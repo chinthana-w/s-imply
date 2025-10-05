@@ -110,12 +110,8 @@ def reset_gates(circuit: List[Gate], total_gates: int):
     Reset all gates to unknown state
     Based on reset_gates from C implementation
     """
-    global fault_excited, d_frontier, fault_masked
     for node_index in range(total_gates + 1):
         circuit[node_index].val = LogicValue.XD
-    fault_excited = False
-    fault_masked = False
-    d_frontier.clear()
 
 def print_pi(circuit: List[Gate], total_gates: int) -> str:
     """

@@ -110,6 +110,21 @@ def _convert_xor_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
     
     return next_id
 
+def _convert_nand_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
+    """Convert NAND gate: NAND(a,b) = NOT(AND(a,b))."""
+    # Create AND gate
+    next_id += 1
+    and_gate = _create_gate(GateType.AND, next_id, gate.fin)
+    _add_gate_to_circuit(new_circuit, and_gate)
+    
+    # Create NOT gate
+    next_id += 1
+    not_gate = _create_gate(GateType.NOT, next_id, [int(and_gate.name)], [int(x) for x in gate.fot])
+    _add_gate_to_circuit(new_circuit, not_gate)
+    and_gate.fot = [int(not_gate.name)]
+    
+    return next_id
+
 def _convert_xnor_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
     """Convert XNOR gate: XNOR(a,b) = NOT(XOR(a,b))."""
     # Use XOR conversion logic
@@ -126,6 +141,27 @@ def _convert_xnor_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int
     
     return next_id
 
+def _convert_buff_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
+    """Convert BUFF gate: BUFF(a) = a (pass-through)."""
+    # A buffer is just a pass-through, so we create a direct connection
+    # For AIG format, we can treat this as preserving the input directly
+    # But we need to maintain the gate structure for fanout handling
+    
+    # Create a simple pass-through gate (essentially just preserve the input)
+    # In AIG, we can represent this as the input itself, but we need to handle fanouts
+    # For now, let's create a simple gate that represents the buffer
+    
+    # Since BUFF is essentially a pass-through, we can just create a gate
+    # that connects the input to the output without any logic
+    # For simplicity, we'll create a gate that just passes through the input
+    
+    # Create a simple gate that represents the buffer
+    # In practice, this could be optimized away, but for now we'll keep it
+    buff_gate = _create_gate(GateType.AND, next_id, gate.fin, [int(x) for x in gate.fot])
+    _add_gate_to_circuit(new_circuit, buff_gate)
+    
+    return next_id + 1
+
 def convert_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
     """Convert a gate to AIG format. Returns the next available ID."""
     # Handle preserved gate types
@@ -141,10 +177,14 @@ def convert_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
         return _convert_or_gate(gate, new_circuit, next_id)
     elif gate.type == GateType.NOR:
         return _convert_nor_gate(gate, new_circuit, next_id)
+    elif gate.type == GateType.NAND:
+        return _convert_nand_gate(gate, new_circuit, next_id)
     elif gate.type == GateType.XOR:
         return _convert_xor_gate(gate, new_circuit, next_id)
     elif gate.type == GateType.XNOR:
         return _convert_xnor_gate(gate, new_circuit, next_id)
+    elif gate.type == GateType.BUFF:
+        return _convert_buff_gate(gate, new_circuit, next_id)
     
     # If we reach here, the gate type is not supported
     raise ValueError(f"Unsupported gate type: {gate.type}")
@@ -157,6 +197,9 @@ def _get_output_gate_id(gate_type: int, start_id: int, fanin_count: int) -> int:
     elif gate_type == GateType.NOR:
         # NOR: 2 NOT + 1 AND = 3 gates, output is AND (at start_id + 3)
         return start_id + 3
+    elif gate_type == GateType.NAND:
+        # NAND: 1 AND + 1 NOT = 2 gates, output is NOT (at start_id + 2)
+        return start_id + 2
     elif gate_type == GateType.XOR:
         # XOR: 2 NOT + 1 AND + 1 NOT + 1 AND + 1 NOT + 1 AND = 7 gates, output is last AND
         return start_id + 6
