@@ -9,6 +9,14 @@ class LogicValue(enum.IntEnum):
     D = 3  # D (good=1, faulty=0)
     DB = 4  # D-bar (good=0, faulty=1)
 
+    def __str__(self) -> str:
+        # Print as its numeric value (e.g., 0, 1, 2, 3, 4)
+        return str(int(self))
+
+    def __repr__(self) -> str:
+        # Also use numeric form when values appear inside containers (dicts/lists)
+        return str(int(self))
+
 
 # Gate type constants
 class GateType(enum.IntEnum):

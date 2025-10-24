@@ -28,7 +28,7 @@ def get_gate_type_str(gate_type: int) -> str:
         GateType.XOR: "XOR",
         GateType.XNOR: "XNOR",
     }
-    return gate_type_map.get(gate_type, "INPT")
+    return gate_type_map.get(gate_type, "INPT") # type: ignore
 
 def parse_bench_file(filename: str) -> Tuple[List[Gate], int]:
     circuit: List[Gate] = []
