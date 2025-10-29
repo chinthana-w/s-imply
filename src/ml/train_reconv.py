@@ -30,7 +30,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from src.ml.reconv_lib import MultiPathTransformer
-from src.ml.minimal_reconv_dataset import ReconvergentPathsDataset, reconv_collate
+from src.ml.reconv_ds import ReconvergentPathsDataset, reconv_collate
 from src.util.io import parse_bench_file
 from src.util.struct import GateType
 
@@ -52,7 +52,18 @@ class TrainConfig:
 
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
-    dataset = ReconvergentPathsDataset(cfg.dataset, device=device, prefer_value=cfg.prefer_value)
+    # Auto-detect processed shards: look for processed/ subdirectory next to dataset
+    dataset_dir = os.path.dirname(cfg.dataset)
+    processed_dir = os.path.join(dataset_dir, 'reconv_processed')
+    load_processed = os.path.isdir(processed_dir)
+    
+    dataset = ReconvergentPathsDataset(
+        cfg.dataset,
+        device=device,
+        prefer_value=cfg.prefer_value,
+        processed_dir=processed_dir if load_processed else None,
+        load_processed=load_processed,
+    )
     # Minimal split: 90/10 train/val
     n = len(dataset)
     n_train = max(1, int(0.9 * n))
@@ -289,7 +300,7 @@ def build_argparser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest='cmd', required=True)
 
     t = sub.add_parser('train', help='Run supervised training')
-    t.add_argument('--dataset', type=str, required=True, help='Path to dataset .pkl')
+    t.add_argument('--dataset', type=str, default='data/datasets/reconv_dataset.pkl', help='Path to dataset .pkl')
     t.add_argument('--output', type=str, default='checkpoints/reconv_minimal', help='Output checkpoint directory')
     t.add_argument('--epochs', type=int, default=10)
     t.add_argument('--batch-size', type=int, default=8)

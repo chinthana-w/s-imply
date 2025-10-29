@@ -12,7 +12,6 @@ from src.ml.gcn import bench_to_embed
 from src.util.io import parse_bench_file
 from src.util.struct import Gate
 
-
 class EmbeddingExtractor:
     """Extracts embeddings with proper AIG conversion and gate mapping handling."""
     
@@ -87,28 +86,41 @@ class EmbeddingExtractor:
         output_gates = [g for g in original_circuit if g.type != 0 and g.nfo == 0]
         return input_gates, output_gates
     
-    def map_predictions_to_original(self, predictions: torch.Tensor, input_gates: List[Gate], 
-                                  gate_mapping: Dict) -> torch.Tensor:
+    def map_predictions_to_original(self, struct_emb: torch.Tensor, func_emb: torch.Tensor, gate_mapping: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Map predictions from AIG gate IDs back to original gate IDs.
+        Map predictions back to original circuit using gate mapping.
         
         Args:
-            predictions: Predictions for AIG input gates
-            input_gates: Original input gates
-            gate_mapping: Mapping from original to AIG IDs
+            struct_emb: Structural embeddings from AIG
+            func_emb: Functional embeddings from AIG
+            gate_mapping: Mapping from original to AIG gate IDs
             
         Returns:
-            mapped_predictions: Predictions mapped to original gate IDs
+            Mapped structural and functional embeddings
         """
-        
-        # Map predictions to original gate IDs
-        original_predictions = {}
-        for i, gate in enumerate(input_gates):
-            original_id = gate.name
-            if original_id in gate_mapping:
-                # Find the index in AIG circuit for this gate
-                # For now, assume predictions are in order of AIG input gates
-                if i < len(predictions):
-                    original_predictions[original_id] = predictions[i].item()
-        
-        return original_predictions
+        mapped_struct_emb = []
+        mapped_func_emb = []
+
+        for _, aig_id in gate_mapping.items():
+            aig_id = int(aig_id)
+            mapped_struct_emb.append(struct_emb[aig_id])
+            mapped_func_emb.append(func_emb[aig_id])
+
+        return torch.stack(mapped_struct_emb), torch.stack(mapped_func_emb)
+
+
+if __name__ == "__main__":
+    extractor = EmbeddingExtractor()
+    struct_emb, func_emb, gate_mapping, original_circuit = extractor.extract_embeddings("data/bench/c17.bench")
+
+    print(f"Structural Embeddings: {struct_emb.shape} -> {struct_emb}")
+    print(f"Functional Embeddings: {func_emb.shape} -> {func_emb}")
+    print(f"Gate Mapping: {gate_mapping}")
+
+
+    mapped_struct_emb, mapped_func_emb = extractor.map_predictions_to_original(struct_emb, func_emb, gate_mapping)
+    input_gates, output_gates = extractor.get_input_output_info(original_circuit)
+    print(f"Mapped Structural Embeddings: {mapped_struct_emb.shape} -> {mapped_struct_emb}")
+    print(f"Mapped Functional Embeddings: {mapped_func_emb.shape} -> {mapped_func_emb}")
+    print(f"Input Gates: {[g.name for g in input_gates]}")
+    print(f"Output Gates: {[g.name for g in output_gates]}")
