@@ -11,7 +11,7 @@ import argparse
 import torch
 
 from src.ml.reconv_lib import MultiPathTransformer
-from src.ml.minimal_reconv_dataset import ReconvergentPathsDataset, reconv_collate
+from src.ml.reconv_ds import ReconvergentPathsDataset, reconv_collate
 from src.ml.train_reconv import policy_loss_and_metrics
 
 
@@ -69,8 +69,9 @@ def main() -> None:
     ds = ReconvergentPathsDataset(args.dataset, device=device)
     dl = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=False, collate_fn=reconv_collate)
 
+    # Model uses embedding_dim + 1 to account for logic value feature
     model = MultiPathTransformer(
-        embedding_dim=args.embedding_dim,
+        embedding_dim=args.embedding_dim + 1,
         nhead=args.nhead,
         num_encoder_layers=args.num_encoder_layers,
         num_interaction_layers=args.num_interaction_layers,
