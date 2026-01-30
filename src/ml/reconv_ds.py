@@ -50,6 +50,7 @@ class ReconvergentPathsDataset(Dataset):
         load_processed: bool = False,
         add_logic_value: bool = True,
         anchor_in_dataset: bool = False,
+        max_len_filter: int = 0,
     ):
         self.dataset_path = dataset_path
         self.device = device
@@ -59,7 +60,13 @@ class ReconvergentPathsDataset(Dataset):
         self.load_processed = load_processed
         self.add_logic_value = add_logic_value
         self.anchor_in_dataset = anchor_in_dataset
+        self.max_len_filter = max_len_filter
         self._prefer_value = int(prefer_value)
+        
+        # Disable processed mode if filtering is active (for simplicity)
+        if self.max_len_filter > 0 and self.load_processed:
+            print(f"Disabling load_processed because max_len_filter={self.max_len_filter} is active.")
+            self.load_processed = False
         
         # If using processed mode and cache exists, set up shard index and return
         self._shard_files: List[str] = []
@@ -97,6 +104,29 @@ class ReconvergentPathsDataset(Dataset):
                     print(f"[WARNING] Dataset at {dataset_path} is in old format without embeddings.")
                     print("[WARNING] Using random dummy embeddings. Consider rebuilding with:")
                     print("[WARNING]   python -m src.atpg.reconv_podem")
+            
+            # Apply max_len filtering
+            if self.max_len_filter > 0:
+                original_len = len(self.data)
+                # self.data is a list of dicts. Keys: 'paths', 'paths_emb', etc.
+                # path structure: list of lists of nodes.
+                # We filter by checking if ANY path in the sample exceeds max_len_filter?
+                # Or if ALL paths are short enough? 
+                # Let's say: we want training samples where the reasoning chain is short. 
+                # So we filter out samples where the path length > max_len_filter.
+                # Assuming all paths in a sample have roughly same effective length if padded, 
+                # but 'paths' key has the actual lists.
+                new_data = []
+                for sample in self.data:
+                    # Check length of the first path (they are reconvergent, so approx same depth)
+                    # sample['info']['paths'] is [[nid, nid, ...], ...]
+                    if 'info' in sample and 'paths' in sample['info']:
+                        p_lens = [len(p) for p in sample['info']['paths']]
+                        if max(p_lens) <= self.max_len_filter:
+                            new_data.append(sample)
+                self.data = new_data
+                print(f"Filtered dataset by max_len={self.max_len_filter}: {original_len} -> {len(self.data)} samples")
+                
             print(f"Loaded {len(self.data)} samples from {dataset_path}")
 
     @staticmethod

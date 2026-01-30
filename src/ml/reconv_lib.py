@@ -5,16 +5,28 @@ import math
 
 # --- Helper: Standard Positional Encoding ---
 # Injects position information into the input embeddings.
+# --- Helper: Standard Positional Encoding ---
+# Injects position information into the input embeddings.
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+    def __init__(self, d_model: int, dropout: float = 0.0, max_len: int = 5000):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
-        self.pe = nn.Parameter(torch.randn(max_len, 1, d_model) * 0.1)
+        
+        # Create constant sinusoidal position encoding
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # Register as buffer so it's not a parameter but is part of state_dict
+        self.register_buffer('pe', pe.unsqueeze(0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [batch_size, seq_len, d_model]
-        pe_slice = self.pe[:x.size(1)].transpose(0, 1) # (1, Seq, Dim)
-        x = x + pe_slice
+        # self.pe: [1, max_len, d_model]
+        x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)
 
 # --- The Main Transformer Architecture ---
@@ -43,10 +55,16 @@ class MultiPathTransformer(nn.Module):
         super().__init__()
         self.input_dim = int(input_dim)
         self.model_dim = int(model_dim)
+        
+        # Explicit Gate Type Embedding (12 types -> 64 dims)
+        # We append this to the input embedding, so actual input to projection increases by 64.
+        self.gate_type_emb = nn.Embedding(12, 64)
+        self.input_aug_dim = self.input_dim + 64
 
         # Optional input projection to expand/shrink to model_dim
-        if self.input_dim != self.model_dim:
-            self.input_proj = nn.Linear(self.input_dim, self.model_dim)
+        # Input is now augmented input_dim + 16
+        if self.input_aug_dim != self.model_dim:
+            self.input_proj = nn.Linear(self.input_aug_dim, self.model_dim)
         else:
             self.input_proj = nn.Identity()
 
@@ -77,22 +95,36 @@ class MultiPathTransformer(nn.Module):
         # We use embedding_dim as input and 2 as output for the two classes (0 and 1).
         self.prediction_head = nn.Linear(self.model_dim, 2)
         
+        # 4. Cross-Attention Block
+        # Allows path nodes (Query) to attend to all interaction-aware path summaries (Key/Value).
+        self.cross_attn = nn.MultiheadAttention(self.model_dim, nhead, batch_first=True)
+        self.cross_norm = nn.LayerNorm(self.model_dim)
+        
         self.pos_encoder = PositionalEncoding(self.model_dim)
 
-    def forward(self, path_list, attention_masks):
+    def forward(self, path_list, attention_masks, gate_types=None):
         """
         Args:
             path_list (Tensor): A padded tensor of path embeddings.
                                 Shape: (batch_size, num_paths, seq_len, embedding_dim)
             attention_masks (Tensor): A boolean mask to ignore padded tokens.
                                      Shape: (batch_size, num_paths, seq_len)
+            gate_types (Tensor, optional): Gate types for each node.
+                                           Shape: (batch_size, num_paths, seq_len)
         """
         batch_size, num_paths, seq_len, _ = path_list.shape
 
+        if gate_types is not None:
+             # Embed gate types
+             # gate_types: [B, P, L] -> [B, P, L, 16]
+             gt_emb = self.gate_type_emb(gate_types.clamp(0, 11))
+             # Concatenate to path embeddings
+             path_list = torch.cat([path_list, gt_emb], dim=-1) # [B, P, L, D+64]
+
         # --- Step 1: Encode Each Path Independently ---
         # Reshape the input to process all paths in the batch at once.
-        # (batch_size * num_paths, seq_len, input_dim)
-        flat_paths = path_list.view(-1, seq_len, self.input_dim)
+        # (batch_size * num_paths, seq_len, input_aug_dim)
+        flat_paths = path_list.view(-1, seq_len, self.input_aug_dim)
         # Project to model dimension if needed
         flat_paths = self.input_proj(flat_paths)
         
@@ -116,11 +148,37 @@ class MultiPathTransformer(nn.Module):
 
         # --- Step 3: Combine and Predict ---
         # Broadcast interaction context back to each node position in each path.
-        global_context = interaction_aware_reps.unsqueeze(2)  # (B, P, 1, model_dim)
+        # Broadcast interaction context back to each node position in each path.
+        # OLD: global_context = interaction_aware_reps.unsqueeze(2)  # (B, P, 1, model_dim)
 
-        # Reshape encoded paths back to grouped form and add context.
+        # Reshape encoded paths back to grouped form: (batch_size, num_paths, seq_len, model_dim)
         encoded_paths = encoded_paths.view(batch_size, num_paths, seq_len, self.model_dim)
-        final_representations = encoded_paths + global_context
+        
+        # --- New Cross-Attention Step ---
+        # Flatten paths again to treat them as independent query sequences: (B*P, L, D)
+        query = encoded_paths.view(-1, seq_len, self.model_dim)
+        
+        # Prepare Key/Value: The set of all path summaries for the corresponding batch item.
+        # interaction_aware_reps is (B, P, D).
+        # We need to repeat this P times so that each of the P paths in a batch can see the full set of P summaries.
+        # kv: (B, P, P, D) -> flatten to (B*P, P, D)
+        kv = interaction_aware_reps.unsqueeze(1).expand(-1, num_paths, -1, -1).reshape(-1, num_paths, self.model_dim)
+        
+        # Cross-Attention: Query=Nodes, Key=PathSummaries, Value=PathSummaries
+        attn_out, _ = self.cross_attn(query, kv, kv)
+        
+        # Residual Connection + Norm + Add back original interaction context (skip connection for "self" bias)
+        # Note: We keep the explicit "own interaction context" addition as a strong bias.
+        global_context = interaction_aware_reps.unsqueeze(2) # (B, P, 1, model_dim)
+        # Reshape global_context to flat (B*P, 1, D) for addition
+        flat_global_context = global_context.view(-1, 1, self.model_dim)
+        
+        # Combine: Original Node + CrossAttn Result + Own Summary
+        # This gives the model maximum flexibility: use local info, look at others, or look at own summary.
+        final_representations = self.cross_norm(query + attn_out + flat_global_context)
+        
+        # Reshape back to (B, P, L, D) for prediction (optional, but prediction_head works on last dim anyway)
+        final_representations = final_representations.view(batch_size, num_paths, seq_len, self.model_dim)
 
         # Per-node logits
         predictions = self.prediction_head(final_representations)  # (B, P, L, 2)

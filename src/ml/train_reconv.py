@@ -44,7 +44,7 @@ class TrainConfig:
     output: str
     epochs: int = 10
     # Internal defaults; not exposed via CLI for simplicity
-    batch_size: int = 8
+    batch_size: int = 128
     lr: float = 1e-4
     embedding_dim: int = 128  # Base structural embedding dimension
     nhead: int = 4
@@ -65,7 +65,7 @@ class TrainConfig:
     # Dataset-level anchor integration (generate anchor in dataset loader)
     dataset_anchor_hint: bool = True
     # DataLoader performance
-    num_workers: int = 4
+    num_workers: int = 8
     pin_memory: bool = True
     # RL stabilization
     normalize_reward: bool = True
@@ -73,8 +73,11 @@ class TrainConfig:
 
     # New arguments
     bench_dir: str = ""
+    soft_edge_lambda: float = 1.0
     amp: bool = False
     include_hard_negatives: bool = False
+    max_len: int = 0
+    use_gate_type_embedding: bool = True
 
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
@@ -93,6 +96,7 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
         load_processed=load_processed,
         add_logic_value=cfg.add_logic_value,
         anchor_in_dataset=cfg.dataset_anchor_hint,
+        max_len_filter=cfg.max_len,
     )
     # Minimal split: 90/10 train/val
     n = len(dataset)
@@ -387,58 +391,96 @@ def _debug_metrics_from_logits(
         'samples_with_edges_frac': samples_with_edges,
     }
 
+def resolve_gate_types(node_ids: torch.Tensor, files: list[str], device: torch.device) -> torch.Tensor:
+    B, P, L = node_ids.shape
+    gtypes_batch = torch.full((B, P, L), -1, dtype=torch.long, device=device)
+    
+    for b in range(B):
+        nid_b = node_ids[b]
+        # Filter positive IDs for lookup
+        valid_mask = nid_b > 0
+        ids_b = nid_b[valid_mask].unique().tolist()
+        
+        circuit = _load_circuit(files[b])
+        if ids_b:
+            max_id = int(max(ids_b))
+            gt_lookup = torch.full((max_id + 1,), -1, dtype=torch.long, device=device)
+            # Safe caching trick
+            for nid in ids_b:
+                try:
+                    if int(nid) < len(circuit):
+                        gt_lookup[int(nid)] = int(circuit[int(nid)].type)
+                except Exception:
+                    pass
+            
+            # Apply lookup
+            gtypes_batch[b] = gt_lookup[nid_b.clamp(min=0, max=max_id).to(device)]
+            
+    return gtypes_batch
+
 
 def policy_loss_and_metrics(
     logits: torch.Tensor,
     node_ids: torch.Tensor,
     mask_valid: torch.Tensor,
     files: list[str],
+    gate_types: torch.Tensor,
     anchor_p: torch.Tensor | None = None,
     anchor_l: torch.Tensor | None = None,
     anchor_v: torch.Tensor | None = None,
     anchor_alpha: float = 0.1,
     normalize_reward: bool = True,
     entropy_beta: float = 0.0,
-) -> tuple[torch.Tensor, float, float]:
+    soft_edge_lambda: float = 1.0,
+) -> tuple[torch.Tensor, float, float, float, float]:
     """Compute REINFORCE loss with LUT-inspired constraints and reconv consistency.
 
-    Returns: (loss, avg_reward, valid_rate)
+    Returns: (loss, avg_reward, valid_rate, edge_acc, trivial_rate)
     """
+
     B, P, L, C = logits.shape
     # Sample actions; detach to avoid retaining graph history through the sample op.
     actions = torch.distributions.Categorical(logits=logits).sample().detach()  # [B, P, L]
     # Compute log-probabilities directly from logits to avoid distribution caching quirks.
     log_probs = torch.log_softmax(logits, dim=-1)  # [B, P, L, C]
     logp = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)  # [B, P, L]
+    
+    # Get probability of 1 (Logic-1) for soft constraints
+    probs_1 = torch.softmax(logits, dim=-1)[..., 1]  # [B, P, L]
 
     wrong_count_list: list[float] = []
     checked_list: list[float] = []
+    local_wrong_list: list[float] = []
+    reconv_wrong_list: list[float] = []
+    edge_wrong_sum = 0.0
+    edge_total_sum = 0.0
+    soft_edge_loss_list: list[torch.Tensor] = []
+
     # Precompute masks for valid adjacent edges once
     valid_edges = mask_valid[:, :, 1:] & mask_valid[:, :, :-1]  # [B, P, L-1]
     prev_vals_all = actions[:, :, :-1]
     cur_vals_all = actions[:, :, 1:]
+    
+    prev_probs_all = probs_1[:, :, :-1]
+    cur_probs_all = probs_1[:, :, 1:]
     for b in range(B):
-        # Build gate type tensor for this sample by mapping node IDs -> gate types
-        nid_b = node_ids[b]  # [P, L]
-        ids_b = nid_b[nid_b > 0].unique().tolist()
-        circuit = _load_circuit(files[b])
-        if ids_b:
-            max_id = int(max(ids_b))
-            gt_lookup = torch.full((max_id + 1,), -1, dtype=torch.long, device=logits.device)
-            for nid in ids_b:
-                try:
-                    gt_lookup[int(nid)] = int(circuit[int(nid)].type)
-                except Exception:
-                    pass
-            gtypes_b = gt_lookup[nid_b.clamp(min=0, max=max_id).to(logits.device)]  # [P, L]
-        else:
-            gtypes_b = torch.full_like(nid_b, -1, dtype=torch.long, device=logits.device)
+        # Use pre-resolved gate types
+        gtypes_b = gate_types[b]
 
-        # Edge-local constraints (vectorized over P, L-1)
-        gt_cur = gtypes_b[:, 1:]  # gate type at current node for each edge
         prev_vals = prev_vals_all[b].to(logits.device)
         cur_vals = cur_vals_all[b].to(logits.device)
         ve_mask = valid_edges[b].to(logits.device)
+
+        # Edge-local constraints (vectorized over P, L-1)
+        gt_cur = gtypes_b[:, 1:]  # gate type at current node for each edge
+        
+        # Define weights for gate types
+        # Boost NOT (4) by 12x (Final Attempt)
+        edge_weights = torch.ones_like(gt_cur, dtype=torch.float32)
+        edge_weights[gt_cur == GateType.NOT] = 12.0
+        
+
+
 
         ok = torch.ones_like(prev_vals, dtype=torch.bool, device=logits.device)
         # NOT
@@ -476,9 +518,66 @@ def policy_loss_and_metrics(
             ok_m = (cur_m == 0) | ((cur_m == 1) & (prev_m == 0))
             ok[m] &= ok_m
 
+        # Soft Edge Constraints (Differentiable)
+        # Using probs_1: prev_p, cur_p
+        prev_p = prev_probs_all[b].to(logits.device)
+        cur_p = cur_probs_all[b].to(logits.device)
+        
+        # Calculate violation per edge
+        viol = torch.zeros_like(prev_p, dtype=torch.float32)
+
+        # NOT: |cur - (1-prev)|^2
+        m = gt_cur == GateType.NOT
+        if m.any():
+            viol[m] = (cur_p[m] - (1.0 - prev_p[m])) ** 2
+            
+        # BUFF: |cur - prev|^2
+        m = gt_cur == GateType.BUFF
+        if m.any():
+            viol[m] = (cur_p[m] - prev_p[m]) ** 2
+            
+        # AND: cur <= prev  => ReLU(cur - prev)^2
+        m = gt_cur == GateType.AND
+        if m.any():
+            viol[m] = F.relu(cur_p[m] - prev_p[m]) ** 2
+            
+        # NAND: cur >= 1 - prev => ReLU((1-prev) - cur)^2
+        m = gt_cur == GateType.NAND
+        if m.any():
+            viol[m] = F.relu((1.0 - prev_p[m]) - cur_p[m]) ** 2
+            
+        # OR: cur >= prev => ReLU(prev - cur)^2
+        m = gt_cur == GateType.OR
+        if m.any():
+            viol[m] = F.relu(prev_p[m] - cur_p[m]) ** 2
+
+        # NOR: cur <= 1 - prev => ReLU(cur - (1-prev))^2
+        m = gt_cur == GateType.NOR
+        if m.any():
+            viol[m] = F.relu(cur_p[m] - (1.0 - prev_p[m])) ** 2
+            
+        # Mask out invalid edges from loss
+        viol = viol * ve_mask.float()
+        
+        # Apply weights 
+        viol = viol * edge_weights
+        
+        if ve_mask.any():
+             soft_edge_loss_list.append(viol.sum() / ve_mask.sum().float().clamp(min=1.0))
+
         wrong_edges = (~ok) & ve_mask
         wrong = wrong_edges.sum(dtype=torch.float32).item()
         checked = ve_mask.sum(dtype=torch.float32).item()
+
+        # Track local vs reconv errors separately
+        local_wrong = float(wrong) # 'wrong' currently has only edge errors
+        rec_wrong = 0.0
+        
+        edge_wrong_sum += local_wrong
+        edge_total_sum += checked
+        
+        # Accumulate edge accuracy lists for batch reporting
+        # (Assuming edge_wrong_list/edge_total_list were placeholders, actually removed them in previous edits but let's just stick to vars)
 
         # Reconvergence consistency: compare last values across paths
         mask_b = mask_valid[b]
@@ -494,18 +593,74 @@ def policy_loss_and_metrics(
             if n_present >= 2:
                 ref = last_vals[0]
                 mism = (last_vals[1:] != ref).sum(dtype=torch.float32).item()
-                wrong += float(mism)
+                rec_wrong = float(mism)
+                # Don't add to checked for edge_accuracy calculation, but for reward denom yes.
                 checked += float(n_present - 1)
 
-        wrong_count_list.append(float(wrong))
+        local_wrong_list.append(local_wrong)
+        reconv_wrong_list.append(rec_wrong)
+        # Total wrong for "valid" status check (still useful for valid_rate)
+        wrong_count_list.append(local_wrong + rec_wrong)
         checked_list.append(float(checked))
-
+        
     checked_t = torch.tensor(checked_list, dtype=torch.float32, device=logits.device)
     wrong_t = torch.tensor(wrong_count_list, dtype=torch.float32, device=logits.device)
-    valid = (wrong_t == 0) & (checked_t > 0)
+    local_wrong_t = torch.tensor(local_wrong_list, dtype=torch.float32, device=logits.device)
+    reconv_wrong_t = torch.tensor(reconv_wrong_list, dtype=torch.float32, device=logits.device)
+    
+    # NEW DEFINITION:
+    # A sample is VALID if it has NO errors (wrong_t == 0).
+    # If checked_t == 0 (trivial case), it has no errors, so it is valid.
+    # We track 'trivial' separately.
+    valid = (wrong_t == 0)
+    trivial = (checked_t == 0)
+    
+    # Reward:
+    # If trivial: 0.0 (neutral) or 1.0 (good)? 
+    # Let's say 1.0 because it satisfies constraints (vacuously).
+    # If non-trivial and valid: 1.0.
+    # If invalid: -wrong/checked.
+    
     denom = torch.clamp(checked_t, min=1.0)
-    reward = torch.where(checked_t > 0, torch.where(valid, torch.ones_like(denom), -wrong_t / denom), torch.zeros_like(denom))
-
+    # If valid (wrong==0), reward is 1.0. Even if trivial.
+    # If invalid (wrong>0), reward is -wrong/denom.
+    # GATED REWARD LOGIC:
+    # 1. If Local Logic Fails (local_wrong > 0): Reward = -1.0 (Hard Penalty)
+    # 2. Else (Local Logic OK):
+    #    If Reconv Fails (reconv_wrong > 0): Reward = -reconv_wrong / checked (Proportional Penalty)
+    #    Else (Perfect): Reward = 1.0
+    
+    # Base reward tensor filled with -1.0 (Worst case default)
+    base_reward = torch.full_like(checked_t, -1.0)
+    
+    # Mask where local logic is OK
+    local_ok = (local_wrong_t == 0)
+    
+    # For local_ok samples, calculate reward based on reconv
+    # If reconv_wrong_t == 0, reward is 1.0
+    # If reconv_wrong_t > 0, reward is -reconv_wrong / checked
+    
+    denom = torch.clamp(checked_t, min=1.0)
+    reconv_penalty = -reconv_wrong_t / denom
+    
+    # If local OK:
+    #   if reconv OK (wrong_t == 0) -> 1.0
+    #   else -> reconv_penalty
+    
+    reconv_ok = (reconv_wrong_t == 0)
+    
+    # Where local_ok is true:
+    # reward = 1.0 if reconv_ok else reconv_penalty
+    reward_if_local_ok = torch.where(reconv_ok, torch.ones_like(base_reward), reconv_penalty)
+    
+    # Apply to base_reward
+    base_reward = torch.where(local_ok, reward_if_local_ok, base_reward)
+    
+    # Special case: Trivial samples (checked == 0) -> 1.0
+    base_reward = torch.where(trivial, torch.ones_like(base_reward), base_reward)
+    
+    reward = base_reward
+    
     # Anchor reward shaping: encourage model to place the anchor value.
     if anchor_p is not None and anchor_l is not None and anchor_v is not None:
         idx = torch.arange(B, device=logits.device)
@@ -518,6 +673,7 @@ def policy_loss_and_metrics(
             anchor_signal[matches] = 1.0
             anchor_signal[present & (~matches)] = -1.0
             reward = reward + float(anchor_alpha) * anchor_signal
+            
     # Keep reward in a reasonable range
     reward = torch.clamp(reward, min=-1.0, max=1.0)
 
@@ -575,22 +731,32 @@ def policy_loss_and_metrics(
     
     if cons_loss_list:
         loss = loss + 0.5 * torch.stack(cons_loss_list).mean()
+        
+    # Soft Edge Consistency Loss
+    if soft_edge_loss_list and soft_edge_lambda > 0:
+        edge_loss = torch.stack(soft_edge_loss_list).mean()
+        loss = loss + float(soft_edge_lambda) * edge_loss
 
     # Report the unnormalized average reward-like signal for monitoring:
     # recompute a view without normalization (no-grad) for logging
     with torch.no_grad():
-        # replicate earlier computation succinctly for avg logging
-        avg_reward = float((valid.float() * 1.0 - (~valid).float() * (wrong_t / torch.clamp(checked_t, min=1.0))).mean().item())
+        avg_reward = float(base_reward.mean().item())
+        
     valid_rate = float(valid.float().mean().item())
-    return loss, avg_reward, valid_rate
+    trivial_rate = float(trivial.float().mean().item())
+    edge_acc = float((edge_total_sum - edge_wrong_sum) / max(1.0, edge_total_sum))
+    
+    return loss, avg_reward, valid_rate, edge_acc, trivial_rate
 
 
-def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Optimizer, scaler: torch.cuda.amp.GradScaler, device: torch.device, cfg: TrainConfig) -> Tuple[float, float, float]:
+def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Optimizer, scaler: torch.cuda.amp.GradScaler, device: torch.device, cfg: TrainConfig) -> Tuple[float, float, float, float, float]:
     model.train()
     total_loss = 0.0
     total_batches = 0
     total_reward = 0.0
     total_valid = 0.0
+    total_edge_acc = 0.0
+    total_trivial = 0.0
     start_time = time.time()
     # Target batch count for ETA (respect caps if provided)
     try:
@@ -647,34 +813,27 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
             paths = _inject_anchor_into_embeddings(paths, anchor_p, anchor_l, anchor_v, enable=cfg.add_logic_value)
         else:
             anchor_p = anchor_l = anchor_v = None  # type: ignore
+        
+        # Resolve gate types if needed (for embedding or loss)
+        # Note: We need them for loss anyway now.
+        gtypes = resolve_gate_types(node_ids, files, device)
 
-        # Optional debug: show anchor stats for the first batch when verbose
-        if cfg.verbose and cfg.anchor_hint and batch_idx == 0:
-            if isinstance(anchor_p, torch.Tensor) and isinstance(anchor_l, torch.Tensor) and isinstance(anchor_v, torch.Tensor):
-                present = (anchor_p >= 0) & (anchor_l >= 0)
-                n_present = int(present.sum().item())
-                n_total = anchor_p.shape[0]
-                if n_present > 0:
-                    v_counts = torch.bincount(anchor_v[present].clamp(0,1), minlength=2)
-                    n0 = int(v_counts[0].item())
-                    n1 = int(v_counts[1].item())
-                    print(f"[anchor] batch0: present={n_present}/{n_total} v0={n0} v1={n1}")
-                else:
-                    print(f"[anchor] batch0: no valid anchors in this batch")
+
 
         optim.zero_grad(set_to_none=True)
         
         # AMP context
         with torch.amp.autocast('cuda', enabled=cfg.amp):
-            logits = model(paths, masks)  # [B, P, L, 2]
-            if cfg.verbose and batch_idx == 0:
-                print(f"[device] batch0 logits device={logits.device}")
-            loss, avg_reward, valid_rate = policy_loss_and_metrics(
-                logits, node_ids, masks, files,
+            # Pass gate types to model if configured
+            logits = model(paths, masks, gate_types=gtypes if cfg.use_gate_type_embedding else None)  # [B, P, L, 2]
+
+            loss, avg_reward, valid_rate, batch_edge_acc, batch_trivial = policy_loss_and_metrics(
+                logits, node_ids, masks, files, gtypes,
                 anchor_p=anchor_p, anchor_l=anchor_l, anchor_v=anchor_v,
                 anchor_alpha=cfg.anchor_reward_alpha,
                 normalize_reward=cfg.normalize_reward,
                 entropy_beta=cfg.entropy_beta,
+                soft_edge_lambda=cfg.soft_edge_lambda,
             )
         
         # Backprop (with scaler if AMP)
@@ -685,6 +844,8 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
         total_loss += float(loss.item())
         total_reward += float(avg_reward)
         total_valid += float(valid_rate)
+        total_edge_acc += float(batch_edge_acc)
+        total_trivial += float(batch_trivial)
         total_batches += 1
         # Periodic progress log
         if cfg.verbose and cfg.log_interval > 0 and (batch_idx + 1) % cfg.log_interval == 0:
@@ -725,16 +886,20 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
     avg_loss = total_loss / max(1, total_batches)
     avg_reward = total_reward / max(1, total_batches)
     valid_rate = total_valid / max(1, total_batches)
-    # Return avg loss, avg reward and accuracy (valid rate)
-    return avg_loss, avg_reward, valid_rate
+    avg_edge_acc = total_edge_acc / max(1, total_batches)
+    avg_trivial = total_trivial / max(1, total_batches)
+    # Return avg loss, avg reward, accuracy (valid rate), edge accuracy, trivial rate
+    return avg_loss, avg_reward, valid_rate, avg_edge_acc, avg_trivial
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, cfg: TrainConfig) -> Tuple[float, float, float]:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, cfg: TrainConfig) -> Tuple[float, float, float, float, float]:
     model.eval()
     total_loss = 0.0
     total_reward = 0.0
     total_valid = 0.0
+    total_edge_acc = 0.0
+    total_trivial = 0.0
     total_batches = 0
     start_time = time.time()
     # Target batch count for ETA (respect caps if provided)
@@ -788,18 +953,23 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, cfg: Tr
         else:
             anchor_p = anchor_l = anchor_v = None  # type: ignore
 
+        gtypes = resolve_gate_types(node_ids, files, device)
+
         with torch.amp.autocast('cuda', enabled=cfg.amp):
-            logits = model(paths, masks)
-            loss, avg_reward, valid_rate = policy_loss_and_metrics(
-                logits, node_ids, masks, files,
+            logits = model(paths, masks, gate_types=gtypes if cfg.use_gate_type_embedding else None)
+            loss, avg_reward, valid_rate, batch_edge_acc, batch_trivial = policy_loss_and_metrics(
+                logits, node_ids, masks, files, gtypes,
                 anchor_p=anchor_p, anchor_l=anchor_l, anchor_v=anchor_v,
                 anchor_alpha=cfg.anchor_reward_alpha,
                 normalize_reward=cfg.normalize_reward,
                 entropy_beta=cfg.entropy_beta,
+                soft_edge_lambda=cfg.soft_edge_lambda,
             )
         total_loss += float(loss.item())
         total_reward += float(avg_reward)
         total_valid += float(valid_rate)
+        total_edge_acc += float(batch_edge_acc)
+        total_trivial += float(batch_trivial)
         total_batches += 1
         # Periodic progress log
         if cfg.verbose and cfg.log_interval > 0 and (batch_idx + 1) % cfg.log_interval == 0:
@@ -839,13 +1009,15 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, cfg: Tr
     avg_loss = total_loss / max(1, total_batches)
     avg_reward = total_reward / max(1, total_batches)
     valid_rate = total_valid / max(1, total_batches)
-    return avg_loss, avg_reward, valid_rate
+    avg_edge_acc = total_edge_acc / max(1, total_batches)
+    avg_trivial = total_trivial / max(1, total_batches)
+    return avg_loss, avg_reward, valid_rate, avg_edge_acc, avg_trivial
 
 
 def save_checkpoint(path: str, model: nn.Module, cfg: TrainConfig, best: bool = False) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save({
-        'state_dict': model.state_dict(),
+        'state_dict': (model.module if hasattr(model, 'module') else model).state_dict(),
         'config': asdict(cfg),
         'best': best,
     }, path)
@@ -868,11 +1040,14 @@ def cmd_train(args: argparse.Namespace) -> None:
         num_interaction_layers=getattr(args, 'int_layers', 1),
         dim_feedforward=getattr(args, 'ffn_dim', 512),
         model_dim=getattr(args, 'model_dim', 512),
-        num_workers=getattr(args, 'num_workers', 4),
+        num_workers=getattr(args, 'num_workers', 8),
         pin_memory=getattr(args, 'pin_memory', True),
         bench_dir=getattr(args, 'bench_dir', ""),
         amp=getattr(args, 'amp', False),
         include_hard_negatives=getattr(args, 'include_hard_negatives', False),
+        soft_edge_lambda=getattr(args, 'soft_edge_lambda', 1.0),
+        max_len=getattr(args, 'max_len', 0),
+        entropy_beta=getattr(args, 'entropy_beta', 0.0),
     )
     
     # Handle checkpoint-dir alias
@@ -916,6 +1091,10 @@ def cmd_train(args: argparse.Namespace) -> None:
         num_interaction_layers=cfg.num_interaction_layers,
         dim_feedforward=cfg.dim_feedforward,
     ).to(device)
+    
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
+        model = nn.DataParallel(model)
 
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     scaler = torch.amp.GradScaler('cuda', enabled=cfg.amp)
@@ -926,12 +1105,12 @@ def cmd_train(args: argparse.Namespace) -> None:
         nb_val = len(val_loader) if hasattr(val_loader, '__len__') else 0
         print(f"Starting training: train_batches={nb_train}, val_batches={nb_val}, batch_size={cfg.batch_size}")
     for epoch in range(1, cfg.epochs + 1):
-        tr_loss, tr_reward, tr_acc = train_one_epoch(model, train_loader, optim, scaler, device, cfg)
-        va_loss, va_reward, va_acc = evaluate(model, val_loader, device, cfg)
+        tr_loss, tr_reward, tr_acc, tr_edge, tr_triv = train_one_epoch(model, train_loader, optim, scaler, device, cfg)
+        va_loss, va_reward, va_acc, va_edge, va_triv = evaluate(model, val_loader, device, cfg)
         print(
             f"Epoch {epoch:03d} | "
-            f"train_loss={tr_loss:.4f} avg_reward={tr_reward:.4f} acc={tr_acc:.4f} | "
-            f"val_loss={va_loss:.4f} avg_reward={va_reward:.4f} acc={va_acc:.4f}"
+            f"train_loss={tr_loss:.4f} avg_reward={tr_reward:.4f} acc={tr_acc:.4f} edge_acc={tr_edge:.4f} triv={tr_triv:.4f} | "
+            f"val_loss={va_loss:.4f} avg_reward={va_reward:.4f} acc={va_acc:.4f} edge_acc={va_edge:.4f} triv={va_triv:.4f}"
         )
 
         # Save periodic checkpoint
@@ -956,7 +1135,7 @@ def build_argparser() -> argparse.ArgumentParser:
     t.add_argument('--amp', action='store_true', help='Enable Automatic Mixed Precision (AMP)')
     t.add_argument('--include-hard-negatives', action='store_true', help='Include hard negatives (currently ignored)')
     t.add_argument('--epochs', type=int, default=10)
-    t.add_argument('--batch-size', type=int, default=8)
+    t.add_argument('--batch-size', type=int, default=128)
     t.add_argument('--verbose', action='store_true')
     # Model capacity
     t.add_argument('--nhead', type=int, default=4, help='Number of attention heads')
@@ -982,6 +1161,10 @@ def build_argparser() -> argparse.ArgumentParser:
                    help='Limit number of validation batches per eval (0 = no limit)')
     t.add_argument('--log-interval', type=int, default=500,
                    help='Batches between progress logs when --verbose is set')
+    t.add_argument('--soft-edge-lambda', type=float, default=1.0, 
+                   help='Weight for soft edge consistency loss')
+    t.add_argument('--max-len', type=int, default=0, help='Filter dataset for max path length (Curriculum Learning)')
+    t.add_argument('--entropy-beta', type=float, default=0.0, help='Entropy regularization weight (negative to minimize)')
 
     return p
 
