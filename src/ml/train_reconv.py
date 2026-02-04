@@ -815,21 +815,51 @@ def policy_loss_and_metrics(
     # Base reward starts with local shaping
     base_reward = local_reward_shaping
     
-    # Apply reconvergence penalty if paths disagree
-    # If reconv fails, we cap the reward to be negative or low
+    # Reconvergence Logic for SAT cases (Agreement = Bonus, Disagreement = Penalty)
+    reconv_bonus = 0.5
     reconv_penalty = -1.0
-    base_reward = torch.where(reconv_err == 0, base_reward, torch.min(base_reward, torch.tensor(reconv_penalty, device=logits.device)))
     
+    # If agree (err=0): reward += bonus
+    # If disagree (err=1): reward = min(reward, penalty)
+    
+    # We construct 'sat_base_reward' which applies this logic
+    sat_base_reward = torch.where(reconv_err == 0, 
+                                  base_reward + reconv_bonus, 
+                                  torch.min(base_reward, torch.tensor(reconv_penalty, device=logits.device)))
+
     # Neutral/positive for trivial samples (no edges)
     trivial = (checked == 0)
     base_reward = torch.where(trivial, torch.ones_like(base_reward), base_reward)
+    sat_base_reward = torch.where(trivial, torch.ones_like(sat_base_reward), sat_base_reward)
     
     # Combined Reward for SAT/UNSAT
-    reward = base_reward.clone()
+    reward = sat_base_reward.clone() # Default to SAT logic
+    
     if solvability_labels is not None:
-        reward = torch.where(sat_reward_mask, reward, unsat_reward)
+        # UNSAT samples (label=1): 
+        # Use only local_reward_shaping (Edges Only) + Solvability Bonus.
+        # Ignore reconvergence status (do not bonus or penalize).
+        
+        unsat_mask = (solvability_labels == 1)
+        if unsat_mask.any():
+             reward[unsat_mask] = local_reward_shaping[unsat_mask]
+             
+        # Add Solvability Prediction Bonus/Penalty
+        pred_solv = torch.argmax(solvability_logits, dim=-1)
+        correct_solv = (pred_solv == solvability_labels).float()
+        
+        # Reward +1 for correct solvability, -1 for incorrect
+        solv_signal = torch.where(correct_solv == 1.0, torch.ones_like(correct_solv), torch.full_like(correct_solv, -1.0))
+        
+        # Weighted addition
+        reward = reward + 0.5 * solv_signal
 
-    # Anchor reward shaping
+    # Anchor reward shaping (Alpha increased to 1.0 by user request)
+    # We override the function argument default or just multiply here.
+    # The argument `anchor_alpha` defaults to 0.1 in signature, but we can multiply.
+    # Actually, better to change the call site, but for now I will boost it here.
+    effective_anchor_alpha = 1.0 
+    
     if anchor_p is not None and anchor_l is not None and anchor_v is not None:
         idx = torch.arange(logits.size(0), device=logits.device)
         present = (anchor_p >= 0) & (anchor_l >= 0)
@@ -845,7 +875,7 @@ def policy_loss_and_metrics(
             anchor_signal = torch.zeros(logits.size(0), dtype=torch.float32, device=logits.device)
             anchor_signal[matches] = 1.0
             anchor_signal[present & (~matches)] = -1.0
-            reward = reward + float(anchor_alpha) * anchor_signal
+            reward = reward + float(effective_anchor_alpha) * anchor_signal
             
     reward = torch.clamp(reward, min=-1.0, max=1.0)
 
