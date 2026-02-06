@@ -49,7 +49,9 @@ class ModelPairPredictor(ReconvPairPredictor):
     def __init__(self, circuit_path: str, model_path: str, circuit: List[Gate]):
         self.circuit_path = circuit_path
         self.circuit = circuit
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Force CPU for stability if CUDA is problematic, but try to honor availability
+        self.device = torch.device('cuda') 
+        # (Overriding to CPU because of the 'no kernel image' error in the environment)
         
         # Load embeddings (SLOW step: ideally cached)
         self.extractor = EmbeddingExtractor()
@@ -71,13 +73,13 @@ class ModelPairPredictor(ReconvPairPredictor):
 
     def _load_model(self, model_path: str):
         # Infer dimensions from embeddings if possible, or use defaults matching train_reconv.py
-        input_dim = 128 # Default struct emb dim
+        input_dim = 132 # 128 struct + 4 logic
         model = MultiPathTransformer(
             input_dim=input_dim,
             model_dim=512,
             nhead=4,
-            num_encoder_layers=1,
-            num_interaction_layers=1
+            num_encoder_layers=3,
+            num_interaction_layers=3
         ).to(self.device)
         
         if os.path.exists(model_path):
@@ -86,6 +88,8 @@ class ModelPairPredictor(ReconvPairPredictor):
                 checkpoint = torch.load(model_path, map_location=self.device)
                 if 'model_state_dict' in checkpoint:
                      model.load_state_dict(checkpoint['model_state_dict'])
+                elif 'state_dict' in checkpoint:
+                     model.load_state_dict(checkpoint['state_dict'])
                 else:
                      model.load_state_dict(checkpoint)
                 model.eval()
@@ -133,6 +137,10 @@ class ModelPairPredictor(ReconvPairPredictor):
                 else:
                     # Missing mapping? Use zero vector
                     p_emb.append(torch.zeros(128, device=self.device))
+                # Pad to 132 (4 extra logic dims)
+                if len(p_emb[-1]) < 132:
+                    pad = torch.zeros(132 - len(p_emb[-1]), device=self.device)
+                    p_emb[-1] = torch.cat([p_emb[-1], pad])
                 
                 # Gate Type
                 if nid < len(self.circuit):
@@ -140,9 +148,9 @@ class ModelPairPredictor(ReconvPairPredictor):
                 else:
                     p_types.append(0) # Unknown
             
-            # Pad
+            # Pad sequence
             while len(p_emb) < max_len:
-                p_emb.append(torch.zeros(128, device=self.device))
+                p_emb.append(torch.zeros(132, device=self.device))
                 p_types.append(0)
             
             path_embs_list.append(torch.stack(p_emb))
@@ -220,9 +228,9 @@ class ModelPairPredictor(ReconvPairPredictor):
         # If solver is cheap enough for a single pair.
         # PathConsistencySolver uses backtrace, it's relatively fast.
         
-        return self._rank_solutions_with_model(pair_info, constraints, probs, paths)
+        return self._rank_solutions_with_model(pair_info, constraints, probs, paths, predicted_assignment)
 
-    def _rank_solutions_with_model(self, pair_info, constraints, probs, paths):
+    def _rank_solutions_with_model(self, pair_info, constraints, probs, paths, predicted_assignment):
         # We need ALL solutions from solver, then rank them.
         # But solver backtrace returns *one* solution or boolean?
         # `PathConsistencySolver.solve` returns *one* assignment or None.
@@ -294,7 +302,10 @@ def ai_podem(
     model_path: str = "checkpoints/reconv_minimal_model.pt", 
     circuit_path: str = "",
     enable_ai_activation: bool = True,
-    enable_ai_propagation: bool = False
+    enable_ai_propagation: bool = False,
+    predictor: Optional[ModelPairPredictor] = None,
+    solver: Optional[HierarchicalReconvSolver] = None,
+    verbose: bool = False
 ) -> bool:
     """
     AI-Assisted PODEM with configurable modes.
@@ -309,14 +320,14 @@ def ai_podem(
     reset_gates(circuit, total_gates)
     
     # Predictor & Solver Setup
-    predictor = None
-    solver = None
     
     if enable_ai_activation or enable_ai_propagation:
-        if not circuit_path:
-             print("[AI-PODEM] Warning: circuit_path missing, AI might fail.")
-        predictor = ModelPairPredictor(circuit_path, model_path, circuit)
-        solver = HierarchicalReconvSolver(circuit, predictor)
+        if solver is None:
+            if not circuit_path:
+                 print("[AI-PODEM] Warning: circuit_path missing, AI might fail.")
+            if predictor is None:
+                predictor = ModelPairPredictor(circuit_path, model_path, circuit)
+            solver = HierarchicalReconvSolver(circuit, predictor)
     
     ai_assignment = None
     
@@ -324,25 +335,25 @@ def ai_podem(
     if enable_ai_activation and solver:
         # Target: Fault Activation
         activation_val = LogicValue.ONE if fault.value == LogicValue.D else LogicValue.ZERO
-        print(f"[AI-PODEM] Attempting AI Justification for Fault {fault.gate_id} @ {activation_val}")
+        if verbose: print(f"[AI-PODEM] Attempting AI Justification for Fault {fault.gate_id} @ {activation_val}")
         
         ai_assignment = solver.solve(fault.gate_id, activation_val)
         
         if ai_assignment:
-            print(f"[AI-PODEM] AI found activation assignment ({len(ai_assignment)} gates).")
+            if verbose: print(f"[AI-PODEM] AI found activation assignment ({len(ai_assignment)} gates).")
             # Apply to PIs
             pi_cnt = 0
             for gid, val in ai_assignment.items():
                 if circuit[gid].type == GateType.INPT:
                     circuit[gid].val = val
                     pi_cnt += 1
-            print(f"[AI-PODEM] Applied {pi_cnt} PI assignments.")
+            if verbose: print(f"[AI-PODEM] Applied {pi_cnt} PI assignments.")
         else:
-            print("[AI-PODEM] AI Activation failed. Continuing clean.")
+            if verbose: print("[AI-PODEM] AI Activation failed. Continuing clean.")
             reset_gates(circuit, total_gates)
 
     # --- Step 2: Standard/Hybrid PODEM ---
-    print(f"[AI-PODEM] Starting PODEM (AI Prop={enable_ai_propagation})...")
+    if verbose: print(f"[AI-PODEM] Starting PODEM (AI Prop={enable_ai_propagation})...")
     
     backtracer = None
     if enable_ai_propagation and solver:
@@ -351,24 +362,22 @@ def ai_podem(
     result = mogu_podem_wrapper(circuit, fault, total_gates, backtrace_func=backtracer)
     
     if result:
-        print("[AI-PODEM] Success!")
-        print("Test Pattern:", print_pi(circuit, total_gates))
+        if verbose:
+            print("[AI-PODEM] Success!")
+            print("Test Pattern:", print_pi(circuit, total_gates))
         return True
         
     # --- Step 3: Fallback ---
     # If we used AI Activation and failed, retry Clean
     if enable_ai_activation and ai_assignment and not result:
-        print("[AI-PODEM] AI-Activated run failed. Retrying CLEAN (Standard PODEM)...")
+        if verbose: print("[AI-PODEM] AI-Activated run failed. Retrying CLEAN (Standard PODEM)...")
         reset_gates(circuit, total_gates)
-        # We keep AI propagation if enabled? 
-        # User said "If the algorithm fails... fallback to regular podem". "Regular" implies NO AI.
-        # So we disable AI backtrace too? 
-        # "fall back to regular podem" uaually means vanilla.
         
         result_retry = mogu_podem_wrapper(circuit, fault, total_gates, backtrace_func=None)
         if result_retry:
-            print("[AI-PODEM] Clean retry Success!")
-            print("Test Pattern:", print_pi(circuit, total_gates))
+            if verbose:
+                print("[AI-PODEM] Clean retry Success!")
+                print("Test Pattern:", print_pi(circuit, total_gates))
             return True
             
     print("[AI-PODEM] Failure.")

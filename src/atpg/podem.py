@@ -66,6 +66,11 @@ TRAIN_BT_BUDGET = None
 
 backtrace_function = None
 
+# Time-based timeout
+podem_start_time = 0
+podem_timeout = float("inf")
+topological_order = []
+
 
 def get_rl_usage_counters():
     return {
@@ -114,18 +119,10 @@ def podem(
     circuit: List[Gate],
     fault: Fault,
     total_gates: int,
-    backtrace_func: Optional[Callable[[Fault, List[Gate]], Fault]] = None,
+    backtrace_func: Optional[Callable] = None,
+    timeout: float = float("inf")
 ) -> bool:
-    """
-    Main PODEM function
-
-    Args:
-        circuit: Circuit representation
-        fault: Fault to test
-        total_gates: Number of gates
-        agent_type: "simple" | "ppo" | "gcn" | "gcn_rnd" | "ml" (alias for "ppo")
-        model_path: Path to trained model (optional)
-    """
+    """Entry point for PODEM algorithm."""
     global \
         depth, \
         scoap_calculated, \
@@ -135,11 +132,24 @@ def podem(
         rl_budget, \
         gate_distances_back, \
         gate_distances_fwd, \
-        backtrace_function
+        backtrace_function, \
+        podem_start_time, \
+        podem_timeout, \
+        topological_order
+        
+    podem_start_time = time.time()
+    podem_timeout = timeout
+
+    from src.atpg.util import get_topological_order
 
     if not scoap_calculated:
         calculate_scoap(circuit, total_gates)
         scoap_calculated = True
+        topological_order = get_topological_order(circuit, total_gates)
+        
+    # Clear distance maps to force recalculation for each circuit
+    gate_distances_back.clear()
+    gate_distances_fwd.clear()
 
     if backtrace_func is not None:
         backtrace_function = backtrace_func
@@ -187,52 +197,50 @@ def podem(
 
 def podem_recursion(circuit: List[Gate], total_gates: int, fault: Fault) -> int:
     """Core PODEM recursion."""
-    global depth, total_recursive_calls, backtrack_count
+    global depth, total_recursive_calls, backtrack_count, podem_start_time, podem_timeout, topological_order, backtrace_function
     depth += 1
     total_recursive_calls += 1
+    
+    # Backtrack limit to prevent hanging
+    if backtrack_count > 1000:
+        return FAILURE
+        
+    # Wall-clock timeout
+    if (time.time() - podem_start_time) > podem_timeout:
+        return FAILURE
 
     try:
         if fault_is_at_po(circuit, total_gates):
             return SUCCESS
 
-        if logic_sim.podem_fail():
-            return FAILURE
-
         objective = get_objective(circuit, fault)
         if objective.gate_id == -1:
             return FAILURE
 
-        # Backtrace to get PI assignment (use RL if available)
-        backtrace_result = backtrace_wrapper(objective, circuit)
-        _trace(
-            f"[bt][d={depth}] PI {backtrace_result.gate_id} = {backtrace_result.value}"
-        )
-        if backtrace_result.gate_id == -1:
+        # Backtrace to get PI assignment
+        pi_assignment = backtrace_function(objective, circuit)
+        if pi_assignment.gate_id == -1:
             return FAILURE
 
-        pi_id = backtrace_result.gate_id
-        desired = backtrace_result.value
-
-        # First assignment
-        logic_sim_and_impl(circuit, total_gates, fault, backtrace_result)
+        pi_id = pi_assignment.gate_id
+        desired_val = pi_assignment.value
+        
+        # Try desired value
+        circuit[pi_id].val = desired_val
+        logic_sim.logic_sim(circuit, total_gates, fault, topo_order=topological_order)
         if podem_recursion(circuit, total_gates, fault) == SUCCESS:
             return SUCCESS
-
-        backtrace_result.value = 1 - desired
-        _trace(
-            f"[bk][d={depth}] backtrack#{backtrack_count} -> flip PI {pi_id}: {desired}->{backtrace_result.value}"
-        )
-        logic_sim_and_impl(circuit, total_gates, fault, backtrace_result)
-
-        # Recurse with backtracked assignment
+            
+        # Backtrack: try flipped value
+        circuit[pi_id].val = 1 - desired_val
+        logic_sim.logic_sim(circuit, total_gates, fault, topo_order=topological_order)
         if podem_recursion(circuit, total_gates, fault) == SUCCESS:
             return SUCCESS
-
+            
         # Reset PI and return failure
-        _trace(f"[bk][d={depth}] backtrack#{backtrack_count} -> reset PI {pi_id}")
+        circuit[pi_id].val = LogicValue.XD
+        logic_sim.logic_sim(circuit, total_gates, fault, topo_order=topological_order)
         backtrack_count += 1
-        backtrace_result.value = LogicValue.XD
-        logic_sim_and_impl(circuit, total_gates, fault, backtrace_result)
         return FAILURE
 
     finally:

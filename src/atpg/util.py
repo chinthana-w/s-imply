@@ -33,6 +33,29 @@ def calculate_distance_to_primary_inputs(circuit, total_gates):
                     queue.append(v)
     return dists
 
+def get_topological_order(circuit, total_gates):
+    """Kahn's or level-based topological sort."""
+    in_degree = [0] * (total_gates + 1)
+    for i in range(1, total_gates + 1):
+        if circuit[i].type != 0:
+            in_degree[i] = len(circuit[i].fin)
+            
+    order = []
+    # Start with nodes that have 0 in-degree (PIs)
+    queue = deque([i for i in range(1, total_gates + 1) if circuit[i].type != 0 and in_degree[i] == 0])
+    
+    while queue:
+        u = queue.popleft()
+        order.append(u)
+        
+        for v in circuit[u].fot:
+            in_degree[v] -= 1
+            if in_degree[v] == 0:
+                queue.append(v)
+                
+    return order
+
+
 def calculate_distance_to_primary_outputs(circuit, total_gates):
     # Backwards BFS from POs
     dists = {}

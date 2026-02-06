@@ -65,6 +65,17 @@ The training uses a REINFORCE-based policy gradient approach with auxiliary loss
         -   **Anchor Reward**: Bonus for predicting the injected anchor value correctly.
     5.  **Entropy Regularization**: Encourages exploration (`entropy_beta`).
 
+### D. DeepGate Integration (`src/ml/gcn.py`)
+The project integrates **DeepGate**, a Graph Neural Network (GNN)-based model, to provide high-fidelity circuit embeddings.
+
+1.  **Structural & Functional Embeddings**: DeepGate generates 128-dimensional embeddings for every node in the circuit.
+    -   **Structural Embedding (`hs`)**: Captures the topological context of a gate.
+    -   **Functional Embedding (`hf`)**: Captures the logical role and input-output relationships.
+2.  **Environment Management**: DeepGate runs in its own Conda environment (`deepgate`) and is dynamically imported into the S-Imply pipeline via manual `sys.path` configuration.
+3.  **Circuit Pre-processing**: Circuits are converted to AIG (And-Inverter Graph) format before being passed to DeepGate's `BenchParser`.
+
+---
+
 ## 4. Project Structure & Key Files
 
 -   **`src/atpg/`**:
@@ -96,6 +107,20 @@ Following the integration of Regional Consistency and LRR-based labeling, the mo
 -   **Path Logic Consistency (`edge_acc`)**: **91.3%**
 -   **Logic Prediction Accuracy (`acc`)**: **55.2%** (Baseline improvement over 50% random-init sequence matching).
 -   **Throughput**: **16 batches/sec** (Optimized `exit_map` in solver resolved previous deadlocks in complex ISCAS85 circuits).
+
+### B. AI-Assisted PODEM Benchmarking
+**Timestamp: 2026-02-03**
+Integration of DeepGate embeddings and AI-assisted justification/propagation evaluated on ISCAS85:
+
+| Circuit | Mode | Faults | FC (%) | Avg Time/Fault (ms) |
+| :--- | :--- | :--- | :--- | :--- |
+| **c17** | Vanilla | 22 | 100% | 0.09 |
+| **c17** | AI-All | 22 | 100% | 0.70 |
+| **c2670** | Vanilla | 50 | 100% | 119.90 |
+| **c2670** | AI-All | 50 | 100% | 122.37 |
+| **c432** | AI-All | 50 | 8.0%* | 25.78 |
+
+*\*Note: Low FC on c432 is a known issue in the base PODEM implementation related to XOR logic handling and D-frontier sorting, currently under investigation.*
 
 ## 7. Current Challenges & Roadmap
 -   **Handling "Don't Cares" (X)**: The current model predicts binary 0/1. Integrating explicit X prediction or X-tolerance in the loss function is an ongoing area of research.

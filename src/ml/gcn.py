@@ -1,6 +1,11 @@
 import torch
 import argparse
 
+import sys
+deepgate_path = "/home/local1/vicky/python-deepgate"
+if deepgate_path not in sys.path:
+    sys.path.append(deepgate_path)
+
 # Force CPU usage due to CUDA compatibility issues
 device = torch.device('cpu')
 
@@ -51,7 +56,9 @@ def bench_to_embed(bench_path: str) -> tuple[torch.Tensor, torch.Tensor]:
             dummy_hf = torch.randn(1, 128, device=device)
             return dummy_hs, dummy_hf
     except Exception as e:
-        print(f"[ERROR] DeepGate parsing failed for {bench_path}: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"[ERROR] DeepGate failure for {bench_path}: {e}")
         # Return dummy embeddings with correct shape
         dummy_hs = torch.randn(1, 128, device=device)
         dummy_hf = torch.randn(1, 128, device=device)

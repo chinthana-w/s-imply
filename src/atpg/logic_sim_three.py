@@ -1,252 +1,183 @@
-"""
-Logic Simulation Module for PODEM Algorithm
-Based on the C implementation from legacy/user.c
-"""
-from typing import List
 
+from typing import List, Dict, Optional
 from src.util.struct import Gate, GateType, LogicValue
 
-# Lookup tables for gates (based on C implementation)
-AND_GATE = [
-    [0, 0, 0],
-    [0, 1, 2],
-    [0, 2, 2],
+# Logic Tables
+AND_TABLE = [
+    [0, 0, 0, 0, 0],
+    [0, 1, 2, 3, 4],
+    [0, 2, 2, 2, 2],
+    [0, 3, 2, 3, 0],
+    [0, 4, 2, 0, 4],
 ]
 
-OR_GATE = [
-    [0, 1, 2],
-    [1, 1, 1],
-    [2, 1, 2],
+OR_TABLE = [
+    [0, 1, 2, 3, 4],
+    [1, 1, 1, 1, 1],
+    [2, 1, 2, 2, 2],
+    [3, 1, 2, 3, 1],
+    [4, 1, 2, 1, 4],
 ]
 
-XOR_GATE = [
-    [0, 1, 2],
-    [1, 0, 2],
-    [2, 2, 2],
-]
+NOT_TABLE = [1, 0, 2, 4, 3]
 
-NOT_GATE = [1, 0, 2]
+def compute_gate_value(circuit: List[Gate], g: Gate) -> int:
+    """Compute the logic value of a gate based on its inputs."""
+    if g.type in (GateType.FROM, GateType.BUFF):
+        return circuit[g.fin[0]].val
+    elif g.type == GateType.NOT:
+        return NOT_TABLE[circuit[g.fin[0]].val]
+    elif g.type == GateType.AND:
+        res = 1
+        for fin in g.fin:
+            res = AND_TABLE[res][circuit[fin].val]
+        return res
+    elif g.type == GateType.NAND:
+        res = 1
+        for fin in g.fin:
+            res = AND_TABLE[res][circuit[fin].val]
+        return NOT_TABLE[res]
+    elif g.type == GateType.OR:
+        res = 0
+        for fin in g.fin:
+            res = OR_TABLE[res][circuit[fin].val]
+        return res
+    elif g.type == GateType.NOR:
+        res = 0
+        for fin in g.fin:
+            res = OR_TABLE[res][circuit[fin].val]
+        return NOT_TABLE[res]
+    elif g.type == GateType.XOR:
+        # XOR(a, b) = a'b + ab'
+        a = circuit[g.fin[0]].val
+        b = circuit[g.fin[1]].val
+        # Simplified XOR for 5-valued logic
+        # 0^0=0, 0^1=1, 1^0=1, 1^1=0
+        # For D/DB/X, it gets complex, but this table-based approach works:
+        return XOR_TABLE[a][b]
+    elif g.type == GateType.XNOR:
+        a = circuit[g.fin[0]].val
+        b = circuit[g.fin[1]].val
+        return NOT_TABLE[XOR_TABLE[a][b]]
+    return LogicValue.XD
+
+XOR_TABLE = [
+    [0, 1, 2, 3, 4],
+    [1, 0, 2, 4, 3],
+    [2, 2, 2, 2, 2],
+    [3, 4, 2, 0, 1],
+    [4, 3, 2, 1, 0],
+]
 
 class DFrontier:
-    """Manages the D-frontier."""
     def __init__(self):
-        self._gates = []
-    
-    def is_empty(self):
-        return len(self._gates) == 0
-        
-    def get_first(self):
-        return self._gates[0] if self._gates else None
-
-    def clear(self):
-        self._gates = []
-
+        self.gates = []
     def add(self, gate_id):
-        self._gates.append(gate_id)
-
+        if gate_id not in self.gates:
+            self.gates.append(gate_id)
+    def remove(self, gate_id):
+        if gate_id in self.gates:
+            self.gates.remove(gate_id)
+    def is_empty(self):
+        return len(self.gates) == 0
+    def get_first(self):
+        return self.gates[0] if self.gates else None
+    def clear(self):
+        self.gates = []
     def sort(self, key_func):
-        self._gates.sort(key=key_func)
+        self.gates.sort(key=key_func)
 
-# Global D-frontier
 d_frontier = DFrontier()
+_dist_map = {}
 
 def set_d_frontier_sort(distance_map):
-    pass # Sorting logic handled outside or not strictly needed for basic func
+    global _dist_map
+    _dist_map = distance_map
 
-def logic_sim(circuit: List[Gate], total_gates: int) -> None:
-    """
-    Logic simulation with fault injection and implication
-    Based on LogicSimAndImpl from C implementation
-    """
-    # Simply simulate (assuming ordered iteration or event driven. Here simple iteration 1 pass)
-    # PODEM often needs event driven or ordered.
-    # The provided loop iterates 0..total_gates. Assuming topologically sorted or handled.
+def logic_sim(circuit: List[Gate], total_gates: int, fault=None, topo_order=None) -> None:
+    """Logic simulation. Uses topo_order for single-pass if provided."""
+    if topo_order:
+        for i in topo_order:
+            g = circuit[i]
+            if g.type == GateType.INPT:
+                if fault and i == fault.gate_id:
+                    if fault.value == LogicValue.D and g.val == LogicValue.ONE:
+                        g.val = LogicValue.D
+                    elif fault.value == LogicValue.DB and g.val == LogicValue.ZERO:
+                        g.val = LogicValue.DB
+                continue
+            
+            new_val = compute_gate_value(circuit, g)
+            
+            if fault and i == fault.gate_id:
+                if fault.value == LogicValue.D and new_val == LogicValue.ONE:
+                    new_val = LogicValue.D
+                elif fault.value == LogicValue.DB and new_val == LogicValue.ZERO:
+                    new_val = LogicValue.DB
+            g.val = new_val
+    else:
+        changed = True
+        passes = 0
+        while changed and passes < 100:
+            changed = False
+            passes += 1
+            for i in range(1, total_gates + 1):
+                g = circuit[i]
+                old_val = g.val
+                if g.type == GateType.INPT:
+                    if fault and i == fault.gate_id:
+                        if fault.value == LogicValue.D and g.val == LogicValue.ONE:
+                            g.val = LogicValue.D
+                        elif fault.value == LogicValue.DB and g.val == LogicValue.ZERO:
+                            g.val = LogicValue.DB
+                    if g.val != old_val: changed = True
+                    continue
+                
+                new_val = compute_gate_value(circuit, g)
+                if fault and i == fault.gate_id:
+                    if fault.value == LogicValue.D and new_val == LogicValue.ONE:
+                        new_val = LogicValue.D
+                    elif fault.value == LogicValue.DB and new_val == LogicValue.ZERO:
+                        new_val = LogicValue.DB
+                
+                if new_val != old_val:
+                    g.val = new_val
+                    changed = True
     
+    # Update D-frontier
     d_frontier.clear()
-    
-    for node_index in range(0, total_gates + 1):
-        current_node = circuit[node_index]
-
-        # Skip if node is not active
-        if current_node.type == 0:
-            continue
-            
-        # Logic simulation based on gate type
-        if current_node.type == GateType.INPT:
-            pass  # Primary input, value already set
-        elif current_node.type == GateType.FROM:
-            current_node.val = circuit[current_node.fin[0]].val
-        elif current_node.type == GateType.BUFF:
-            current_node.val = circuit[current_node.fin[0]].val
-        elif current_node.type == GateType.NOT:
-            current_node.val = NOT_GATE[circuit[current_node.fin[0]].val]
-
-        elif current_node.type == GateType.AND:
-            node_result = 1
-            for fanin_id in current_node.fin:
-                if node_result == 0:
-                    break
-                node_result = AND_GATE[node_result][circuit[fanin_id].val]
-
-            current_node.val = node_result
-
-        elif current_node.type == GateType.NAND:
-            node_result = 1
-            for fanin_id in current_node.fin:
-                if node_result == 0:
-                    break
-                node_result = AND_GATE[node_result][circuit[fanin_id].val]
-
-            current_node.val = NOT_GATE[node_result]
-
-        elif current_node.type == GateType.OR:
-            node_result = 0
-            for fanin_id in current_node.fin:
-                if node_result == 1:
-                    break
-                node_result = OR_GATE[node_result][circuit[fanin_id].val]
-
-            current_node.val = node_result
-
-        elif current_node.type == GateType.NOR:
-            node_result = 0
-            for fanin_id in current_node.fin:
-                if node_result == 1:
-                    break
-                node_result = OR_GATE[node_result][circuit[fanin_id].val]
-
-            current_node.val = NOT_GATE[node_result]
-
-        elif current_node.type == GateType.XOR:
-            node_result = circuit[current_node.fin[0]].val
-            for fanin_id in current_node.fin[1:]:
-                if node_result == LogicValue.XD:
-                    break
-                node_result = XOR_GATE[node_result][circuit[fanin_id].val]
-
-            current_node.val = node_result
-
-        elif current_node.type == GateType.XNOR:
-            node_result = circuit[current_node.fin[0]].val
-            for fanin_id in current_node.fin[1:]:
-                if node_result == LogicValue.XD:
-                    break
-                node_result = XOR_GATE[node_result][circuit[fanin_id].val]
-
-            current_node.val = NOT_GATE[node_result]
-            
-        # D-Frontier Update
-        if current_node.val == LogicValue.XD:
-            # Check if any input has fault effect (D or DB)
-            has_fault_effect = False
-            for fin in current_node.fin:
+    for i in range(1, total_gates + 1):
+        if circuit[i].val == LogicValue.XD:
+            for fin in circuit[i].fin:
                 if circuit[fin].val in (LogicValue.D, LogicValue.DB):
-                    has_fault_effect = True
+                    d_frontier.add(i)
                     break
-            if has_fault_effect:
-                d_frontier.add(node_index)
-
+    if _dist_map:
+        d_frontier.sort(key_func=lambda gid: _dist_map.get(gid, 999999))
 
 def logic_sim_and_impl(circuit: List[Gate], total_gates: int, fault, assignment) -> None:
-    # 1. Apply assignment (if valid)
-    if assignment.gate_id != -1 and assignment.value != -1:
-         circuit[assignment.gate_id].val = assignment.value
-         
-    # 2. Inject Fault (if current state matches condition)
-    # Actually, logic_sim usually handles fault injection implicitly or we need to modify gate val?
-    # Simple logic sim:
-    
-    # Run simulation
-    logic_sim(circuit, total_gates)
-    
-    # 3. Post-process Fault Injection?
-    # Usually we inject fault by flipping value at fault site if activated.
-    # Check fault site:
-    f_gate = circuit[fault.gate_id]
-    
-    # If fault is SA0 (val=D -> good=1, faulty=0)
-    # If calculated val is 1 (Good), we change it to D.
-    # If calculated val is 0, no fault effect (0/0).
-    
-    if fault.value == LogicValue.D: # SA0
-        if f_gate.val == LogicValue.ONE:
-            f_gate.val = LogicValue.D
-        elif f_gate.val == LogicValue.ZERO:
-            pass # 0/0
-        # What if X? X/0 -> maybe? simple sim keeps X.
-        
-    elif fault.value == LogicValue.DB: # SA1
-        if f_gate.val == LogicValue.ZERO:
-            f_gate.val = LogicValue.DB
-        elif f_gate.val == LogicValue.ONE:
-            pass # 1/1
+    if assignment and assignment.gate_id != -1:
+        circuit[assignment.gate_id].val = assignment.value
+    logic_sim(circuit, total_gates, fault)
 
-    # Re-propagate fault effects?
-    # Since we changed a value, we might need to propagate again from fault site forward.
-    # But simple logic_sim iterates all.
-    # If we iterate 0..total_gates, and fault site is visited, the change persists?
-    # But standard logic_sim calculates based on inputs.
-    # If we modify f_gate.val AFTER logic_sim loop, forward gates are not updated.
-    # We should integrate injection INTO logic_sim loop.
-    
-    # Let's simple-hack: set it and re-run logic_sim?
-    # But logic_sim overwrites it based on inputs!
-    # So we need logic_sim to be fault-aware or modify input gates?
-    # Or overwrite AFTER computing current_node.val inside logic_sim.
-    # For now, let's just make logic_sim fault aware?
-    # Or just modify `logic_sim` above to handle fault injection?
-    # The `fault` argument is missing from standard logic_sim signature I created.
-    
-    pass
-
-def podem_fail():
-    return False # Placeholder
-
-def fault_is_at_po(circuit, total_gates):
-    for i in range(1, total_gates+1):
-        if circuit[i].nfo == 0 and circuit[i].val in (LogicValue.D, LogicValue.DB):
-            return True
-    return False
-
-def reset_gates(circuit: List[Gate], total_gates: int):
-    """
-    Reset all gates to unknown state
-    Based on reset_gates from C implementation
-    """
-    for node_index in range(total_gates + 1):
-        circuit[node_index].val = LogicValue.XD
-        
+def reset_gates(circuit: List[Gate], total_gates: int) -> None:
+    for i in range(total_gates + 1):
+        if circuit[i]:
+            circuit[i].val = LogicValue.XD
     d_frontier.clear()
 
-def print_pi(circuit: List[Gate], total_gates: int) -> str:
-    """
-    Print primary input values
-    Based on printPI from C implementation
-    """
-    result = ""
-    for i in range(1, total_gates + 1):
-        if circuit[i].type != 0 and circuit[i].nfi == 0:
-            if circuit[i].val == LogicValue.XD:
-                result += "X"
-            elif circuit[i].val == LogicValue.D:
-                result += "1"  # D represents good=1, faulty=0
-            elif circuit[i].val == LogicValue.DB:
-                result += "0"  # D-bar represents good=0, faulty=1
-            elif circuit[i].val == 0:
-                result += "0"
-            elif circuit[i].val == 1:
-                result += "1"
-            else:
-                result += "X"  # Default to X for unexpected values
-    return result
-
-def print_po(circuit: List[Gate], total_gates: int) -> str:
-    """
-    Print primary output values
-    Based on printPO from C implementation
-    """
-    result = ""
+def fault_is_at_po(circuit: List[Gate], total_gates: int) -> bool:
+    """Check if any primary output has a fault value (D or DB)."""
     for i in range(1, total_gates + 1):
         if circuit[i].type != 0 and circuit[i].nfo == 0:
-            result += str(circuit[i].val)
-    return result
+            if circuit[i].val in (LogicValue.D, LogicValue.DB):
+                return True
+    return False
+
+def print_pi(circuit: List[Gate], total_gates: int) -> str:
+    """Returns string represention of PI values."""
+    res = []
+    for i in range(1, total_gates + 1):
+        if circuit[i].type == GateType.INPT:
+            res.append(str(int(circuit[i].val)))
+    return "".join(res)

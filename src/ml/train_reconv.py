@@ -22,11 +22,15 @@ from __future__ import annotations
 import argparse
 from typing import List, Optional, Dict, Tuple
 import os
+import warnings
 from dataclasses import dataclass, asdict
 from functools import lru_cache
 from typing import Tuple
 import time
 from tqdm import tqdm
+
+# Suppress annoying prototype warnings from PyTorch transformer
+warnings.filterwarnings("ignore", message="The PyTorch API of nested tensors is in prototype stage")
 
 import torch
 from torch import nn
