@@ -2,7 +2,7 @@
 import os
 import torch
 import collections
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from src.util.struct import LogicValue, Gate, GateType, Fault
 from src.atpg.podem import podem, backtrace_wrapper, initialize, get_all_faults, simple_backtrace
@@ -13,30 +13,52 @@ class AIBacktracer:
     Backtrace function that uses HierarchicalReconvSolver to satisfy objectives.
     Falls back to simple_backtrace if AI fails.
     """
-    def __init__(self, solver: HierarchicalReconvSolver):
+    def __init__(self, solver: HierarchicalReconvSolver, verbose: bool = False):
         self.solver = solver
         self.circuit = solver.circuit
+        self.verbose = verbose
         
     def __call__(self, objective: Fault, circuit: List[Gate]) -> Fault:
         # Objective: gate_id, value. Try AI Solve.
+        if self.verbose: print(f"[AI-BT] Objective: Gate {objective.gate_id} = {objective.value}")
         try:
             # Build constraints from currently assigned PIs
             current_constraints = {}
-            for g in self.circuit:
+            for i, g in enumerate(self.circuit):
                if g.type == GateType.INPT and g.val in (LogicValue.ZERO, LogicValue.ONE):
-                   current_constraints[g.node_id] = g.val
+                   current_constraints[i] = g.val
 
+            if self.verbose: print(f"  [AI-BT] Constraints: {current_constraints}")
             solution = self.solver.solve(objective.gate_id, objective.value, current_constraints)
             
             if solution:
-                # Return ONE unassigned PI from solution
+                if self.verbose: print(f"  [AI-BT] Solution: {solution}")
+                # 1. Try to find a direct PI assignment
                 for gid, val in solution.items():
                     if self.circuit[gid].type == GateType.INPT and self.circuit[gid].val == LogicValue.XD:
+                         if self.verbose: print(f"  [AI-BT] Returning assignment: Gate {gid}={val}")
                          return Fault(gid, val)
+                
+                # 2. If no PI, finding an internal node in solution that needs justification
+                #    and use simple_backtrace to reach a PI from there.
+                if self.verbose: print("  [AI-BT] No direct PI found. Looking for intermediate objectives...")
+                for gid, val in solution.items():
+                     if self.circuit[gid].val == LogicValue.XD:
+                         if self.verbose: print(f"  [AI-BT] Delegating to simple_backtrace for internal objective: Gate {gid}={val}")
+                         return simple_backtrace(Fault(gid, val), circuit)
+                         
+                if self.verbose: print("  [AI-BT] Solution found but all nodes already assigned/consistent?")
+            else:
+                 if self.verbose: print("  [AI-BT] No solution from solver.")
         except Exception as e:
+            if self.verbose:
+                print(f"  [AI-BT] Error: {e}")
+                import traceback
+                traceback.print_exc()
             pass
             
         # Fallback to simple
+        if self.verbose: print("  [AI-BT] Fallback to simple_backtrace")
         return simple_backtrace(objective, circuit)
 
 from src.atpg.reconv_podem import PathConsistencySolver
@@ -104,38 +126,52 @@ class ModelPairPredictor(ReconvPairPredictor):
         self, 
         pair_info: Dict[str, Any], 
         constraints: Dict[int, LogicValue]
-    ) -> List[Dict[int, LogicValue]]:
-        
+    ) -> Tuple[List[Dict[int, LogicValue]], Optional[Dict[str, Any]]]:
         if self.struct_emb is None or self.model is None:
             # Fallback to pure solver if model failed
             return self._fallback_solve(pair_info, constraints)
 
         # 1. Prepare Batch for Model
-        # Need paths embedding [1, P, L, D] and node_ids/gate_types
-        # pair_info paths are [S, ..., R].
         
         paths = pair_info['paths']
+        
+        # Optimization: If all nodes in paths already have values, use them directly
+        all_constrained = True
+        precomputed_assignment = {}
+        for p in paths:
+            for nid in p:
+                if nid in constraints:
+                    precomputed_assignment[nid] = constraints[nid]
+                else:
+                    all_constrained = False
+                    break
+            if not all_constrained:
+                break
+        
+        if all_constrained and precomputed_assignment:
+            # All gates already have values - skip model, return existing values
+            return [precomputed_assignment], None
+        
         # Convert path node IDs to AIG IDs to get embeddings
         path_embs_list = []
         gate_types_list = []
-        
-        valid_input = True
+        node_ids_list = [] # For saving state
         
         max_len = max(len(p) for p in paths)
         
         for p in paths:
             p_emb = []
             p_types = []
+            p_ids = []
             for nid in p:
+                p_ids.append(nid)
                 if nid in self.gate_mapping:
                     aig_id = self.gate_mapping[nid]
                     if aig_id < self.struct_emb.size(0):
                         p_emb.append(self.struct_emb[aig_id])
                     else:
-                        # Should not happen if mapping is correct
                         p_emb.append(torch.zeros(128, device=self.device))
                 else:
-                    # Missing mapping? Use zero vector
                     p_emb.append(torch.zeros(128, device=self.device))
                 # Pad to 132 (4 extra logic dims)
                 if len(p_emb[-1]) < 132:
@@ -152,32 +188,35 @@ class ModelPairPredictor(ReconvPairPredictor):
             while len(p_emb) < max_len:
                 p_emb.append(torch.zeros(132, device=self.device))
                 p_types.append(0)
+                p_ids.append(0)
             
             path_embs_list.append(torch.stack(p_emb))
             gate_types_list.append(torch.tensor(p_types, device=self.device))
+            node_ids_list.append(torch.tensor(p_ids, device=self.device))
 
         # Stack to [1, P, L, D]
-        batch_embs = torch.stack(path_embs_list).unsqueeze(0) # [1, P, L, D]
-        batch_types = torch.stack(gate_types_list).unsqueeze(0) # [1, P, L]
+        batch_embs = torch.stack(path_embs_list).unsqueeze(0) 
+        batch_types = torch.stack(gate_types_list).unsqueeze(0)
+        batch_ids = torch.stack(node_ids_list).unsqueeze(0)
+        
         batch_mask = torch.ones((1, len(paths), max_len), dtype=torch.bool, device=self.device)
-        # TODO: Adjust mask for padding if paths had different lengths (handled by append loop implicitly?)
-        # Yes, we padded with valid tensors, but conceptually they are padding.
-        # Attention mask used in transformer: False means ignored.
         for i, p in enumerate(paths):
             batch_mask[0, i, len(p):] = False
 
+        # Snapshot for RL (Clone to CPU)
+        inputs_snapshot = {
+            'node_ids': batch_ids.cpu(),
+            'mask_valid': batch_mask.cpu(),
+            'gate_types': batch_types.cpu(),
+            'files': [self.circuit_path]
+        }
+        
         # 2. Run Inference
         with torch.no_grad():
             logits, solv_logits = self.model(batch_embs, batch_mask, batch_types)
         
-        # 3. Decode Logits to Assignments
-        # Logic: We want to extract valid assignments for the path nodes.
-        # The model predicts probability of 0/1 for each node.
-        # We can greedy decode or sample.
-        # But we must respect `constraints`.
-        
+        # 3. Decode Logits
         probs = torch.softmax(logits, dim=-1) # [1, P, L, 2]
-        # Get top predictions
         vals = torch.argmax(probs, dim=-1).squeeze(0) # [P, L]
         
         predicted_assignment = {}
@@ -185,73 +224,27 @@ class ModelPairPredictor(ReconvPairPredictor):
         
         for i, p in enumerate(paths):
             for j, nid in enumerate(p):
-                # Check if padded
                 if j >= len(p): continue
-                
                 val = int(vals[i, j].item())
-                # LogicValue enum: 0->ZERO, 1->ONE
                 lv = LogicValue.ZERO if val == 0 else LogicValue.ONE
                 
                 if nid in constraints:
                     if constraints[nid] != lv:
-                        # Model prediction conflicts with constraint!
-                        # Trust constraint or Model? 
-                        # Constraints are hard facts (from previous decisions).
-                        # If Model disagrees, model is wrong about this node context.
-                        # We can try to enforce the constraint or just mark as conflict.
-                        # But wait, predict() should return *candidates*. 
-                        # A generic predictor might just return what it thinks.
-                        # We need to filter/adjust.
                         lv = constraints[nid]
                 
                 if nid in predicted_assignment:
                     if predicted_assignment[nid] != lv:
-                        # Internal conflict in prediction (same node in multiple paths)
-                        # Pick one or fail?
                         conflict = True
                 
                 predicted_assignment[nid] = lv
         
-        # Verify this assignment is locally consistent using Solver
-        # Because raw model prediction might be invalid logic (e.g. AND(1,1)=0).
-        # We use the solver to "repair" or validate.
-        # Actually, simpler: Use solver to find valid solution *using prediction as heuristic*.
-        # OR: Just return the predicted map and let recursive solver's implicit checks handle it?
-        # Parameter `predict` says "returns ranked list of valid assignments".
-        # So we should validate.
-        
-        # Let's try to validate/fix using solver.
-        # We use the predicted values as preferred constraints?
-        # Or we just use `_fallback_solve` filtering by prediction logic?
-        
-        # Better approach: Use solver to enumerate solutions, rank them by model probability?
-        # If solver is cheap enough for a single pair.
-        # PathConsistencySolver uses backtrace, it's relatively fast.
-        
-        return self._rank_solutions_with_model(pair_info, constraints, probs, paths, predicted_assignment)
+        return self._rank_solutions_with_model(pair_info, constraints, probs, paths, predicted_assignment, inputs_snapshot)
 
-    def _rank_solutions_with_model(self, pair_info, constraints, probs, paths, predicted_assignment):
-        # We need ALL solutions from solver, then rank them.
-        # But solver backtrace returns *one* solution or boolean?
-        # `PathConsistencySolver.solve` returns *one* assignment or None.
-        # It doesn't enumerate.
-        
-        # So we rely on `_fallback_solve` pattern: try target values.
-        # BUT `reconv_podem.PathConsistencySolver` is not designed to enumerate.
-        # Maybe we can use the Model's top choice, if valid.
-        
-        # Let's trust the model's output as a *candidate*.
-        # We verify it.
-        # Since we constructed `predicted_assignment` above, let's verify logic consistency.
-        # We can run a mini-sim or check edges.
-        
-        # If model prediction is invalid, we fall back to generic solver logic.
-        
+    def _rank_solutions_with_model(self, pair_info, constraints, probs, paths, predicted_assignment, inputs_snapshot):
         if self._verify_assignment_logic(predicted_assignment):
-             return [predicted_assignment]
+             return [predicted_assignment], inputs_snapshot
         
-        # If invalid, return fallback
-        return self._fallback_solve(pair_info, constraints)
+        return self._fallback_solve(pair_info, constraints)[0], inputs_snapshot
 
     def _verify_assignment_logic(self, assignment):
         # Quick check of all gates in assignment
@@ -271,28 +264,48 @@ class ModelPairPredictor(ReconvPairPredictor):
             
             if all_inputs_present:
                  # Check consistency
-                 # LogicValue 0/1 match?
-                 # Need a helper to compute gate.
-                 # Reusing simple compute from reconv_podem or just manual
                  pass
-        return True # Placeholder: assume model is decent or let recursive solver catch conflicts deeper
+        return True 
 
-    def _fallback_solve(self, pair_info, constraints):
-        # Try both 0 and 1 for Reconvergence Node if not constrained
-        # Return valid ones.
+    def _fallback_solve(self, pair_info, constraints) -> Tuple[List[Dict[int, LogicValue]], Optional[Dict[str, Any]]]:
+        # Try both 0 and 1 for Reconvergence Node
         reconv_node = pair_info['reconv']
         targets = []
         if reconv_node in constraints:
             targets.append(constraints[reconv_node])
         else:
             targets = [LogicValue.ZERO, LogicValue.ONE]
+        
+        # Create minimal snapshot for RL tracking even in fallback
+        paths = pair_info.get('paths', [])
+        if paths:
+            max_len = max(len(p) for p in paths)
+            node_ids = torch.zeros(1, len(paths), max_len, dtype=torch.long)
+            mask_valid = torch.zeros(1, len(paths), max_len, dtype=torch.bool)
+            gate_types = torch.zeros(1, len(paths), max_len, dtype=torch.long)
+            
+            for i, p in enumerate(paths):
+                for j, nid in enumerate(p):
+                    node_ids[0, i, j] = nid
+                    mask_valid[0, i, j] = True
+                    if nid < len(self.circuit):
+                        gate_types[0, i, j] = self.circuit[nid].type
+            
+            snapshot = {
+                'node_ids': node_ids,
+                'mask_valid': mask_valid,
+                'gate_types': gate_types,
+                'files': [self.circuit_path]
+            }
+        else:
+            snapshot = None
             
         candidates = []
         for t in targets:
             res = self.solver.solve(pair_info, t, constraints)
             if res:
                 candidates.append(res)
-        return candidates
+        return candidates, snapshot
 
 
 def ai_podem(
@@ -357,7 +370,7 @@ def ai_podem(
     
     backtracer = None
     if enable_ai_propagation and solver:
-        backtracer = AIBacktracer(solver)
+        backtracer = AIBacktracer(solver, verbose=verbose)
         
     result = mogu_podem_wrapper(circuit, fault, total_gates, backtrace_func=backtracer)
     

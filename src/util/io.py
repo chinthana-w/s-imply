@@ -59,12 +59,15 @@ def parse_bench_file(filename: str) -> Tuple[List[Gate], int]:
     circuit = [Gate() for _ in range(max_node_id + 1)]
     for node_id in inputs:
         circuit[node_id] = Gate(str(node_id), GateType.INPT, 0, 0, 0, LogicValue.XD)
+        circuit[node_id].fin = []
+        circuit[node_id].fot = []
     for node_id, gate_type_str, input_ids in gates:
         gate_type = get_gate_type(gate_type_str)
         circuit[node_id] = Gate(
             str(node_id), gate_type, len(input_ids), 0, 0, LogicValue.XD
         )
         circuit[node_id].fin = input_ids
+        circuit[node_id].fot = []
         for input_id in input_ids:
             if circuit[input_id].fot is None:
                 circuit[input_id].fot = []

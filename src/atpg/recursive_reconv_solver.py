@@ -46,13 +46,17 @@ class HierarchicalReconvSolver:
     ordered from shortest to longest.
     """
 
-    def __init__(self, circuit: List[Gate], predictor: ReconvPairPredictor):
+    def __init__(self, circuit: List[Gate], predictor: ReconvPairPredictor, recorder = None):
         self.circuit = circuit
         self.predictor = predictor
+        self.recorder = recorder
         # Helper for consistency checks, reused from existing codebase
         self.consistency_checker = PathConsistencySolver(circuit)
+        
+        # Populate fanout lists from fanin (if not already present)
+        self._populate_fanouts()
 
-    def solve(self, target_node: int, target_val: LogicValue) -> Optional[Dict[int, LogicValue]]:
+    def solve(self, target_node: int, target_val: LogicValue, constraints: Dict[int, LogicValue] = None) -> Optional[Dict[int, LogicValue]]:
         """
         Main entry point. Tries to justify target_node = target_val.
         
@@ -64,11 +68,16 @@ class HierarchicalReconvSolver:
         # 1. & 2. Find relevant pairs
         pairs = self._collect_and_sort_pairs(target_node)
         
-        # Initial constraints: just the target
-        constraints = {target_node: target_val}
+        # Initial constraints: target + provided constraints
+        initial_constraints = {}
+        if constraints:
+            initial_constraints.update(constraints)
+        
+        # Set/Overwrite target requirement (critical!)
+        initial_constraints[target_node] = target_val
         
         # 3. Recursive Solve
-        final_assignment = self._solve_recursive(0, pairs, constraints)
+        final_assignment = self._solve_recursive(0, pairs, initial_constraints)
         
         return final_assignment
 
@@ -113,6 +122,20 @@ class HierarchicalReconvSolver:
                     queue.append(fin)
         return seen
 
+    def _populate_fanouts(self):
+        """Build fanout lists from fanin relationships if not present."""
+        # Initialize empty fanout lists
+        for gate in self.circuit:
+            if not hasattr(gate, 'fot') or gate.fot is None:
+                gate.fot = []
+        
+        # Build fanouts from fanins
+        for gate_id, gate in enumerate(self.circuit):
+            for fin_id in gate.fin:
+                if fin_id < len(self.circuit):
+                    if gate_id not in self.circuit[fin_id].fot:
+                        self.circuit[fin_id].fot.append(gate_id)
+
     def _find_pairs_in_set(self, allowed_nodes: Set[int]) -> List[Dict[str, Any]]:
         """
         Find reconvergent pairs where all path nodes are in allowed_nodes.
@@ -133,6 +156,9 @@ class HierarchicalReconvSolver:
             # We track which branch (index in valid_fot) reached a node
             start_gate = self.circuit[s]
             valid_fot = [fo for fo in (getattr(start_gate, 'fot', []) or []) if fo in allowed_nodes]
+            
+            # Track reported reconvergence nodes for this stem to avoid duplicates
+            reported_reconvs = set()
             
             # reached[node] = {branch_idx: path_list}
             reached = {} 
@@ -163,15 +189,15 @@ class HierarchicalReconvSolver:
                     p2 = reached[curr][b2]
                     
                     # Avoid duplicates? (s, curr)
-                    # We add to results.
-                    results.append({
-                        'start': s,
-                        'reconv': curr,
-                        'branches': [valid_fot[b1], valid_fot[b2]], # Branch specific nodes?
-                        # Actually 'branches' usually refers to S's immediate fanouts.
-                        # But here indices match valid_fot.
-                        'paths': [p1, p2]
-                    })
+                    # We add to results if not already reported for this stem.
+                    if curr not in reported_reconvs:
+                        reported_reconvs.add(curr)
+                        results.append({
+                            'start': s,
+                            'reconv': curr,
+                            'branches': [valid_fot[b1], valid_fot[b2]], # Branch specific nodes
+                            'paths': [p1, p2]
+                        })
                     
                     # Do we continue from here? Yes, might reach further reconvergence.
                     
@@ -231,18 +257,21 @@ class HierarchicalReconvSolver:
         # Base Case: All pairs processed
         if pair_idx >= len(pairs):
             return current_constraints
-
-        pair = pairs[pair_idx]
         
-        # Check if pair is already fully satisfied/decided by current constraints?
-        # If the start and reconv nodes and critical path nodes are already set, 
-        # we might just verify consistency and skip prediction.
-        # But prediction might fill in internal nodes ("justification").
-        # So we should ask the predictor for a compatible assignment.
+        pair = pairs[pair_idx]
         
         # Get candidate solutions from Oracle
         # The predictor should return solutions that respect `current_constraints`.
-        candidates = self.predictor.predict(pair, current_constraints)
+        
+        # UPDATE: Predictor now returns (candidates, inputs_snapshot)
+        prediction_result = self.predictor.predict(pair, current_constraints)
+        
+        # Handle backward compatibility if someone hasn't updated their predictor class
+        inputs_snapshot = None
+        if isinstance(prediction_result, tuple):
+             candidates, inputs_snapshot = prediction_result
+        else:
+             candidates = prediction_result
         
         if not candidates:
             # If the model cannot find any solution for this pair given constraints,
@@ -250,6 +279,21 @@ class HierarchicalReconvSolver:
             return None
             
         for assignment_part in candidates:
+            # Log this decision attempt if recording
+            step_record = None
+            if self.recorder and inputs_snapshot:
+                 # Log the attempt. 
+                 # We record the snapshot and the chosen assignment.
+                 # Note: "candidates" is a ranked list. We are trying "assignment_part" now.
+                 step_record = self.recorder.log_step(
+                     node_ids=inputs_snapshot['node_ids'],
+                     mask_valid=inputs_snapshot['mask_valid'],
+                     gate_types=inputs_snapshot['gate_types'],
+                     files=inputs_snapshot['files'],
+                     pair_info=pair,
+                     selected_assignment=assignment_part
+                 )
+
             # 1. Merge assignment
             # (Logic consistency is assumed enforced by predictor, but we can double check)
             new_constraints = current_constraints.copy()
@@ -263,6 +307,9 @@ class HierarchicalReconvSolver:
                     new_constraints[k] = v
             
             if conflict:
+                if step_record and self.recorder:
+                     # Immediate conflict -> local failure
+                     self.recorder.mark_backtrack(penalty=-0.5) 
                 continue
                 
             # 2. Recurse
@@ -270,8 +317,16 @@ class HierarchicalReconvSolver:
             
             if result is not None:
                 # Found a valid complete assignment!
+                # We do NOT mark success here per pair, 
+                # but implicit success is that we don't penalize.
+                # Global success will reward everyone later.
                 return result
-                
+            
+            # If we returned None, it means a conflict happened deeper in the recursion.
+            # This choice (assignment_part) led to a failure.
+            if step_record and self.recorder:
+                 self.recorder.mark_backtrack(penalty=-0.5)
+                 
         # If no candidates lead to a solution, backtrack.
         return None
 
