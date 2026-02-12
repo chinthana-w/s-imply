@@ -96,6 +96,10 @@ class TrainConfig:
     lambda_logic: float = 0.0  # Weight for reconvergence logic consistency loss
     lambda_full_logic: float = 0.0  # Weight for full-path gate consistency loss
 
+    # Gumbel Softmax
+    gumbel_temp: float = 1.0
+    gumbel_anneal_rate: float = 0.99
+
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
     # Use config processed_dir if provided, else auto-detect
@@ -635,7 +639,7 @@ def policy_loss_and_metrics(
 def calculate_logic_loss(
     node_ids: torch.Tensor,     # [B, P, L]
     gate_types: torch.Tensor,   # [B, P, L]
-    logits: torch.Tensor,       # [B, P, L, 2]
+    probs: torch.Tensor,        # [B, P, L, 2] - Gumbel Softmax Outputs
     mask_valid: torch.Tensor,   # [B, P, L]
     device: torch.device
 ) -> torch.Tensor:
@@ -667,8 +671,8 @@ def calculate_logic_loss(
     last_idx = (path_lens - 1).clamp(min=0)
     second_last = (last_idx - 1).clamp(min=0)
     
-    # Get Probabilities of logic-1
-    probs_1 = torch.softmax(logits, dim=-1)[..., 1] # [B, P, L]
+    # Get Probabilities of logic-1 (Using Gumbel Softmax output passed in)
+    probs_1 = probs[..., 1] # [B, P, L]
     
     # Gather output probs: [B, P]
     # We gather from [B, P, L] using indices [B, P]
@@ -777,16 +781,15 @@ def calculate_logic_loss(
 
 def calculate_full_logic_loss(
     gate_types: torch.Tensor,   # [B, P, L]
-    logits: torch.Tensor,       # [B, P, L, 2]
+    probs: torch.Tensor,       # [B, P, L, 2]
     mask_valid: torch.Tensor,   # [B, P, L]
     device: torch.device
 ) -> torch.Tensor:
     """
     Full-path gate consistency loss.
     Penalizes ALL edge-level gate logic violations along paths as a direct
-    differentiable loss (not just reward shaping).
     """
-    probs_1 = torch.softmax(logits, dim=-1)[..., 1]  # [B, P, L]
+    probs_1 = probs[..., 1]  # [B, P, L]
     
     valid_edges = mask_valid[:, :, 1:] & mask_valid[:, :, :-1]  # [B, P, L-1]
     if not valid_edges.any():
@@ -859,16 +862,27 @@ def reinforce_loss(
     soft_edge_lambda: float = 1.0,
     normalize_reward: bool = True,
     anchor_alpha: float = 0.1,
+    gumbel_temp: float = 1.0, 
 ) -> tuple[torch.Tensor, float, float, float, float]:
-    """Compute REINFORCE loss with LUT-inspired constraints and reconv consistency.
+    """Compute Loss using Gumbel-Softmax for differentiable logic consistency.
+
+    The 'reward' concepts from RL are kept for metric logging but removed from the
+    gradient path in favor of direct logic differentiation.
 
     Returns: (loss, avg_reward, valid_rate, edge_acc, constraint_violation_rate)
     """
 
     B, P, L, C = logits.shape
 
-    # Sample actions
-    actions = torch.distributions.Categorical(logits=logits).sample().detach()  # [B, P, L]
+    # Gumbel Softmax Action Sampling (Straight-Through Estimator)
+    # hard=True:
+    #   Forward pass: one-hot discrete values (0 or 1)
+    #   Backward pass: uses gradients of the Gumbel-Softmax distribution
+    # We use this ONE-HOT output for all logic calculations to propagate gradients.
+    actions_one_hot = F.gumbel_softmax(logits, tau=gumbel_temp, hard=True, dim=-1) # [B, P, L, 2]
+    
+    # Extract indices for legacy code (constraint masking, metrics)
+    actions = actions_one_hot.argmax(dim=-1) # [B, P, L] - No grad flow through argmax usually, but OK here as we use one_hot for loss
     
     # constraint_metrics
     constraint_loss = torch.tensor(0.0, device=logits.device)
@@ -881,9 +895,9 @@ def reinforce_loss(
             flat_logits = logits.view(-1, 2)
             flat_targets = constraint_vals.view(-1)
             
-            # CE Loss on constrained nodes
+            # CE Loss on constrained nodes (Supervised)
             c_loss = F.cross_entropy(flat_logits[valid_constraints], flat_targets[valid_constraints])
-            constraint_loss = c_loss * 500.0 
+            constraint_loss = c_loss * 1.0 
             
             # Metric: Violation rate
             preds = actions[constraint_mask]
@@ -892,21 +906,23 @@ def reinforce_loss(
             total_c = targets.numel()
             constraint_violation_rate = (violations / max(1, total_c)).item()
             
+            # Forcing: Update actions to match constraints to ensure downstream path consistency?
+            # In RL we could overwrite actions. In Gumbel matching loss is usually enough.
+            # But to help convergence we can overwrite the 'hard' actions for the forward pass context
+            # if we wanted. But Gumbel hard=True makes it discrete.
+            # Let's overwrite `actions` indices for metrics, but we can't easily overwrite `actions_one_hot`
+            # without breaking gradient flow unless we are careful.
+            # Since constraint_loss is strong, we'll assume it converges.
+            # However, existing code overwrote actions.
             actions[constraint_mask] = constraint_vals[constraint_mask]
 
     # Solvability Loss
     solvability_loss = torch.tensor(0.0, device=logits.device)
     if solvability_logits is not None and solvability_labels is not None:
-        # Penalize False UNSAT heavily (User: "predicting all instances as unsolvable ... easy to approach")
-        # False UNSAT = Label 0 (SAT), Pred 1 (UNSAT).
-        # We can use weighted cross entropy.
-        weights = torch.tensor([10.0, 1.0], device=logits.device) # Heavy weight on Label 0 to avoid predicting 1
-        solvability_loss = F.cross_entropy(solvability_logits, solvability_labels, weight=weights) * 100.0
+        weights = torch.tensor([10.0, 1.0], device=logits.device) 
+        solvability_loss = F.cross_entropy(solvability_logits, solvability_labels, weight=weights) * 1.0
 
-    # RL Reward Logic
-    # If UNSAT: reward = 1.0 if correct solvability pred, else -1.0
-    # If SAT: reward based on path consistency as before
-    
+    # RL Reward Logic (For Logging Only)
     sat_reward_mask = torch.ones(B, dtype=torch.bool, device=logits.device)
     unsat_reward = torch.zeros(B, dtype=torch.float32, device=logits.device)
     
@@ -920,312 +936,184 @@ def reinforce_loss(
             correct = (pred_solv[unsat_mask] == 1).float()
             unsat_reward[unsat_mask] = torch.where(correct == 1, torch.ones_like(correct), torch.full_like(correct, -1.0))
 
-    # Compute log-probabilities directly from logits to avoid distribution caching quirks.
-    log_probs = torch.log_softmax(logits, dim=-1)  # [B, P, L, C]
-    logp = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)  # [B, P, L]
-    
-    # Get probability of 1 (Logic-1) for soft constraints
-    probs_1 = torch.softmax(logits, dim=-1)[..., 1]  # [B, P, L]
-
-    # Initialize loss accumulator
+    # Initialize loss
     loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
 
-    # Vectorized Logic Consistency
-    # ----------------------------
+    # Vectorized Logic Consistency (Metrics Only)
+    # We use `actions` (indices) for metrics to see "Hard" violations
     valid_edges = mask_valid[:, :, 1:] & mask_valid[:, :, :-1]  # [B, P, L-1]
-    
     prev_vals = actions[:, :, :-1]
     cur_vals = actions[:, :, 1:]
-    gt_cur = gate_types[:, :, 1:] # [B, P, L-1]
+    gt_cur = gate_types[:, :, 1:] 
     
     edge_ok = torch.ones_like(prev_vals, dtype=torch.bool)
-    
-    # NOT: cur == 1 - prev
     m = gt_cur == GateType.NOT
     edge_ok[m] &= (cur_vals[m] == (1 - prev_vals[m]))
-    
-    # BUFF: cur == prev
     m = gt_cur == GateType.BUFF
     edge_ok[m] &= (cur_vals[m] == prev_vals[m])
-    
-    # AND: cur <= prev
     m = gt_cur == GateType.AND
     edge_ok[m] &= (cur_vals[m] <= prev_vals[m])
-    
-    # NAND: cur >= 1 - prev
     m = gt_cur == GateType.NAND
     edge_ok[m] &= (cur_vals[m] >= (1 - prev_vals[m]))
-    
-    # OR: cur >= prev
     m = gt_cur == GateType.OR
     edge_ok[m] &= (cur_vals[m] >= prev_vals[m])
-    
-    # NOR: cur <= 1 - prev
     m = gt_cur == GateType.NOR
     edge_ok[m] &= (cur_vals[m] <= (1 - prev_vals[m]))
 
-    # Gather Edge Errors
-    wrong_edges = (~edge_ok) & valid_edges # [B, P, L-1]
-    
-    # Sample-level stats
-    # local_wrong [B]: number of wrong edges per sample
-    local_wrong = wrong_edges.sum(dim=(1, 2)) # [B]
-    checked = valid_edges.sum(dim=(1, 2)) # [B]
-    
+    wrong_edges = (~edge_ok) & valid_edges
+    local_wrong = wrong_edges.sum(dim=(1, 2))
+    checked = valid_edges.sum(dim=(1, 2))
     edge_wrong_sum = local_wrong.sum().item()
     edge_total_sum = checked.sum().item()
 
-    # Vectorized Reconvergence Failures
-    # -------------------------------
-    path_len = mask_valid.long().sum(dim=-1) # [B, P]
+    # Vectorized Reconvergence Failures (Metrics Only)
+    path_len = mask_valid.long().sum(dim=-1)
     last_idx = (path_len - 1).clamp(min=0)
+    last_idx_exp = last_idx.unsqueeze(-1)
+    last_vals = actions.gather(2, last_idx_exp).squeeze(-1)
+    path_valid_mask = (path_len > 0)
     
-    # Gather last values
-    last_idx_exp = last_idx.unsqueeze(-1) # [B, P, 1]
-    last_vals = actions.gather(2, last_idx_exp).squeeze(-1) # [B, P]
-    
-    path_valid_mask = (path_len > 0) # [B, P]
-    
-    # Min/Max across valid paths
     neg_inf = -999.0
     pos_inf = 999.0
-    
     lv_float = last_vals.float()
     vm_float = path_valid_mask.float()
-    
-    # Max of valid: invalid -> -inf
     max_v = (lv_float * vm_float + neg_inf * (1 - vm_float)).max(dim=-1).values
-    # Min of valid: invalid -> +inf
     min_v = (lv_float * vm_float + pos_inf * (1 - vm_float)).min(dim=-1).values
     
-    # Failure if min < max
     has_valid_paths = (path_valid_mask.sum(dim=-1) > 0)
     reconv_fail_mask = (min_v < max_v) & has_valid_paths
+    reconv_wrong = reconv_fail_mask.float()
     
-    reconv_wrong = reconv_fail_mask.float() # [B]
+    # Metrics
+    with torch.no_grad():
+        trivial = (checked == 0)
+        valid = (local_err := local_wrong.float()) == 0
+        valid = valid & (reconv_wrong == 0) & (~trivial)
+        if solvability_labels is not None:
+             valid = valid & (solvability_labels == 0)
+             denom_count = (solvability_labels == 0).float().sum().item()
+        else:
+             denom_count = B
+        valid_rate = float(valid.float().sum().item() / max(1.0, denom_count))
+        edge_acc = float((edge_total_sum - edge_wrong_sum) / max(1.0, edge_total_sum))
+        
+        # Calculate a pseudo-reward for logging consistency
+        local_reward_shaping = (1.0 - (local_err / checked.clamp(min=1.0))) * 2.0 - 1.0
+        reconv_bonus = 0.5
+        reconv_penalty = -2.0
+        sat_base_reward = torch.where(reconv_wrong == 0, 
+                                      local_reward_shaping + reconv_bonus, 
+                                      torch.min(local_reward_shaping, torch.tensor(reconv_penalty, device=logits.device)))
+        reward = sat_base_reward.clone()
+        avg_reward = float(reward.mean().item())
 
-    # Reconvergence Consistency Loss (MSE on Logits)
+
+    # -----------------------------------------------------------------------
+    # Differentiable Losses
+    # -----------------------------------------------------------------------
+    
+    # 1. Reconvergence Consistency Loss (MSE on Logits / Gumbel Probs)
+    # We use logits or gumbel outputs. Gumbel outputs are safer for consistency.
+    # Gather output probs [B, P, 2]
+    # last_idx_logits = last_idx_exp.unsqueeze(-1).expand(actions.size(0), actions.size(1), 1, 2)
+    # last_probs = actions_one_hot.gather(2, last_idx_logits).squeeze(2) # [B, P, 2]
+    # Actually, let's use the code from before but on LOGITS to permit gradients 
+    # even without Gumbel hard path if needed, BUT mixing them is tricky.
+    # Let's use logits for the MSE consistency as it provides a smooth signal.
+    
     # Gather logits at last_idx: [B, P, C]
     last_idx_logits = last_idx_exp.unsqueeze(-1).expand(actions.size(0), actions.size(1), 1, logits.shape[-1])
     last_logits = logits.gather(2, last_idx_logits).squeeze(2) # [B, P, C]
     
-    # Mean logit per sample
     mask_exp = path_valid_mask.unsqueeze(-1) # [B, P, 1]
     count_paths = mask_exp.sum(dim=1).clamp(min=1.0) # [B, 1]
     sum_logits = (last_logits * mask_exp).sum(dim=1) # [B, C]
     mean_logits = sum_logits / count_paths # [B, C]
     
-    # MSE
     diff = (last_logits - mean_logits.unsqueeze(1))
     mse_per_sample = ((diff ** 2) * mask_exp).sum(dim=(1,2)) / count_paths.squeeze(-1) # [B]
-    
     loss = loss + 0.5 * mse_per_sample.mean()
 
-    # Vectorized Soft Edge Loss
-    # -------------------------
+    # 2. Vectorized Soft Edge Loss (Using Gumbel Outputs one_hot)
+    # This acts as a differentiable consistency check.
+    probs_1 = actions_one_hot[..., 1] # [B, P, L]
     prev_p = probs_1[:, :, :-1]
     cur_p = probs_1[:, :, 1:]
     
     viol = torch.zeros_like(prev_p)
-    
-    # Apply soft constraints
     # NOT: |cur - (1-prev)|^2
     m = gt_cur == GateType.NOT
     viol[m] = (cur_p[m] - (1.0 - prev_p[m])) ** 2
-    
     # BUFF: |cur - prev|^2
     m = gt_cur == GateType.BUFF
     viol[m] = (cur_p[m] - prev_p[m]) ** 2
-    
     # AND: cur <= prev => ReLU(cur - prev)^2
     m = gt_cur == GateType.AND
     viol[m] = F.relu(cur_p[m] - prev_p[m]) ** 2
-    
     # NAND: cur >= 1-prev => ReLU((1-prev) - cur)^2
     m = gt_cur == GateType.NAND
     viol[m] = F.relu((1.0 - prev_p[m]) - cur_p[m]) ** 2
-    
     # OR: cur >= prev => ReLU(prev - cur)^2
     m = gt_cur == GateType.OR
     viol[m] = F.relu(prev_p[m] - cur_p[m]) ** 2
-    
     # NOR: cur <= 1-prev => ReLU(cur - (1-prev))^2
     m = gt_cur == GateType.NOR
     viol[m] = F.relu(cur_p[m] - (1.0 - prev_p[m])) ** 2
     
-    # Weighting and masking
     edge_weights = torch.ones_like(gt_cur, dtype=torch.float32)
-    edge_weights[gt_cur == GateType.NOT] = 20.0
+    edge_weights[gt_cur == GateType.NOT] = 20.0 # Heavy penalty for inverters
     viol = viol * edge_weights * valid_edges.float()
     
-    # Loss per sample
     valid_edge_counts = valid_edges.sum(dim=(1,2)).float().clamp(min=1.0)
     edge_loss_per_sample = viol.sum(dim=(1,2)) / valid_edge_counts
     
     if soft_edge_lambda > 0:
         loss = loss + float(soft_edge_lambda) * edge_loss_per_sample.mean()
 
-    # Reward Logic
-    # ----------------------------
-    # Granular reward based on edge satisfaction to provide a smoother gradient.
-    local_err = local_wrong.float()
-    reconv_err = reconv_wrong.float()
-    denom_edges = checked.float().clamp(min=1.0)
-    
-    # Calculate local consistency reward as a fraction in [0, 1] mapped to [-1, 1]
-    local_reward_shaping = (1.0 - (local_err / denom_edges)) * 2.0 - 1.0
-    
-    # Base reward starts with local shaping
-    base_reward = local_reward_shaping
-    
-    # Reconvergence Logic for SAT cases (Agreement = Bonus, Disagreement = Penalty)
-    reconv_bonus = 0.5
-    reconv_penalty = -2.0
-    
-    # If agree (err=0): reward += bonus
-    # If disagree (err=1): reward = min(reward, penalty)
-    
-    # We construct 'sat_base_reward' which applies this logic
-    sat_base_reward = torch.where(reconv_err == 0, 
-                                  base_reward + reconv_bonus, 
-                                  torch.min(base_reward, torch.tensor(reconv_penalty, device=logits.device)))
-
-    # Neutral/positive for trivial samples (no edges)
-    trivial = (checked == 0)
-    base_reward = torch.where(trivial, torch.ones_like(base_reward), base_reward)
-    sat_base_reward = torch.where(trivial, torch.ones_like(sat_base_reward), sat_base_reward)
-    
-    # Combined Reward for SAT/UNSAT
-    reward = sat_base_reward.clone() # Default to SAT logic
-    
-    if solvability_labels is not None:
-        # UNSAT samples (label=1): 
-        # Use only local_reward_shaping (Edges Only) + Solvability Bonus.
-        # Ignore reconvergence status (do not bonus or penalize).
-        
-        unsat_mask = (solvability_labels == 1)
-        if unsat_mask.any():
-             reward[unsat_mask] = local_reward_shaping[unsat_mask]
-             
-        # Add Solvability Prediction Bonus/Penalty
-        pred_solv = torch.argmax(solvability_logits, dim=-1)
-        correct_solv = (pred_solv == solvability_labels).float()
-        
-        # Reward +1 for correct solvability, -1 for incorrect
-        solv_signal = torch.where(correct_solv == 1.0, torch.ones_like(correct_solv), torch.full_like(correct_solv, -1.0))
-        
-        # Weighted addition
-        reward = reward + 0.5 * solv_signal
-
-    # Anchor reward shaping (Alpha increased to 1.0 by user request)
-    # We override the function argument default or just multiply here.
-    # The argument `anchor_alpha` defaults to 0.1 in signature, but we can multiply.
-    # Actually, better to change the call site, but for now I will boost it here.
-    effective_anchor_alpha = anchor_alpha 
-    
-    if anchor_p is not None and anchor_l is not None and anchor_v is not None:
-        idx = torch.arange(logits.size(0), device=logits.device)
-        present = (anchor_p >= 0) & (anchor_l >= 0)
-        if solvability_labels is not None:
-            present = present & (solvability_labels == 0)
-            
-        if bool(present.any()):
-            pred_vals = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
-            p_idx = anchor_p[present]
-            l_idx = anchor_l[present]
-            pred_vals[present] = actions[idx[present], p_idx, l_idx]
-            matches = (pred_vals == anchor_v) & present
-            anchor_signal = torch.zeros(logits.size(0), dtype=torch.float32, device=logits.device)
-            anchor_signal[matches] = 1.0
-            anchor_signal[present & (~matches)] = -1.0
-            reward = reward + float(effective_anchor_alpha) * anchor_signal
-            
-    reward = torch.clamp(reward, min=-1.0, max=1.0)
-
-    # Calculate avg_reward BEFORE normalization for logging
-    with torch.no_grad():
-        raw_avg_reward = float(reward.mean().item())
-
-    # Optional per-batch normalization
-    if normalize_reward:
-        mean_r = reward.mean()
-        std_r = reward.std().clamp(min=1e-6)
-        reward = (reward - mean_r) / std_r
-
-    # Detach reward for REINFORCE
-    reward = reward.detach()
-
-    # Policy gradient loss
-    logp_sum = (logp * mask_valid).sum(dim=(1, 2))  # [B]
-    count = torch.clamp(mask_valid.sum(dim=(1, 2)).float(), min=1.0)
-    per_sample_loss = -(reward * (logp_sum / count))  # [B]
-    loss = loss + per_sample_loss.mean()
-
-    # Entropy regularization
+    # 3. Entropy regularization (Using logits)
     if entropy_beta > 0.0:
         probs = torch.softmax(logits, dim=-1)
-        ent = -(probs * torch.log_softmax(logits, dim=-1)).sum(dim=-1)  # [B,P,L]
+        ent = -(probs * torch.log_softmax(logits, dim=-1)).sum(dim=-1)
         ent_mean = (ent * mask_valid.float()).sum() / torch.clamp(mask_valid.float().sum(), min=1.0)
         loss = loss - float(entropy_beta) * ent_mean
 
-    # Auxiliary Supervised Loss for Anchors (ONLY if SAT)
+    # 4. Anchor Supervision (Standard CE)
     if anchor_p is not None and anchor_l is not None and anchor_v is not None:
         valid_anchors = (anchor_p >= 0) & (anchor_l >= 0)
         if solvability_labels is not None:
             valid_anchors = valid_anchors & (solvability_labels == 0)
-            
         if valid_anchors.any():
             b_idx = torch.arange(logits.size(0), device=logits.device)[valid_anchors]
             p_idx = anchor_p[valid_anchors]
             l_idx = anchor_l[valid_anchors]
             targets = anchor_v[valid_anchors].long().clamp(0, 1)
-            pred_logits = logits[b_idx, p_idx, l_idx] # [N, 2]
+            pred_logits = logits[b_idx, p_idx, l_idx] 
             sup_loss = F.cross_entropy(pred_logits, targets)
             loss = loss + 1.0 * sup_loss
     
-    # Add constraint loss and solvability loss
+    # 5. Add accumulated auxiliary losses
     loss = loss + constraint_loss + solvability_loss
 
-    # Logic Consistency Loss
+    # 6. Reconvergence Logic Loss (Differentiable via Gumbel)
     if lambda_logic > 0.0 and node_ids is not None:
         logic_loss = calculate_logic_loss(
             node_ids=node_ids,
             gate_types=gate_types,
-            logits=logits,
+            probs=actions_one_hot, # Pass Gumbel outputs
             mask_valid=mask_valid,
             device=logits.device
         )
         loss = loss + (lambda_logic * logic_loss)
 
-    # Full-Path Gate Consistency Loss
+    # 7. Full-Path Gate Consistency Loss (Differentiable via Gumbel)
     if lambda_full_logic > 0.0:
         full_logic_loss = calculate_full_logic_loss(
             gate_types=gate_types,
-            logits=logits,
+            probs=actions_one_hot, # Pass Gumbel outputs
             mask_valid=mask_valid,
             device=logits.device
         )
         loss = loss + (lambda_full_logic * full_logic_loss)
-
-    # Recompute metrics for logging
-    with torch.no_grad():
-        avg_reward = raw_avg_reward # Log the raw reward
-        
-        # Valid = local OK & reconv OK & non-trivial
-        trivial = (checked == 0)
-        valid = (local_err == 0) & (reconv_err == 0) & (~trivial)
-        
-        # For valid_rate, we only consider SAT cases as potentially "valid" in terms of consistency.
-        # This keeps the metric stable.
-        if solvability_labels is not None:
-             valid = valid & (solvability_labels == 0)
-             denom_count = (solvability_labels == 0).float().sum().item()
-        else:
-             denom_count = B
-             
-        valid_rate = float(valid.float().sum().item() / max(1.0, denom_count))
-        
-        edge_acc = float((edge_total_sum - edge_wrong_sum) / max(1.0, edge_total_sum))
 
     return loss, avg_reward, valid_rate, edge_acc, constraint_violation_rate
 
@@ -1331,6 +1219,9 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
 
         optim.zero_grad(set_to_none=True)
         
+        # Gumbel Annealing
+        gumbel_t = max(0.1, cfg.gumbel_temp * (cfg.gumbel_anneal_rate ** (epoch - 1)))
+        
         with torch.amp.autocast('cuda', enabled=cfg.amp):
             logits, solv_logits = model(paths, masks, gate_types=gtypes if cfg.use_gate_type_embedding else None)
 
@@ -1352,6 +1243,7 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
                 soft_edge_lambda=cfg.soft_edge_lambda,
                 normalize_reward=cfg.normalize_reward,
                 anchor_alpha=cfg.anchor_reward_alpha,
+                gumbel_temp=gumbel_t, 
             )
         
         scaler.scale(loss).backward()
@@ -1464,6 +1356,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, cfg: Tr
                 soft_edge_lambda=cfg.soft_edge_lambda,
                 normalize_reward=cfg.normalize_reward,
                 anchor_alpha=cfg.anchor_reward_alpha,
+                gumbel_temp=0.1,
             )
             
         total_loss += float(loss.item())
@@ -1536,6 +1429,8 @@ def cmd_train(args: argparse.Namespace) -> None:
         processed_dir=getattr(args, 'processed_dir', None),
         lambda_logic=getattr(args, 'lambda_logic', 0.0),
         lambda_full_logic=getattr(args, 'lambda_full_logic', 0.0),
+        gumbel_temp=getattr(args, 'gumbel_temp', 1.0),
+        gumbel_anneal_rate=getattr(args, 'gumbel_anneal_rate', 0.99),
     )
     
     # Handle checkpoint-dir alias
@@ -1660,6 +1555,8 @@ def build_argparser() -> argparse.ArgumentParser:
     t.add_argument('--entropy-beta', type=float, default=0.0, help='Entropy regularization weight (negative to minimize)')
     t.add_argument('--lambda-logic', type=float, default=0.0, help='Weight for reconvergence logic consistency loss (Phase 7)')
     t.add_argument('--lambda-full-logic', type=float, default=0.0, help='Weight for full-path gate consistency loss')
+    t.add_argument('--gumbel-temp', type=float, default=1.0, help='Initial Gumbel Softmax temperature')
+    t.add_argument('--gumbel-anneal-rate', type=float, default=0.99, help='Annealing rate per epoch')
 
     return p
 
