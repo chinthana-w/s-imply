@@ -7,6 +7,8 @@ and prepares them for training the Multi-Path transformer model.
 
 from __future__ import annotations
 
+import glob
+import json
 import os
 import pickle
 from functools import lru_cache
@@ -16,9 +18,7 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from src.atpg.reconv_podem import PathConsistencySolver
 from src.util.io import parse_bench_file
-from src.util.struct import GateType, LogicValue
 
 
 class ReconvergentPathsDataset(Dataset):
@@ -231,7 +231,7 @@ class ReconvergentPathsDataset(Dataset):
             return
 
         # Load new shard
-        print(f"[Dataset] Loading shard {shard_idx} from disk...", flush=True)
+        print(f"\r[Dataset] Loading shard {shard_idx} from disk...", flush=True, end="")
         path = self._shard_files[shard_idx]
         try:
             self._loaded_shard_data = torch.load(path, map_location="cpu")
@@ -479,7 +479,6 @@ class ReconvergentPathsDataset(Dataset):
 
         # Try to solve for reconvergence = 1 first, then 0
         assignment = None
-        target_val = None
 
         for val in [LogicValue.ONE, LogicValue.ZERO]:
             try:
@@ -723,10 +722,6 @@ class ReconvergentPathsDataset(Dataset):
                 flush()
         flush()
 
-        # Save metadata for fast future loads
-        import json
-        import glob
-
         shards = sorted(glob.glob(os.path.join(output_dir, "shard_*.pt")))
         lens = []
         for s in shards:
@@ -921,10 +916,10 @@ def resolve_gate_types(
             # But simplest is loop.
             P, L = nb.shape
             for p in range(P):
-                for l in range(L):
-                    nid = int(nb[p, l].item())
+                for length in range(L):
+                    nid = int(nb[p, length].item())
                     if nid > 0 and nid < len(circuit):
-                        gb[p, l] = int(circuit[nid].type)
+                        gb[p, length] = int(circuit[nid].type)
 
             gates[b] = gb.to(device)
 
@@ -972,15 +967,6 @@ def _generate_anchor(
     av = torch.zeros(B, dtype=torch.long, device=dev)
     sv = torch.zeros(B, dtype=torch.long, device=dev)
 
-    # We can reuse the instance method from Dataset if we instantiate a dummy or static one?
-    # Or just copy logic. Logic is complex (solver calls).
-    # We'll instantiate a dummy dataset just to access the helper,
-    # or better, refactor _gen_anchor_for_sample to be static/standalone.
-    # It is an instance method in valid code, but let's just make a standalone helper.
-    # Actually ReconvergentPathsDataset has it.
-
-    ds = ReconvergentPathsDataset
-
     # We need to loop. Solver is CPU-bound.
     for b in range(B):
         # We need info dict for solver?
@@ -990,7 +976,8 @@ def _generate_anchor(
         # unless it was passed through collate.
         # ReconvergentPathsDataset.__getitem__ has access to it.
         # If we are calling this from train.py, we only have tensors and files.
-        # We CANNOT run the exact same logic without pair_info (which contains reconvergence details).
+        # We CANNOT run the exact same logic without pair_info
+        # (which contains reconvergence details)
 
         # Fallback: Just pick a random gate near the end of a path?
         # And check solvability from PI?
@@ -1001,7 +988,8 @@ def _generate_anchor(
 
         # If we are here, it means the dataset didn't provide anchors.
         # We can implement a simplified anchor choice: pick random node, assign random val.
-        # Is it sizable? We'll check with solver if we can deduce pairwise info or just standard consistency.
+        # Is it sizable? We'll check with solver if we can deduce pairwise info
+        # or just standard consistency.
 
         # For valid training, we really should have anchors from dataset pre-generation.
         # Check train.py calls:
@@ -1054,7 +1042,7 @@ def _inject_anchor_into_embeddings(
     idxs = torch.nonzero(valid).squeeze(1)
     for b in idxs:
         p = anchor_p[b].item()
-        l = anchor_l[b].item()
+        l_val = anchor_l[b].item()
         v = anchor_v[b].item()
 
         # One-hot: 0 -> [1,0,0], 1 -> [0,1,0], X -> [0,0,1]
@@ -1066,6 +1054,6 @@ def _inject_anchor_into_embeddings(
         else:
             vec = torch.tensor([0.0, 0.0, 1.0], device=paths.device)
 
-        out[b, p, l, D - 3 :] = vec
+        out[b, p, l_val, D - 3 :] = vec
 
     return out

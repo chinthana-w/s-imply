@@ -105,6 +105,11 @@ class TrainConfig:
     gumbel_temp: float = 1.0
     gumbel_anneal_rate: float = 0.99
 
+    # Memory optimization
+    grad_accum: int = 1
+    checkpointing: bool = False
+    micro_batch_size: int = 256  # Safe default to avoid prefetch memory blowup
+
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
     # Use config processed_dir if provided, else auto-detect
@@ -148,20 +153,22 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
         )
         train_loader = DataLoader(
             train_set,
-            batch_size=cfg.batch_size,
+            batch_size=cfg.micro_batch_size,
             shuffle=True,
             collate_fn=reconv_collate,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
             persistent_workers=cfg.num_workers > 0,
         )
         val_loader = DataLoader(
             val_set,
-            batch_size=cfg.batch_size,
+            batch_size=cfg.micro_batch_size,
             shuffle=False,
             collate_fn=reconv_collate,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
             persistent_workers=cfg.num_workers > 0,
         )
         print("DataLoaders initialized.", flush=True)
@@ -236,11 +243,29 @@ def train_one_epoch(
     if cfg.verbose:
         print(f"Starting epoch {epoch} loop (waiting for DataLoader)...", flush=True)
     pbar = tqdm(loader, desc=f"Epoch {epoch}", total=target_batches, disable=not cfg.verbose)
+
+    # Calculate actual grad accumulation needed to hit target batch size
+    # logical_batch_size = cfg.batch_size (user's intended total batch)
+    accum_steps = max(1, cfg.batch_size // cfg.micro_batch_size)
+    if cfg.grad_accum > 1:
+        # If user explicitly set grad_accum, honor it as well (multiplier)
+        accum_steps *= cfg.grad_accum
+
+    print(
+        f"[Memory] Total Batch={cfg.batch_size}, \
+            Micro-Batch={cfg.micro_batch_size}, \
+            Accumulation Steps={accum_steps}"
+    )
+    if cfg.micro_batch_size > 1024:
+        print("[WARNING] micro-batch-size > 1024 may crash host RAM due to DataLoader prefetching.")
+
     for batch_idx, batch in enumerate(pbar):
-        paths = batch["paths_emb"]
-        masks = batch["attn_mask"]
-        node_ids = batch["node_ids"]
+        paths = batch["paths_emb"].to(device)
+        masks = batch["attn_mask"].to(device)
+        node_ids = batch["node_ids"].to(device)
         files = batch["files"]
+        c_mask = batch["constraint_mask"].to(device) if "constraint_mask" in batch else None
+        c_vals = batch["constraint_vals"].to(device) if "constraint_vals" in batch else None
 
         # Initialize Logic Value Vector to "Unknown" [0, 0, 1] if enabled
         if cfg.add_logic_value:
@@ -250,23 +275,14 @@ def train_one_epoch(
                 # "CUDA error: no kernel image is available"
                 # which seems to happen on some GPU architectures with specific indexing
                 # patterns in DataParallel.
+                # This block is now applied after moving to device, assuming paths are on device.
+                # If this causes issues, it might need to be done in collate_fn or dataset.
                 paths[..., D_cur - 3] = 0.0
                 paths[..., D_cur - 2] = 0.0
                 paths[..., D_cur - 1] = 1.0
 
-        if device.type == "cuda":
-            paths = paths.to(device, non_blocking=True)
-            masks = masks.to(device, non_blocking=True)
-            node_ids = node_ids.to(device, non_blocking=True)
-
-        # Generate Constraints
-        c_prob = constraint_prob
-        c_mask, c_vals = generate_constraints(node_ids, files, prob=c_prob)
-        c_mask = c_mask.to(device)
-        c_vals = c_vals.to(device)
-
         # Inject constraints into embeddings
-        if cfg.add_logic_value:
+        if cfg.add_logic_value and c_mask is not None:
             # We always check for constraints but only inject if mask is present
             if c_mask.any():
                 D = paths.shape[-1]
@@ -282,20 +298,8 @@ def train_one_epoch(
                         mask_flat = valid_mask.view(-1)
                         paths_flat[mask_flat, D - 3 : D] = one_hot
 
-        # Try to use anchors provided by the dataset (parallelized in workers)
-        if "anchor_p" in batch and batch["anchor_p"] is not None and "solvability" in batch:
-            anchor_p = batch["anchor_p"].to(device)
-            anchor_l = batch["anchor_l"].to(device)
-            anchor_v = batch["anchor_v"].to(device)
-            solv_labels = batch["solvability"].to(device)
-            # Inject into embeddings if enabled
-            if cfg.add_logic_value:
-                paths = _inject_anchor_into_embeddings(
-                    paths, anchor_p, anchor_l, anchor_v, enable=True
-                )
-
-        elif cfg.anchor_hint:
-            # Fallback to main-thread generation (slow)
+        # Anchor hint generation if needed
+        if cfg.anchor_hint and "anchor_p" not in batch:
             ap_cpu, al_cpu, av_cpu, s_cpu = _generate_anchor(
                 node_ids.detach().cpu(), masks.detach().cpu(), files, cfg.prefer_value
             )
@@ -307,7 +311,14 @@ def train_one_epoch(
                 paths, anchor_p, anchor_l, anchor_v, enable=cfg.add_logic_value
             )
         else:
-            anchor_p = anchor_l = anchor_v = solv_labels = None  # type: ignore
+            anchor_p = batch.get("anchor_p", None)
+            if anchor_p is not None:
+                anchor_p = anchor_p.to(device)
+                anchor_l = batch["anchor_l"].to(device)
+                anchor_v = batch["anchor_v"].to(device)
+                solv_labels = batch["solvability"].to(device)
+            else:
+                anchor_p = anchor_l = anchor_v = solv_labels = None  # type: ignore
 
         # Resolve gate types
         if "gate_types" in batch:
@@ -315,14 +326,15 @@ def train_one_epoch(
         else:
             gtypes = resolve_gate_types(node_ids, files, device)
 
-        optim.zero_grad(set_to_none=True)
-
         # Gumbel Annealing
         gumbel_t = max(0.1, cfg.gumbel_temp * (cfg.gumbel_anneal_rate ** (epoch - 1)))
 
         with torch.amp.autocast("cuda", enabled=cfg.amp):
             logits, solv_logits = model(
-                paths, masks, gate_types=gtypes if cfg.use_gate_type_embedding else None
+                paths,
+                masks,
+                gate_types=gtypes if cfg.use_gate_type_embedding else None,
+                checkpointing=cfg.checkpointing,
             )
 
             loss, avg_reward, valid_rate, batch_edge_acc, batch_c_viol = reinforce_loss(
@@ -345,12 +357,17 @@ def train_one_epoch(
                 anchor_alpha=cfg.anchor_reward_alpha,
                 gumbel_temp=gumbel_t,
             )
+            # Scale loss for accumulation
+            loss = loss / accum_steps
 
         scaler.scale(loss).backward()
-        scaler.step(optim)
-        scaler.update()
 
-        total_loss += float(loss.item())
+        if (batch_idx + 1) % accum_steps == 0:
+            scaler.step(optim)
+            scaler.update()
+            optim.zero_grad(set_to_none=True)
+
+        total_loss += float(loss.item()) * accum_steps
         total_reward += float(avg_reward)
         total_valid += float(valid_rate)
         total_edge_acc += float(batch_edge_acc)
@@ -358,7 +375,11 @@ def train_one_epoch(
         total_batches += 1
         bdone += paths.size(0)
 
-        if cfg.verbose and cfg.log_interval > 0 and (batch_idx + 1) % cfg.log_interval == 0:
+        if (
+            cfg.verbose
+            and cfg.log_interval > 0
+            and (batch_idx + 1) % (cfg.log_interval // accum_steps + 1) == 0
+        ):
             dbg = _debug_metrics_from_logits(
                 logits,
                 node_ids,
@@ -577,6 +598,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         lambda_full_logic=getattr(args, "lambda_full_logic", 0.0),
         gumbel_temp=getattr(args, "gumbel_temp", 1.0),
         gumbel_anneal_rate=getattr(args, "gumbel_anneal_rate", 0.99),
+        grad_accum=getattr(args, "grad_accum", 1),
+        checkpointing=getattr(args, "checkpointing", False),
+        micro_batch_size=getattr(args, "micro_batch_size", 256),
     )
 
     # Handle checkpoint-dir alias
@@ -844,6 +868,24 @@ def build_argparser() -> argparse.ArgumentParser:
         type=float,
         default=0.99,
         help="Annealing rate per epoch",
+    )
+    t.add_argument(
+        "--grad-accum",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps",
+    )
+    t.add_argument(
+        "--checkpointing",
+        action="store_true",
+        default=False,
+        help="Use gradient checkpointing to save memory",
+    )
+    t.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=256,
+        help="Amount of data processed at once. Keep small for memory safety.",
     )
 
     return p

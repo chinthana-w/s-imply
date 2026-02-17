@@ -139,6 +139,7 @@ class MultiPathTransformer(nn.Module):
         node_ids=None,
         seed: Optional[int] = None,
         perturb_scale: float = 0.0,
+        checkpointing: bool = False,
     ):
         """
         Args:
@@ -148,7 +149,10 @@ class MultiPathTransformer(nn.Module):
             node_ids (Tensor): [batch_size, num_paths, seq_len] - Physical Gate IDs
             seed (int, optional): Random seed.
             perturb_scale (float): Noise scale.
+            checkpointing (bool): Whether to use gradient checkpointing.
         """
+        from torch.utils.checkpoint import checkpoint
+
         batch_size, num_paths, seq_len, _ = path_list.shape
 
         # 1. Embed Discrete Features
@@ -182,20 +186,21 @@ class MultiPathTransformer(nn.Module):
         flat_masks = attention_masks.view(-1, seq_len)
 
         # Pass all paths through the same shared encoder.
-        encoded_paths = self.shared_path_encoder(flat_paths, src_key_padding_mask=~flat_masks)
+        if checkpointing:
+            # Note: src_key_padding_mask requires ~flat_masks (padded positions are True)
+            encoded_paths = checkpoint(
+                self.shared_path_encoder, flat_paths, None, ~flat_masks, use_reentrant=False
+            )
+        else:
+            encoded_paths = self.shared_path_encoder(flat_paths, src_key_padding_mask=~flat_masks)
 
         # --- Step 2: Allow Paths to Interact ---
         # Masked Max Pooling: Aggregate features across length dimension
 
-        # Reshape for pooling: (B * P, L, D)
-        # encoded_paths is (B*P, L, D)
-
         # Apply mask: set invalid positions to -inf
-        # flat_masks: (B*P, L) - True is Valid
         mask_expanded = flat_masks.unsqueeze(-1)  # (B*P, L, 1)
 
         # Fill invalid positions with large negative value for Max Pooling
-        # We need clone to avoid in-place modification error
         pooled_input = encoded_paths.masked_fill(~mask_expanded, -1e9)
 
         # Max Pool over L dimension: (B*P, D)
@@ -205,7 +210,12 @@ class MultiPathTransformer(nn.Module):
         path_representations = path_summaries.view(batch_size, num_paths, self.model_dim)
 
         # Paths interact through a Transformer operating over the path axis.
-        interaction_aware_reps = self.path_interaction_layer(path_representations)
+        if checkpointing:
+            interaction_aware_reps = checkpoint(
+                self.path_interaction_layer, path_representations, use_reentrant=False
+            )
+        else:
+            interaction_aware_reps = self.path_interaction_layer(path_representations)
 
         # --- Step 3: Combine and Predict ---
         # Reshape encoded paths back to grouped form: (batch_size, num_paths, seq_len, model_dim)
@@ -215,25 +225,21 @@ class MultiPathTransformer(nn.Module):
         # Flatten paths again to treat them as independent query sequences: (B*P, L, D)
         query = encoded_paths.view(-1, seq_len, self.model_dim)
 
-        # Prepare Key/Value: The set of all path summaries for the corresponding batch item.
-        # interaction_aware_reps is (B, P, D).
-        # We need to repeat this P times so that each of the P paths in a batch can see
-        # the full set of P summaries.
-        # kv: (B, P, P, D) -> flatten to (B*P, P, D)
+        # Prepare Key/Value
         kv = (
             interaction_aware_reps.unsqueeze(1)
             .expand(-1, num_paths, -1, -1)
             .reshape(-1, num_paths, self.model_dim)
         )
 
-        # Cross-Attention: Query=Nodes, Key=PathSummaries, Value=PathSummaries
-        attn_out, _ = self.cross_attn(query, kv, kv)
+        # Cross-Attention
+        if checkpointing:
+            attn_out, _ = checkpoint(self.cross_attn, query, kv, kv, use_reentrant=False)
+        else:
+            attn_out, _ = self.cross_attn(query, kv, kv)
 
         # Residual Connection + Norm + Add back original interaction context
-        # (skip connection for "self" bias)
-        # Note: We keep the explicit "own interaction context" addition as a strong bias.
         global_context = interaction_aware_reps.unsqueeze(2)  # (B, P, 1, model_dim)
-        # Reshape global_context to flat (B*P, 1, D) for addition
         flat_global_context = global_context.view(-1, 1, self.model_dim)
 
         # Combine: Original Node + CrossAttn Result + Own Summary
@@ -248,11 +254,6 @@ class MultiPathTransformer(nn.Module):
         per_node_logits = self.prediction_head(final_representations)  # (B, P, L, 2)
 
         # Global Solvability Prediction
-        # Pool across paths for the batch (e.g., mean pool over path summaries)
-        # interaction_aware_reps: (B, P, D)
-        # We also need to mask paths that were not present if necessary,
-        # but path_interaction_layer already handles variable paths reasonably.
-        # Let's take the mean over paths.
         batch_summary = interaction_aware_reps.mean(dim=1)  # (B, D)
         solvability_logits = self.solvability_head(batch_summary)  # (B, 2)
 
