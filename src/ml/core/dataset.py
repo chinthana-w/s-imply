@@ -8,6 +8,7 @@ and prepares them for training the Multi-Path transformer model.
 from __future__ import annotations
 
 import glob
+import gc
 import json
 import os
 import pickle
@@ -230,11 +231,20 @@ class ReconvergentPathsDataset(Dataset):
         if self._loaded_shard_idx == shard_idx and self._loaded_shard_data is not None:
             return
 
+        # Explicitly release previous shard before loading a new one so each
+        # worker process only keeps one shard resident at a time.
+        if self._loaded_shard_data is not None:
+            self._loaded_shard_data = None
+            gc.collect()
+
         # Load new shard
         print(f"\r[Dataset] Loading shard {shard_idx} from disk...", flush=True, end="")
         path = self._shard_files[shard_idx]
         try:
-            self._loaded_shard_data = torch.load(path, map_location="cpu")
+            # mmap avoids eagerly materializing full shard tensors in host RAM.
+            self._loaded_shard_data = torch.load(
+                path, map_location="cpu", weights_only=True, mmap=True
+            )
             self._loaded_shard_idx = shard_idx
         except Exception as e:
             print(f"[Dataset ERROR] Failed to load shard {path}: {e}")

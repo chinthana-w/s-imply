@@ -138,6 +138,8 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
         max_len_filter=cfg.max_len,
     )
     print(f"Dataset ready. Splitting {len(dataset)} samples...", flush=True)
+
+    using_processed_shards = bool(getattr(dataset, "_use_processed", False))
     # Minimal split: 90/10 train/val
     n = len(dataset)
     n_train = max(1, int(0.9 * n))
@@ -147,8 +149,21 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
 
     # Use workers and pinned memory for faster host->device transfer when on CUDA
     if device.type == "cuda":
+        dl_workers = cfg.num_workers
+        prefetch_factor = 2 if dl_workers > 0 else None
+        persistent_workers = dl_workers > 0
+
+        # Processed shard loading is I/O heavy and each worker keeps one shard
+        # resident. Tune worker behavior to reduce host RAM pressure and avoid
+        # loading too many shards concurrently.
+        if using_processed_shards and dl_workers > 0:
+            dl_workers = min(dl_workers, 2)
+            prefetch_factor = 1
+            persistent_workers = False
+
         print(
-            f"Initializing DataLoaders (workers={cfg.num_workers}, batch_size={cfg.batch_size})...",
+            f"Initializing DataLoaders (workers={dl_workers}, batch_size={cfg.micro_batch_size}, "
+            f"processed_shards={using_processed_shards})...",
             flush=True,
         )
         train_loader = DataLoader(
@@ -156,20 +171,20 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
             batch_size=cfg.micro_batch_size,
             shuffle=True,
             collate_fn=reconv_collate,
-            num_workers=cfg.num_workers,
+            num_workers=dl_workers,
             pin_memory=cfg.pin_memory,
-            prefetch_factor=2 if cfg.num_workers > 0 else None,
-            persistent_workers=cfg.num_workers > 0,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
         )
         val_loader = DataLoader(
             val_set,
             batch_size=cfg.micro_batch_size,
             shuffle=False,
             collate_fn=reconv_collate,
-            num_workers=cfg.num_workers,
+            num_workers=dl_workers,
             pin_memory=cfg.pin_memory,
-            prefetch_factor=2 if cfg.num_workers > 0 else None,
-            persistent_workers=cfg.num_workers > 0,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
         )
         print("DataLoaders initialized.", flush=True)
     else:
