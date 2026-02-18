@@ -161,19 +161,24 @@ def main():
             candidates = predict_res
 
         if candidates:
-            print(
-                f"{indent}│   [Inference] Model returned {len(candidates)} "
-                f"candidate assignments."
-            )
-            # Show a few assigned nodes from the first candidate
+            n_cands = len(candidates)
+            tag = "" if n_cands == 1 else f" (+{n_cands - 1} fallback)"
+            print(f"{indent}│   [Inference] Model returned " f"{n_cands} candidate(s){tag}.")
+
+            # Show the model prediction (first candidate), path by path
             sample = candidates[0]
-            nodes = sorted(list(sample.keys()))
-            nodes_str = ", ".join([f"{n}:{sample[n]}" for n in nodes[:6]])
-            if len(nodes) > 6:
-                nodes_str += "..."
-            print(f"{indent}│   [Inference] Candidate 1: {{{nodes_str}}}")
+            paths = pair_info.get("paths", [])
+            for p_idx, path in enumerate(paths):
+                path_vals = []
+                for nid in path:
+                    val = sample.get(nid, None)
+                    if val is None:
+                        path_vals.append(f"{nid}:?")
+                    else:
+                        path_vals.append(f"{nid}:{int(val)}")
+                print(f"{indent}│   [Inference] Path {p_idx}: " f"[{' -> '.join(path_vals)}]")
         else:
-            print(f"{indent}│   [Inference] ⚠ Model returned NO candidates " f"(logical conflict).")
+            print(f"{indent}│   [Inference] ⚠ Model returned " f"NO candidates (logical conflict).")
 
         return predict_res
 

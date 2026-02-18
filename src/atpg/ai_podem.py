@@ -209,6 +209,7 @@ class ModelPairPredictor(ReconvPairPredictor):
             nhead=4,
             num_encoder_layers=3,
             num_interaction_layers=3,
+            dim_feedforward=2048,
         ).to(self.device)
 
         if os.path.exists(model_path):
@@ -349,6 +350,8 @@ class ModelPairPredictor(ReconvPairPredictor):
         )
 
         predicted_assignment = {}
+        # Track per-node confidence for conflict resolution
+        node_confidence = {}  # nid -> float (prob of chosen class)
 
         for i, p in enumerate(paths):
             for j, nid in enumerate(p):
@@ -356,19 +359,30 @@ class ModelPairPredictor(ReconvPairPredictor):
                     continue
                 val = int(vals[i, j].item())
                 lv = LogicValue.ZERO if val == 0 else LogicValue.ONE
+                conf = float(probs[0, i, j, val].item())
 
+                # Constraints always override model
                 if nid in constraints:
-                    if constraints[nid] != lv:
-                        lv = constraints[nid]
+                    lv = constraints[nid]
+                    conf = 1.0  # Constraints are absolute
 
+                # Resolve cross-path conflicts: keep highest confidence
                 if nid in predicted_assignment:
                     if predicted_assignment[nid] != lv:
-                        pass
+                        prev_conf = node_confidence.get(nid, 0.0)
+                        if conf <= prev_conf:
+                            continue  # Keep previous (higher confidence)
 
                 predicted_assignment[nid] = lv
+                node_confidence[nid] = conf
 
         return self._rank_solutions_with_model(
-            pair_info, constraints, probs, paths, predicted_assignment, inputs_snapshot
+            pair_info,
+            constraints,
+            probs,
+            paths,
+            predicted_assignment,
+            inputs_snapshot,
         )
 
     def _rank_solutions_with_model(
@@ -380,13 +394,29 @@ class ModelPairPredictor(ReconvPairPredictor):
         predicted_assignment,
         inputs_snapshot,
     ):
-        if self._verify_assignment_logic(predicted_assignment):
-            return [predicted_assignment], inputs_snapshot
+        violations = self._verify_assignment_logic(predicted_assignment)
 
-        return self._fallback_solve(pair_info, constraints)[0], inputs_snapshot
+        # Always return model prediction as first candidate.
+        # The HierarchicalReconvSolver._solve_recursive does its own
+        # consistency checks, so let it decide whether to accept.
+        candidates = [predicted_assignment]
 
-    def _verify_assignment_logic(self, assignment):
-        # Quick check of all gates in assignment
+        # If model prediction has violations, also add fallback as backup
+        if violations > 0:
+            fallback, _ = self._fallback_solve(pair_info, constraints)
+            candidates.extend(fallback)
+
+        return candidates, inputs_snapshot
+
+    def _verify_assignment_logic(self, assignment: Dict[int, LogicValue]) -> int:
+        """Verify logical consistency and return the count of violations.
+
+        Returns 0 if all gates are consistent, otherwise the number of
+        gates whose predicted value contradicts their Boolean truth table.
+        """
+        from src.atpg.logic_sim_three import compute_gate_value
+
+        violations = 0
         for nid, val in assignment.items():
             if nid >= len(self.circuit):
                 continue
@@ -394,19 +424,31 @@ class ModelPairPredictor(ReconvPairPredictor):
             if not gate.fin:
                 continue
 
-            # Get input vals if in assignment
-            input_vals = []
-            all_inputs_present = True
-            for fin in gate.fin:
-                if fin in assignment:
-                    input_vals.append(assignment[fin])
-                else:
-                    all_inputs_present = False
+            # Check if all inputs are present in the assignment
+            if all(fin in assignment for fin in gate.fin):
+                original_vals = {fin: self.circuit[fin].val for fin in gate.fin}
+                original_gate_val = gate.val
 
-            if all_inputs_present:
-                # Check consistency
-                pass
-        return True
+                for fin in gate.fin:
+                    self.circuit[fin].val = assignment[fin]
+
+                expected_val = compute_gate_value(self.circuit, gate)
+
+                for fin, v in original_vals.items():
+                    self.circuit[fin].val = v
+                gate.val = original_gate_val
+
+                if expected_val != val:
+                    violations += 1
+                    if self.config.verbose:
+                        print(
+                            f"  [AI-BT] Logic Mismatch at Gate "
+                            f"{nid} ({gate.type}): "
+                            f"Expected {expected_val}, "
+                            f"Predicted {val}"
+                        )
+
+        return violations
 
     def _fallback_solve(
         self, pair_info, constraints
