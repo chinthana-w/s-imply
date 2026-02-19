@@ -387,7 +387,16 @@ def train_one_epoch(
                 gumbel_temp=gumbel_t,
             )
 
+        # NaN/Inf guard: skip corrupt batches
+        if not torch.isfinite(loss):
+            print(f"[WARNING] Non-finite loss at batch {batch_idx}, skipping.")
+            optim.zero_grad(set_to_none=True)
+            continue
+
         scaler.scale(loss).backward()
+        # Gradient clipping to prevent AMP-induced explosions
+        scaler.unscale_(optim)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optim)
         scaler.update()
         optim.zero_grad(set_to_none=True)
@@ -515,17 +524,12 @@ def evaluate(
                     mask_flat = c_mask.view(-1)
                     paths_flat[mask_flat, D - 3 : D] = one_hot
 
-        if cfg.anchor_hint:
-            ap_cpu, al_cpu, av_cpu, s_cpu = _generate_anchor(
-                node_ids.detach().cpu(), masks.detach().cpu(), files, cfg.prefer_value
-            )
-            anchor_p = ap_cpu.to(device)
-            anchor_l = al_cpu.to(device)
-            anchor_v = av_cpu.to(device)
-            solv_labels = s_cpu.to(device)
-            paths = _inject_anchor_into_embeddings(
-                paths, anchor_p, anchor_l, anchor_v, enable=cfg.add_logic_value
-            )
+        # Use pre-computed anchors from shards (avoid on-the-fly solver)
+        if "anchor_p" in batch:
+            anchor_p = batch["anchor_p"].to(device)
+            anchor_l = batch["anchor_l"].to(device)
+            anchor_v = batch["anchor_v"].to(device)
+            solv_labels = batch["solvability"].to(device)
         else:
             anchor_p = anchor_l = anchor_v = solv_labels = None  # type: ignore
 
@@ -740,7 +744,13 @@ def cmd_train(args: argparse.Namespace) -> None:
         print(f"Loading weights from {weight_path}...")
         try:
             state = torch.load(weight_path, map_location=device)
-            weights = state["model_state_dict"] if "model_state_dict" in state else state
+            # Check all possible key names for model weights
+            if "state_dict" in state:
+                weights = state["state_dict"]
+            elif "model_state_dict" in state:
+                weights = state["model_state_dict"]
+            else:
+                weights = state
 
             has_module = any(k.startswith("module.") for k in weights.keys())
             is_dp = isinstance(model, nn.DataParallel)
@@ -757,6 +767,12 @@ def cmd_train(args: argparse.Namespace) -> None:
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp)
 
+    # Cosine LR scheduler with linear warmup
+    warmup_epochs = min(3, cfg.epochs // 4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optim, T_max=max(1, cfg.epochs - warmup_epochs), eta_min=1e-6
+    )
+
     best_val = float("inf")
     if cfg.verbose:
         nb_train = len(train_loader) if hasattr(train_loader, "__len__") else 0
@@ -766,17 +782,30 @@ def cmd_train(args: argparse.Namespace) -> None:
             f"val_batches={nb_val}, batch_size={cfg.batch_size}"
         )
     for epoch in range(1, cfg.epochs + 1):
+        # LR Warmup (first few epochs)
+        if epoch <= warmup_epochs:
+            warmup_lr = cfg.lr * (epoch / max(1, warmup_epochs))
+            for pg in optim.param_groups:
+                pg["lr"] = warmup_lr
+
         tr_loss, tr_reward, tr_acc, tr_edge, tr_c_viol = train_one_epoch(
             model, train_loader, optim, scaler, device, cfg, epoch=epoch
         )
         va_loss, va_reward, va_acc, va_edge, va_c_viol = evaluate(model, val_loader, device, cfg)
+
+        current_lr = optim.param_groups[0]["lr"]
         print(
             f"Epoch {epoch:03d} | "
             f"train_loss={tr_loss:.4f} avg_reward={tr_reward:.4f} acc={tr_acc:.4f} "
             f"edge_acc={tr_edge:.4f} c_viol={tr_c_viol:.4f} | "
             f"val_loss={va_loss:.4f} avg_reward={va_reward:.4f} acc={va_acc:.4f} "
-            f"edge_acc={va_edge:.4f} c_viol={va_c_viol:.4f}"
+            f"edge_acc={va_edge:.4f} c_viol={va_c_viol:.4f} "
+            f"lr={current_lr:.2e}"
         )
+
+        # Step LR scheduler after warmup
+        if epoch > warmup_epochs:
+            scheduler.step()
 
         # Save periodic checkpoint
         if epoch % 10 == 0 or epoch == cfg.epochs:

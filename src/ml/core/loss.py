@@ -8,28 +8,15 @@ from src.util.struct import GateType
 
 def calculate_consistency_loss(
     gate_types: torch.Tensor,  # [B, P, L]
-    logits: torch.Tensor,  # [B, P, L, 2] - Logits for (0, 1)
+    probs: torch.Tensor,  # [B, P, L, 2] - Gumbel-Softmax one-hot
     mask_valid: torch.Tensor,  # [B, P, L]
     device: torch.device,
 ) -> torch.Tensor:
+    """Edge-level consistency loss using Gumbel-Softmax hard outputs.
+
+    Uses the same discrete gradient path as calculate_full_logic_loss
+    to avoid conflicting gradient signals in the optimizer.
     """
-    Physics-Informed Consistency Loss for 3-valued Logic (0, 1, X).
-
-    The model predicts probabilities for 0 and 1. Implicitly P(X) is low if P(0)+P(1) is high?
-    Actually, the instruction says: "Output Domain: Strictly Binary: 0 or 1".
-    "Input Domain: 3-Valued Logis".
-    "Refine Logic Primitives: X=2".
-    "Output Head: nn.Linear(model_dim, 2) (predicting logits for 0 vs 1)".
-
-    So the model predicts a BINARY state (it forces the gate to be 0 or 1).
-    The loss checks if this binary assignment is consistent with the gate logic.
-
-    If inputs are X, we are lenient.
-
-    Shapes:
-    probs: [B, P, L, 2] -> Softmax(logits) gives P(0) and P(1).
-    """
-    probs = F.softmax(logits, dim=-1)
     p0 = probs[..., 0]
     p1 = probs[..., 1]
 
@@ -86,19 +73,17 @@ def calculate_consistency_loss(
     if is_nor.any():
         loss[is_nor] += prev_p1[is_nor] * cur_p1[is_nor]
 
-    # --- 2. Deterministic Gate Violations ---
+    # --- 2. Deterministic Gate Violations (2x weight) ---
 
-    # NOT: 0->1, 1->0
     is_not = gt_cur == GateType.NOT
     if is_not.any():
-        # Disallow 0->0 and 1->1
-        loss[is_not] += prev_p0[is_not] * cur_p0[is_not] + prev_p1[is_not] * cur_p1[is_not]
+        loss[is_not] += 2.0 * (prev_p0[is_not] * cur_p0[is_not] + prev_p1[is_not] * cur_p1[is_not])
 
-    # BUFF: 0->0, 1->1
     is_buff = gt_cur == GateType.BUFF
     if is_buff.any():
-        # Disallow 0->1 and 1->0
-        loss[is_buff] += prev_p0[is_buff] * cur_p1[is_buff] + prev_p1[is_buff] * cur_p0[is_buff]
+        loss[is_buff] += 2.0 * (
+            prev_p0[is_buff] * cur_p1[is_buff] + prev_p1[is_buff] * cur_p0[is_buff]
+        )
 
     # --- 3. Non-Controlling Input Consistency (Weak) ---
     # AND: Input 1 -> Output can be 0 or 1 (depends on other inputs).
@@ -351,12 +336,7 @@ def calculate_full_logic_loss(
     if m.any():
         viol[m] = F.relu(cur_p[m] - (1.0 - prev_p[m])) ** 2
 
-    # Heavy weights for deterministic gates
-    edge_weights = torch.ones_like(gt_cur, dtype=torch.float32)
-    edge_weights[gt_cur == GateType.NOT] = 20.0
-    edge_weights[gt_cur == GateType.BUFF] = 20.0
-
-    viol = viol * edge_weights * valid_edges.float()
+    viol = viol * valid_edges.float()
 
     valid_edge_counts = valid_edges.sum(dim=(1, 2)).float().clamp(min=1.0)
     loss_per_sample = viol.sum(dim=(1, 2)) / valid_edge_counts
@@ -451,7 +431,6 @@ def reinforce_loss(
         )
 
     # RL Reward Logic (For Logging Only)
-    torch.ones(B, dtype=torch.bool, device=logits.device)
     unsat_reward = torch.zeros(B, dtype=torch.float32, device=logits.device)
 
     if solvability_labels is not None:
@@ -464,8 +443,8 @@ def reinforce_loss(
                 correct == 1, torch.ones_like(correct), torch.full_like(correct, -1.0)
             )
 
-    # Initialize loss
-    loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
+    # Accumulate loss terms in a list for clean gradient flow
+    loss_terms: list[torch.Tensor] = []
 
     # Vectorized Logic Consistency (Metrics Only)
     # We use `actions` (indices) for metrics to see "Hard" violations
@@ -563,7 +542,7 @@ def reinforce_loss(
 
     diff = last_logits - mean_logits.unsqueeze(1)
     mse_per_sample = ((diff**2) * mask_exp).sum(dim=(1, 2)) / count_paths.squeeze(-1)  # [B]
-    loss = loss + 0.5 * mse_per_sample.mean()
+    loss_terms.append(0.5 * mse_per_sample.mean())
 
     # 2. Vectorized Soft Edge Loss (Using Gumbel Outputs one_hot)
     # This acts as a differentiable consistency check.
@@ -591,22 +570,20 @@ def reinforce_loss(
     m = gt_cur == GateType.NOR
     viol[m] = F.relu(cur_p[m] - (1.0 - prev_p[m])) ** 2
 
-    edge_weights = torch.ones_like(gt_cur, dtype=torch.float32)
-    edge_weights[gt_cur == GateType.NOT] = 20.0  # Heavy penalty for inverters
-    viol = viol * edge_weights * valid_edges.float()
+    viol = viol * valid_edges.float()
 
     valid_edge_counts = valid_edges.sum(dim=(1, 2)).float().clamp(min=1.0)
     edge_loss_per_sample = viol.sum(dim=(1, 2)) / valid_edge_counts
 
     if soft_edge_lambda > 0:
-        loss = loss + float(soft_edge_lambda) * edge_loss_per_sample.mean()
+        loss_terms.append(float(soft_edge_lambda) * edge_loss_per_sample.mean())
 
     # 3. Entropy regularization (Using logits)
     if entropy_beta > 0.0:
         probs = torch.softmax(logits, dim=-1)
         ent = -(probs * torch.log_softmax(logits, dim=-1)).sum(dim=-1)
         ent_mean = (ent * mask_valid.float()).sum() / torch.clamp(mask_valid.float().sum(), min=1.0)
-        loss = loss - float(entropy_beta) * ent_mean
+        loss_terms.append(-float(entropy_beta) * ent_mean)
 
     # 4. Anchor Supervision (Standard CE)
     if anchor_p is not None and anchor_l is not None and anchor_v is not None:
@@ -620,30 +597,39 @@ def reinforce_loss(
             targets = anchor_v[valid_anchors].long().clamp(0, 1)
             pred_logits = logits[b_idx, p_idx, l_idx]
             sup_loss = F.cross_entropy(pred_logits, targets)
-            loss = loss + 1.0 * sup_loss
+            loss_terms.append(sup_loss)
 
     # 5. Add accumulated auxiliary losses
-    loss = loss + constraint_loss + solvability_loss
+    if constraint_loss.requires_grad or constraint_loss.item() > 0:
+        loss_terms.append(constraint_loss)
+    if solvability_loss.requires_grad or solvability_loss.item() > 0:
+        loss_terms.append(solvability_loss)
 
     # 6. Reconvergence Logic Loss (Differentiable via Gumbel)
     if lambda_logic > 0.0:
         logic_loss = calculate_consistency_loss(
             gate_types=gate_types,
-            logits=logits,  # Pass LOGITS not Gumbel hard outputs for gradients
+            probs=actions_one_hot,
             mask_valid=mask_valid,
             device=logits.device,
         )
-        loss = loss + (lambda_logic * logic_loss)
+        loss_terms.append(lambda_logic * logic_loss)
 
-        # 7. Full-Path Gate Consistency Loss (Now merged into consistency loss)
-        # if lambda_full_logic > 0.0:
+    # 7. Full-Path Gate Consistency Loss
+    if lambda_full_logic > 0.0:
         full_logic_loss = calculate_full_logic_loss(
             gate_types=gate_types,
-            probs=actions_one_hot,  # Pass Gumbel outputs
+            probs=actions_one_hot,
             mask_valid=mask_valid,
             device=logits.device,
         )
-        loss = loss + (lambda_full_logic * full_logic_loss)
+        loss_terms.append(lambda_full_logic * full_logic_loss)
+
+    # Sum all loss terms
+    if loss_terms:
+        loss = torch.stack(loss_terms).sum()
+    else:
+        loss = torch.tensor(0.0, device=logits.device)
 
     return loss, avg_reward, valid_rate, edge_acc, constraint_violation_rate
 

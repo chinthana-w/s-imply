@@ -85,6 +85,9 @@ class ReconvergentPathsDataset(Dataset):
         self._current_shard_id: Optional[int] = None
         self._current_shard: Optional[Dict[str, Any]] = None
 
+        # Default to not using processed shards; set True below if shards are found
+        self._use_processed = False
+
         if self.load_processed and self.processed_dir and os.path.isdir(self.processed_dir):
             shard_paths = sorted(
                 [
@@ -104,10 +107,8 @@ class ReconvergentPathsDataset(Dataset):
                 print(
                     f"[WARNING] No shards found in {self.processed_dir}. Will fallback to pickle."
                 )
-                self._use_processed = False
-        # Decide if we need to load the raw pickle (for the 'info' dictionaries)
-        # Even if using processed shards, we need 'info' for the solver (inject_constraints)
-        self.need_pickle_info = (not self._use_processed) or self.inject_constraints
+        # Constraints are now baked into shards — no longer need pickle for inject_constraints
+        self.need_pickle_info = not self._use_processed
 
         # Load raw pickle dataset if needed
         if self.need_pickle_info:
@@ -307,10 +308,16 @@ class ReconvergentPathsDataset(Dataset):
                 v_sel = int(data["anchor_v"][local_idx].item())
                 s_sel = int(data["solvability"][local_idx].item())
 
-            # For constraint solving, we need the original 'info' dict.
-            # Shards don't store the full 'info' dict to save space.
-            # We must load it from the pickle/fallback if constraints are needed.
-            if self.inject_constraints or not self.anchor_in_dataset:
+            # Load pre-baked constraints from shard if available
+            if "constraint_mask" in data:
+                c_mask_tensor = data["constraint_mask"][local_idx].to(self.device)
+                c_vals_tensor = data["constraint_vals"][local_idx].to(self.device)
+            else:
+                c_mask_tensor = torch.zeros_like(node_ids, dtype=torch.bool)
+                c_vals_tensor = torch.zeros_like(node_ids, dtype=torch.long)
+
+            # For non-shard features we may still need pickle info
+            if not self.anchor_in_dataset:
                 if hasattr(self, "data") and idx < len(self.data):
                     final_info = self.data[idx]["info"]
         else:
@@ -370,22 +377,29 @@ class ReconvergentPathsDataset(Dataset):
             )
             paths_emb[p_sel, l_sel, D - 3 : D] = onehot
 
-        # Step 4: Inject random solver-derived constraints if enabled
-        c_mask_tensor = torch.zeros_like(node_ids, dtype=torch.bool, device=self.device)
-        c_vals_tensor = torch.zeros_like(node_ids, dtype=torch.long, device=self.device)
-        if self.inject_constraints and self.add_logic_value and final_info:
-            constraints = self._gen_constraints_for_sample(final_info, file_path)
-            if constraints:
-                for nid, val in constraints.items():
-                    mask = node_ids == nid
-                    if mask.any():
-                        c_mask_tensor |= mask
-                        c_vals_tensor[mask] = int(val)
-                        D = paths_emb.shape[-1]
-                        vec = torch.tensor(
-                            [1.0, 0.0, 0.0] if val == 0 else [0.0, 1.0, 0.0], device=self.device
-                        )
-                        paths_emb.view(-1, D)[mask.view(-1), D - 3 : D] = vec
+        # Step 4: Use pre-baked constraints (from shard) or empty tensors
+        # Constraints are now generated during preprocess_to_shards,
+        # not on-the-fly. This eliminates the GIL-locked solver bottleneck.
+        if not getattr(self, "_use_processed", False):
+            # Slow path (pickle): generate on-the-fly as fallback
+            c_mask_tensor = torch.zeros_like(node_ids, dtype=torch.bool, device=self.device)
+            c_vals_tensor = torch.zeros_like(node_ids, dtype=torch.long, device=self.device)
+            if self.inject_constraints and self.add_logic_value and final_info:
+                constraints = self._gen_constraints_for_sample(final_info, file_path)
+                if constraints:
+                    for nid, val in constraints.items():
+                        mask = node_ids == nid
+                        if mask.any():
+                            c_mask_tensor |= mask
+                            c_vals_tensor[mask] = int(val)
+                            D = paths_emb.shape[-1]
+                            vec = torch.tensor(
+                                [1.0, 0.0, 0.0] if val == 0 else [0.0, 1.0, 0.0],
+                                device=self.device,
+                            )
+                            pe_flat = paths_emb.view(-1, D)
+                            pe_flat[mask.view(-1), D - 3 : D] = vec
+        # else: c_mask_tensor / c_vals_tensor already loaded from shard
 
         # Step 5: Finalize dictionary
         res = {
@@ -400,16 +414,8 @@ class ReconvergentPathsDataset(Dataset):
             "solvability": torch.tensor(s_sel, dtype=torch.long, device=self.device),
         }
         if self.inject_constraints:
-            # 25% skip for curriculum/speed
-            import random
-
-            if random.random() > 0.25:
-                res["constraint_mask"] = c_mask_tensor
-                res["constraint_vals"] = c_vals_tensor
-            else:
-                # Provide empty tensors but same shape
-                res["constraint_mask"] = torch.zeros_like(node_ids, dtype=torch.bool)
-                res["constraint_vals"] = torch.zeros_like(node_ids, dtype=torch.long)
+            res["constraint_mask"] = c_mask_tensor
+            res["constraint_vals"] = c_vals_tensor
         return res
 
     def _solve_sample_assignment(
@@ -609,10 +615,13 @@ class ReconvergentPathsDataset(Dataset):
         buf_av: List[torch.Tensor] = []
         buf_solv: List[torch.Tensor] = []
         buf_gt: List[torch.Tensor] = []
+        buf_cmask: List[torch.Tensor] = []
+        buf_cvals: List[torch.Tensor] = []
 
         def flush() -> None:
             nonlocal shard_idx, buf_paths, buf_masks, buf_nodes, buf_files
             nonlocal buf_ap, buf_al, buf_av, buf_solv, buf_gt
+            nonlocal buf_cmask, buf_cvals
             if not buf_paths:
                 return
             # Final safety: ensure equal shapes before stacking
@@ -634,6 +643,8 @@ class ReconvergentPathsDataset(Dataset):
             av_t = torch.tensor(buf_av, dtype=torch.long)
             sv_t = torch.tensor(buf_solv, dtype=torch.long)
             gt_t = torch.stack(buf_gt, dim=0)
+            cmask_t = torch.stack(buf_cmask, dim=0)
+            cvals_t = torch.stack(buf_cvals, dim=0)
 
             shard = {
                 "paths_emb": paths_t.cpu(),
@@ -645,6 +656,8 @@ class ReconvergentPathsDataset(Dataset):
                 "anchor_v": av_t.cpu(),
                 "solvability": sv_t.cpu(),
                 "gate_types": gt_t.cpu(),
+                "constraint_mask": cmask_t.cpu(),
+                "constraint_vals": cvals_t.cpu(),
             }
             out_path = os.path.join(output_dir, f"shard_{shard_idx:05d}.pt")
             torch.save(shard, out_path)
@@ -653,6 +666,7 @@ class ReconvergentPathsDataset(Dataset):
             buf_paths, buf_masks, buf_nodes, buf_files = [], [], [], []
             buf_ap, buf_al, buf_av, buf_solv = [], [], [], []
             buf_gt = []
+            buf_cmask, buf_cvals = [], []
 
         for i in range(total):
             raw_ds.data[i]  # Access raw data to avoid overhead of __getitem__ logic
@@ -710,6 +724,20 @@ class ReconvergentPathsDataset(Dataset):
                     onehot = torch.tensor([0.0, 1.0, 0.0])
                 pe[p_sel, l_sel, D - 3 : D] = onehot
 
+            # GENERATE CONSTRAINTS (bake into shard)
+            c_mask = torch.zeros_like(ni, dtype=torch.bool)
+            c_vals = torch.zeros_like(ni, dtype=torch.long)
+            constraints = raw_ds._gen_constraints_for_sample(info, file_path)
+            if constraints and raw_ds.add_logic_value and pe.shape[-1] >= 3:
+                D = pe.shape[-1]
+                for nid, val in constraints.items():
+                    mask = ni == nid
+                    if mask.any():
+                        c_mask |= mask
+                        c_vals[mask] = int(val)
+                        vec = torch.tensor([1.0, 0.0, 0.0] if val == 0 else [0.0, 1.0, 0.0])
+                        pe.view(-1, D)[mask.view(-1), D - 3 : D] = vec
+
             # Pad strictly to max_path_length for stacking
             Pdim, Lcur, Ddim = pe.shape
             Lfix = max_path_length
@@ -722,17 +750,24 @@ class ReconvergentPathsDataset(Dataset):
                 ni_pad[:, :Lcur] = ni
                 gt_pad = torch.full((Pdim, Lfix), -1, dtype=gt.dtype)
                 gt_pad[:, :Lcur] = gt
+                cm_pad = torch.zeros(Pdim, Lfix, dtype=c_mask.dtype)
+                cm_pad[:, :Lcur] = c_mask
+                cv_pad = torch.zeros(Pdim, Lfix, dtype=c_vals.dtype)
+                cv_pad[:, :Lcur] = c_vals
                 pe, am, ni, gt = pe_pad, am_pad, ni_pad, gt_pad
+                c_mask, c_vals = cm_pad, cv_pad
             elif Lcur > Lfix:
-                pe = pe[:, :Lfix, :]
-                am = am[:, :Lfix]
-                ni = ni[:, :Lfix]
-                gt = gt[:, :Lfix]
+                raise RuntimeError(
+                    f"Path length {Lcur} exceeds max_path_length "
+                    f"{Lfix}. Upstream filtering has failed."
+                )
 
             buf_paths.append(pe)
             buf_masks.append(am)
             buf_nodes.append(ni)
             buf_gt.append(gt)
+            buf_cmask.append(c_mask)
+            buf_cvals.append(c_vals)
             buf_files.append(file_path)
 
             buf_ap.append(int(p_sel))
@@ -807,10 +842,10 @@ def reconv_collate(batch: List[Dict[str, Any]], max_paths: int = 0) -> Dict[str,
         if P > MAX_PATHS:
             P = MAX_PATHS
 
-    # Initialize batch tensors with zeros/False
-    # Use pinned memory if device is CPU (which it usually is in simple collation)
-    # But here device comes from batch items, usually CPU until DataLoader moves it
-    paths = torch.zeros(B, P, L, D, device=device, dtype=torch.float32)
+    # Initialize batch tensors — use float16 to match source dtype from shards
+    # Converted to float32 once at the end before returning to model
+    src_dtype = batch[0]["paths_emb"].dtype
+    paths = torch.zeros(B, P, L, D, device=device, dtype=src_dtype)
     masks = torch.zeros(B, P, L, dtype=torch.bool, device=device)
     node_ids = torch.zeros(B, P, L, dtype=torch.long, device=device)
     gate_types = torch.full((B, P, L), -1, dtype=torch.long, device=device)
@@ -819,15 +854,7 @@ def reconv_collate(batch: List[Dict[str, Any]], max_paths: int = 0) -> Dict[str,
     # Fill in data from each sample
     for b, item in enumerate(batch):
         p_i, l_i, d = item["paths_emb"].shape
-
-        # If sample has more paths than limit, we must truncate or sample
-        # Simple truncation: take first MAX_PATHS
-        # Better: take random or sort? Top-k longest paths might be best?
-        # For now, simple truncation for speed.
-        if p_i > P:
-            p_curr = P
-        else:
-            p_curr = p_i
+        p_curr = min(p_i, P)
 
         # Copy embeddings (padding happens automatically via zeros initialization)
         paths[b, :p_curr, :l_i, :d] = item["paths_emb"][:p_curr]
@@ -838,7 +865,6 @@ def reconv_collate(batch: List[Dict[str, Any]], max_paths: int = 0) -> Dict[str,
         files.append(item["file"])
 
     # Convert to float32 for model computation
-    # (keeps dataset/cache in float16 to save RAM)
     paths = paths.to(torch.float32)
 
     out: Dict[str, Any] = {
