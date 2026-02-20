@@ -309,12 +309,12 @@ def calculate_full_logic_loss(
     # NOT: |cur - (1-prev)|^2
     m = gt_cur == GateType.NOT
     if m.any():
-        viol[m] = (cur_p[m] - (1.0 - prev_p[m])) ** 2
+        viol[m] = 2.0 * ((cur_p[m] - (1.0 - prev_p[m])) ** 2)
 
     # BUFF: |cur - prev|^2
     m = gt_cur == GateType.BUFF
     if m.any():
-        viol[m] = (cur_p[m] - prev_p[m]) ** 2
+        viol[m] = 2.0 * ((cur_p[m] - prev_p[m]) ** 2)
 
     # AND: cur <= prev => ReLU(cur - prev)^2
     m = gt_cur == GateType.AND
@@ -388,7 +388,7 @@ def reinforce_loss(
 
     # constraint_metrics
     constraint_loss = torch.tensor(0.0, device=logits.device)
-    constraint_violation_rate = 0.0
+    constraint_violation_rate = torch.tensor(0.0, device=logits.device)
 
     # Enforce constraints if provided
     if constraint_mask is not None and constraint_vals is not None:
@@ -408,7 +408,9 @@ def reinforce_loss(
             targets = constraint_vals[constraint_mask]
             violations = (preds != targets).float().sum()
             total_c = targets.numel()
-            constraint_violation_rate = (violations / max(1, total_c)).item()
+            constraint_violation_rate = torch.tensor(
+                violations.item() / max(1, total_c), device=logits.device
+            )
 
             # Forcing: Update actions to match constraints to ensure downstream
             # path consistency?
@@ -493,16 +495,22 @@ def reinforce_loss(
 
     # Metrics
     with torch.no_grad():
-        trivial = checked == 0
-        valid = (local_err := local_wrong.float()) == 0
-        valid = valid & (reconv_wrong == 0) & (~trivial)
-        if solvability_labels is not None:
-            valid = valid & (solvability_labels == 0)
-            denom_count = (solvability_labels == 0).float().sum().item()
-        else:
-            denom_count = B
-        valid_rate = float(valid.float().sum().item() / max(1.0, denom_count))
-        edge_acc = float((edge_total_sum - edge_wrong_sum) / max(1.0, edge_total_sum))
+        # Granular path-wise accuracy (instead of strict sample-wise validity)
+        path_wrong = wrong_edges.sum(dim=2)  # [B, P]
+        path_valid = (path_wrong == 0) & path_valid_mask  # [B, P]
+
+        # Simplify by directly removing the solvable masking logic
+        total_paths = path_valid_mask.float().sum().item()
+        total_valid_paths = path_valid.float().sum().item()
+
+        # Fallback to local error for reward shaping
+        local_err = local_wrong.float()
+
+        # Path Accuracy (percentage of paths entirely consistent)
+        valid_rate = torch.tensor(total_valid_paths / max(1.0, total_paths), device=logits.device)
+        edge_acc = torch.tensor(
+            (edge_total_sum - edge_wrong_sum) / max(1.0, edge_total_sum), device=logits.device
+        )
 
         # Calculate a pseudo-reward for logging consistency
         local_reward_shaping = (1.0 - (local_err / checked.clamp(min=1.0))) * 2.0 - 1.0
@@ -514,7 +522,7 @@ def reinforce_loss(
             torch.min(local_reward_shaping, torch.tensor(reconv_penalty, device=logits.device)),
         )
         reward = sat_base_reward.clone()
-        avg_reward = float(reward.mean().item())
+        avg_reward = reward.mean()
 
     # -----------------------------------------------------------------------
     # Differentiable Losses

@@ -312,8 +312,38 @@ def main():
 
     solver_module.HierarchicalReconvSolver.solve = traced_solve_with_verification
 
+    # --- Trace internal Justification (the "regular" part) ---
+    original_justify_all = solver_module.HierarchicalReconvSolver._justify_all
+
+    def traced_justify_all(self, assignment):
+        print("  ┌────── [Justification] Solving remaining logic paths to PIs...")
+        res = original_justify_all(self, assignment)
+        if res:
+            print("  └────── ✓ Justification Complete.")
+        else:
+            print("  └────── ✗ Justification Failed.")
+        return res
+
+    solver_module.HierarchicalReconvSolver._justify_all = traced_justify_all
+
+    original_justify_gate = solver_module.HierarchicalReconvSolver._justify_gate
+
+    def traced_justify_gate(self, node, val, assignment):
+        res = original_justify_gate(self, node, val, assignment)
+        if res:
+            for fin, fval in res.items():
+                # Filter entries that are already in assignment to avoid spam,
+                # or just show the new ones
+                if assignment.get(fin) != fval:
+                    print(
+                        f"  │   [Trace] Gate {node}={val} justification -> setting Input {fin}={fval}"
+                    )
+        return res
+
+    solver_module.HierarchicalReconvSolver._justify_gate = traced_justify_gate
+
     print("=" * 80)
-    print("RUNNING 100 AI PODEM CYCLES (AI Activation ONLY - Detailed Trace)")
+    print("RUNNING AI PODEM (Activation + Propagation - Detailed Trace)")
     print("=" * 80 + "\n")
 
     # patterns = [] # Unused
@@ -324,30 +354,69 @@ def main():
     initialize(circuit, total_gates)
 
     try:
-        result = ai_podem(
-            circuit,
-            fault,
-            total_gates,
-            circuit_path=circuit_path,
-            predictor=predictor,
-            enable_ai_activation=True,
-            enable_ai_propagation=True,  # AI activation and propagation
-            verbose=True,
-        )
+        # Use AI Activation only
+        print("[AI-PODEM] Starting AI Justification for Activation...")
+        activation_val = LogicValue.ONE if fault.value == LogicValue.D else LogicValue.ZERO
 
-        if result:
+        # Actually, let's use the solver directly to illustrate the process we saw in logs
+        solver = solver_module.HierarchicalReconvSolver(circuit, predictor, verbose=True)
+        ai_assignment = solver.solve(fault.gate_id, activation_val)
+
+        if ai_assignment:
             print("\n" + "=" * 80)
-            print("FINAL RESULT: SUCCESS - Found pattern")
-            print(f"Pattern: {result}")
+            print("AI ACTIVATION SUCCESS")
+            print(f"Total assignments in AI dictionary: {len(ai_assignment)}")
+
+            # Print PI assignments
+            pi_assignments = {
+                gid: val for gid, val in ai_assignment.items() if circuit[gid].type == GateType.INPT
+            }
+            print(f"PI assignments ({len(pi_assignments)}): {pi_assignments}")
+
+            # Verify internal logic consistency of the AI assignment
+            violations = predictor._verify_assignment_logic(ai_assignment)
+            if violations == 0:
+                print("✓ AI Logic Verification: SUCCESS")
+            else:
+                print(f"✗ AI Logic Verification: FAILED ({violations} violations)")
+
+            # --- ILLUSTRATE PODEM-STYLE ACTIVATION COMPLETION ---
+            print("\n[AI-PODEM] Applying PI assignments to circuit...")
+            for gid, val in pi_assignments.items():
+                circuit[gid].val = val
+
+            print("[AI-PODEM] Running logic simulation (Forward Prop)...")
+            from src.atpg.logic_sim_three import logic_sim
+            from src.atpg.util import get_topological_order
+
+            topo_order = get_topological_order(circuit, total_gates)
+
+            # Simulation propagates PIs through the cone.
+            # If the AI solver was correct, Gate 259 should reach the target value.
+            logic_sim(circuit, total_gates, fault, topo_order=topo_order)
+
+            actual_val = circuit[fault.gate_id].val
+            print(f"[AI-PODEM] Gate {fault.gate_id} value after simulation: {actual_val}")
+
+            # Check for activation (Fault site should be D or DB depending on objective)
+            # activation_val was the GOOD value we wanted.
+            if actual_val in [LogicValue.D, LogicValue.DB]:
+                print("✓ ACTIVATION VERIFIED: Fault site contains D/D-bar.")
+            elif actual_val == activation_val:
+                # In some cases if D/DB isn't handled by sim yet for activation phase
+                print("✓ ACTIVATION VERIFIED: Fault site reached objective value.")
+            else:
+                print(f"✗ ACTIVATION FAILED: Expected {activation_val}, reached {actual_val}")
+
             print("=" * 80)
         else:
             print("\n" + "=" * 80)
-            print("FINAL RESULT: FAILURE - No pattern found")
+            print("AI ACTIVATION FAILURE")
             print("=" * 80)
 
-        # Print PODEM statistics summary
-        stats = podem_module.get_statistics()
-        print(f"\n    PODEM Stats: {stats}")
+        # EXIT before propagation
+        print("\nExiting after activation analysis as requested.")
+        return
 
     except Exception as e:
         print(f"\nCRITICAL ERROR: {e}")

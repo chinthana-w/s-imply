@@ -214,7 +214,7 @@ class ModelPairPredictor(ReconvPairPredictor):
             nhead=4,
             num_encoder_layers=3,
             num_interaction_layers=3,
-            dim_feedforward=2048,
+            dim_feedforward=512,  # Match training default
         ).to(self.device)
 
         if os.path.exists(model_path):

@@ -286,8 +286,6 @@ def train_one_epoch(
         print(f"Starting epoch {epoch} loop (waiting for DataLoader)...", flush=True)
     pbar = tqdm(loader, desc=f"Epoch {epoch}", total=target_batches, unit="batch")
 
-    print(f"[Memory] Batch={cfg.batch_size}")
-
     for batch_idx, batch in enumerate(pbar):
         pbar.set_description(f"Epoch {epoch}")
         paths = batch["paths_emb"].to(device)
@@ -388,12 +386,13 @@ def train_one_epoch(
             )
 
         # NaN/Inf guard: skip corrupt batches
-        if not torch.isfinite(loss):
+        loss_val = loss.mean()
+        if not torch.isfinite(loss_val):
             print(f"[WARNING] Non-finite loss at batch {batch_idx}, skipping.")
             optim.zero_grad(set_to_none=True)
             continue
 
-        scaler.scale(loss).backward()
+        scaler.scale(loss_val).backward()
         # Gradient clipping to prevent AMP-induced explosions
         scaler.unscale_(optim)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -401,11 +400,11 @@ def train_one_epoch(
         scaler.update()
         optim.zero_grad(set_to_none=True)
 
-        total_loss += float(loss.item())
-        total_reward += float(avg_reward)
-        total_valid += float(valid_rate)
-        total_edge_acc += float(batch_edge_acc)
-        total_trivial += float(batch_c_viol)
+        total_loss += float(loss_val.item())
+        total_reward += float(avg_reward.mean().item())
+        total_valid += float(valid_rate.mean().item())
+        total_edge_acc += float(batch_edge_acc.mean().item())
+        total_trivial += float(batch_c_viol.mean().item())
         total_batches += 1
         bdone += paths.size(0)
 
@@ -436,11 +435,15 @@ def train_one_epoch(
             pbar.set_postfix(
                 {
                     "loss": f"{total_loss / max(1, total_batches):.4f}",
-                    "acc": f"{total_valid / max(1, total_batches):.4f}",
+                    "path_acc": f"{total_valid / max(1, total_batches):.4f}",
                     "solv": f"{dbg['solvability_acc']:.3f}",
                     "edge": f"{dbg['edge_acc']:.3f}",
+                    "reconv": f"{dbg['reconv_match_rate']:.3f}",
                 }
             )
+
+        if cfg.max_train_batches > 0 and (batch_idx + 1) >= cfg.max_train_batches:
+            break
 
         if cfg.max_train_batches > 0 and (batch_idx + 1) >= cfg.max_train_batches:
             break
@@ -563,11 +566,12 @@ def evaluate(
                 gumbel_temp=0.1,
             )
 
-        total_loss += float(loss.item())
-        total_reward += float(avg_reward)
-        total_valid += float(valid_rate)
-        total_edge_acc += float(batch_edge_acc)
-        total_trivial += float(batch_c_viol)
+        loss_val = loss.mean()
+        total_loss += float(loss_val.item())
+        total_reward += float(avg_reward.mean().item())
+        total_valid += float(valid_rate.mean().item())
+        total_edge_acc += float(batch_edge_acc.mean().item())
+        total_trivial += float(batch_c_viol.mean().item())
         total_batches += 1
 
         if cfg.verbose and cfg.log_interval > 0 and (batch_idx + 1) % cfg.log_interval == 0:
@@ -587,8 +591,9 @@ def evaluate(
             print(
                 f"[val] batch {batch_idx + 1} "
                 f"avg_loss={total_loss / max(1, total_batches):.4f} "
-                f"acc={total_valid / max(1, total_batches):.4f} "
+                f"path_acc={total_valid / max(1, total_batches):.4f} "
                 f"edge_acc={dbg['edge_acc']:.3f} "
+                f"reconv={dbg['reconv_match_rate']:.3f} "
                 f"solv_acc={dbg['solvability_acc']:.3f} speed={it_per_s:.2f} it/s"
             )
 
@@ -680,20 +685,29 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     train_loader, val_loader = make_dataloaders(cfg, device)
 
-    # Infer actual embedding dimension from a real batch to avoid mismatches
-    # with processed shards and logic-value features.
+    # Infer actual embedding dimension from a single sample to avoid spawning
+    # the entire heavy DataLoader queue just for a shape check.
     print(
-        "Retrieving first batch to probe dimensions (spawning workers, might take a moment)...",
+        "Probing dataset dimensions...",
         flush=True,
     )
     import time
 
     start_time = time.time()
-    probe_batch = next(iter(train_loader))
-    elapsed = time.time() - start_time
-    observed_dim = int(probe_batch["paths_emb"].shape[-1])
+
+    # Get a single sample directly from the underlying dataset
+    probe_sample = train_loader.dataset[0]
+    raw_dim = int(probe_sample["paths_emb"].shape[-1])
+
+    # Account for the padding that reconv_collate performs (divisibility by nhead)
     nhead = cfg.nhead
-    print(f"First batch retrieved in {elapsed:.2f}s")
+    if raw_dim % nhead == 0:
+        observed_dim = raw_dim
+    else:
+        observed_dim = ((raw_dim // nhead) + 1) * nhead
+
+    elapsed = time.time() - start_time
+    print(f"Dimensions probed in {elapsed:.4f}s. Observed dim: {observed_dim}")
     if cfg.verbose:
         print(f"Observed embedding dimension from batch: {observed_dim}")
         print(f"Number of attention heads: {nhead}")
@@ -796,9 +810,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         current_lr = optim.param_groups[0]["lr"]
         print(
             f"Epoch {epoch:03d} | "
-            f"train_loss={tr_loss:.4f} avg_reward={tr_reward:.4f} acc={tr_acc:.4f} "
+            f"train_loss={tr_loss:.4f} avg_reward={tr_reward:.4f} path_acc={tr_acc:.4f} "
             f"edge_acc={tr_edge:.4f} c_viol={tr_c_viol:.4f} | "
-            f"val_loss={va_loss:.4f} avg_reward={va_reward:.4f} acc={va_acc:.4f} "
+            f"val_loss={va_loss:.4f} avg_reward={va_reward:.4f} path_acc={va_acc:.4f} "
             f"edge_acc={va_edge:.4f} c_viol={va_c_viol:.4f} "
             f"lr={current_lr:.2e}"
         )

@@ -71,12 +71,8 @@ class MultiPathTransformer(nn.Module):
         # Explicit Gate Type Embedding (12 types -> 64 dims)
         self.gate_type_emb = nn.Embedding(12, 64)
 
-        # Node Identity Embedding (Topology Awareness)
-        self.num_total_nodes = 20000  # Default large enough for ISCAS85/89
-        self.node_emb = nn.Embedding(self.num_total_nodes, 64)
-
-        # Input has: [Base Feature] + [GateType(64)] + [NodeID(64)]
-        self.input_aug_dim = self.input_dim + 64 + 64
+        # Input has: [Base Feature] + [GateType(64)]
+        self.input_aug_dim = self.input_dim + 64
 
         # Optional input projection to expand/shrink to model_dim
         # Input is now augmented input_dim + 16
@@ -162,15 +158,6 @@ class MultiPathTransformer(nn.Module):
             gt_emb = self.gate_type_emb(gate_types.clamp(0, 11))
             features.append(gt_emb)
 
-        if node_ids is not None:
-            # Clamp to avoid out of bounds
-            n_emb = self.node_emb(node_ids.clamp(0, self.num_total_nodes - 1))
-            features.append(n_emb)
-        else:
-            # Fallback if no node_ids provided (though they should be)
-            n_emb = torch.zeros(batch_size, num_paths, seq_len, 64, device=path_list.device)
-            features.append(n_emb)
-
         # Concatenate: [B, P, L, D_total]
         x = torch.cat(features, dim=-1)
 
@@ -195,16 +182,23 @@ class MultiPathTransformer(nn.Module):
             encoded_paths = self.shared_path_encoder(flat_paths, src_key_padding_mask=~flat_masks)
 
         # --- Step 2: Allow Paths to Interact ---
-        # Masked Max Pooling: Aggregate features across length dimension
+        # Instead of max-pooling which destroys sequence causality,
+        # gather the explicit terminal (reconvergent) node for each path.
 
-        # Apply mask: set invalid positions to -inf
-        mask_expanded = flat_masks.unsqueeze(-1)  # (B*P, L, 1)
+        # Calculate sequence length of each path (number of True elements in mask)
+        seq_lens = attention_masks.sum(dim=-1)  # (batch_size, num_paths)
+        # Ensure minimum length of 1 to avoid index out of bounds (-1)
+        valid_lens = seq_lens.clamp(min=1)
 
-        # Fill invalid positions with large negative value for Max Pooling
-        pooled_input = encoded_paths.masked_fill(~mask_expanded, -1e9)
+        # The terminal node is the last valid node (index = seq_len - 1)
+        terminal_indices = (valid_lens - 1).long()  # (batch_size, num_paths)
 
-        # Max Pool over L dimension: (B*P, D)
-        path_summaries, _ = pooled_input.max(dim=1)
+        # Flatten batch and path dimensions for gathering
+        encoded_flat = encoded_paths  # (B*P, seq_len, model_dim)
+        terminal_indices_flat = terminal_indices.view(-1, 1, 1).expand(-1, -1, self.model_dim)
+
+        # Gather the terminal node embedding [B*P, 1, D] -> [B*P, D]
+        path_summaries = torch.gather(encoded_flat, dim=1, index=terminal_indices_flat).squeeze(1)
 
         # Group by original batch item: (batch_size, num_paths, model_dim)
         path_representations = path_summaries.view(batch_size, num_paths, self.model_dim)

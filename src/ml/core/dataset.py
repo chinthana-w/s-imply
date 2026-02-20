@@ -263,7 +263,8 @@ class ReconvergentPathsDataset(Dataset):
         # Load new shard
         path = self._shard_files[shard_idx]
         try:
-            data = torch.load(path, map_location="cpu")
+            # Bypass unpickling CPU overhead with memory mapping
+            data = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
             self._shard_cache[shard_idx] = data
 
             # Enforce cache size
@@ -294,12 +295,16 @@ class ReconvergentPathsDataset(Dataset):
             if data is None:
                 raise RuntimeError(f"Shard data is None! shard={shard_idx}")
 
-            paths_emb = data["paths_emb"][local_idx].to(torch.float32).to(self.device)
-            attn_mask = data["attn_mask"][local_idx].to(self.device)
-            node_ids = data["node_ids"][local_idx].to(self.device)
+            # Explicitly .clone() so we don't return a view that keeps the entire
+            # 5000-sample 138MB shard backing Storage alive in the DataLoader queues!
+            paths_emb = data["paths_emb"][local_idx].clone().to(torch.float32).to(self.device)
+            attn_mask = data["attn_mask"][local_idx].clone().to(self.device)
+            node_ids = data["node_ids"][local_idx].clone().to(self.device)
             file_path = data["files"][local_idx]
-            gate_types = data.get("gate_types", torch.full_like(node_ids, -1))[local_idx].to(
-                self.device
+            gate_types = (
+                data.get("gate_types", torch.full_like(node_ids, -1))[local_idx]
+                .clone()
+                .to(self.device)
             )
 
             if "anchor_p" in data:
@@ -310,8 +315,8 @@ class ReconvergentPathsDataset(Dataset):
 
             # Load pre-baked constraints from shard if available
             if "constraint_mask" in data:
-                c_mask_tensor = data["constraint_mask"][local_idx].to(self.device)
-                c_vals_tensor = data["constraint_vals"][local_idx].to(self.device)
+                c_mask_tensor = data["constraint_mask"][local_idx].clone().to(self.device)
+                c_vals_tensor = data["constraint_vals"][local_idx].clone().to(self.device)
             else:
                 c_mask_tensor = torch.zeros_like(node_ids, dtype=torch.bool)
                 c_vals_tensor = torch.zeros_like(node_ids, dtype=torch.long)
