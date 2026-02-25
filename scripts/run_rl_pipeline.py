@@ -40,9 +40,11 @@ def run_experience_collection(args):
                 "scripts.collect_experience",
                 "--max_faults",
                 str(args.max_faults // num_gpus),
-                "--gpu",
-                str(i),
+                "--bench_dirs",
             ]
+            cmd.extend(args.bench_dirs)
+            cmd.extend(["--gpu", str(i)])
+
             if args.model:
                 cmd.extend(["--model", args.model])
 
@@ -94,6 +96,8 @@ def run_training(args):
         str(args.batch_size),
         "--lr",
         str(args.lr),
+        "--max_paths",
+        str(args.max_paths),
         "--amp",
     ]
 
@@ -117,7 +121,17 @@ def run_benchmark(args):
 
     model_path = args.output_model or "checkpoints/reconv_rl_model.pt"
 
-    cmd = ["python", "scripts/benchmark_c432_compare.py", "--ai_model", model_path]
+    cmd = [
+        "python",
+        "-m",
+        "scripts.benchmark_podem",
+        "--model",
+        model_path,
+        "--gate",
+        "259",
+        "--sa",
+        "1",
+    ]
 
     print(f"Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=os.path.dirname(os.path.dirname(__file__)))
@@ -167,6 +181,12 @@ Examples:
         default=100,
         help="Maximum faults per circuit (default: 100)",
     )
+    collect_group.add_argument(
+        "--bench_dirs",
+        nargs="+",
+        default=["data/bench/ISCAS85", "data/bench/iscas89"],
+        help="Directories with .bench files (default: ISCAS85 and iscas89)",
+    )
 
     # Training parameters
     train_group = parser.add_argument_group("Training Parameters")
@@ -177,7 +197,24 @@ Examples:
         "--batch_size", type=int, default=256, help="Training batch size (default: 256)"
     )
     train_group.add_argument("--lr", type=float, default=1e-4, help="Learning rate (default: 1e-4)")
-    train_group.add_argument("--model", type=str, help="Pretrained model path to continue training")
+    train_group.add_argument(
+        "--model",
+        type=str,
+        default="checkpoints/unlinked_candidate/best_model.pth",
+        help="Pretrained model path to start/continue training",
+    )
+    train_group.add_argument(
+        "--max_paths",
+        type=int,
+        default=250,
+        help="Maximum paths per sample during training (default: 250)",
+    )
+    train_group.add_argument(
+        "--amp",
+        action="store_true",
+        default=True,
+        help="Use automatic mixed precision (default: True)",
+    )
 
     # Output parameters
     output_group = parser.add_argument_group("Output Parameters")
@@ -208,6 +245,7 @@ Examples:
     print(f"  - Benchmarking:          {'✓' if run_bench else '✗'}")
     print("\nParameters:")
     print(f"  - Max faults per circuit: {args.max_faults}")
+    print(f"  - Bench dirs:             {', '.join(args.bench_dirs)}")
     print(f"  - Training epochs:        {args.epochs}")
     print(f"  - Batch size:             {args.batch_size}")
     print(f"  - Learning rate:          {args.lr}")

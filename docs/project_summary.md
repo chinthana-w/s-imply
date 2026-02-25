@@ -78,6 +78,16 @@ The project integrates **DeepGate**, a Graph Neural Network (GNN)-based model, t
 2.  **Environment Management**: DeepGate runs in its own Conda environment (`deepgate`) and is dynamically imported into the S-Imply pipeline via manual `sys.path` configuration.
 3.  **Circuit Pre-processing**: Circuits are converted to AIG (And-Inverter Graph) format before being passed to DeepGate's `BenchParser`.
 
+### F. RL Training Pipeline Rerun (Multi-Dataset)
+**Timestamp: 2026-02-24**
+Initiated a comprehensive RL training rerun to optimize path selection and logic consistency across a broader range of topologies.
+- **Datasets**: Combined `ISCAS85` and `iscas89` benchmarks (17 circuits total).
+- **Configuration**:
+    - **Experience Collection**: 1000 faults per circuit (500 per GPU) using the current best candidate.
+    - **Training**: 50 epochs, Batch Size 4096, Max Paths 250 (Stabilized VRAM).
+    - **Hardware**: Parallelized across 2x 16GB GPUs.
+- **Goal**: Improve the model's ability to handle complex reconvergence in sequential-like structures (ISCAS89) and further reduce `✗ Convergence Path Invalid` failures observed in dense combinational logic (`c1908`).
+
 ---
 
 ## 4. Project Structure & Key Files

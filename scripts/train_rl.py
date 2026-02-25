@@ -33,7 +33,7 @@ sys.modules["src.ml.rl_recorder"] = src.ml.rl.rl_recorder
 @dataclass
 class TrainConfig:
     experience_dir: str = "data/rl_experience"
-    model_path: str = "checkpoints/reconv_minimal_model.pt"
+    model_path: str = "checkpoints/unlinked_candidate/best_model.pth"
     output_path: str = "checkpoints/reconv_rl_model.pt"
 
     # Training params
@@ -52,6 +52,7 @@ class TrainConfig:
     # RL params
     gamma: float = 0.99  # Discount factor
     entropy_beta: float = 0.01  # Entropy regularization
+    max_paths: int = 200  # Memory optimization: limit paths per sample
 
 
 class ExperienceDataset(Dataset):
@@ -109,11 +110,16 @@ class ExperienceDataset(Dataset):
         }
 
 
-def collate_experience(batch):
+def collate_experience(batch, max_paths_limit=0):
     """Custom collate function for variable-sized experience."""
 
     # Find max dimensions
-    max_paths = max(b["node_ids"].shape[0] for b in batch)
+    actual_max_paths = max(b["node_ids"].shape[0] for b in batch)
+    if max_paths_limit > 0:
+        max_paths = min(actual_max_paths, max_paths_limit)
+    else:
+        max_paths = actual_max_paths
+
     max_len = max(b["node_ids"].shape[1] if b["node_ids"].ndim >= 2 else 1 for b in batch)
 
     batch_size = len(batch)
@@ -127,10 +133,11 @@ def collate_experience(batch):
     for i, b in enumerate(batch):
         nids = b["node_ids"]
         if nids.ndim == 2:
-            p, length = nids.shape
-            node_ids[i, :p, :length] = nids
-            mask_valid[i, :p, :length] = b["mask_valid"]
-            gate_types[i, :p, :length] = b["gate_types"]
+            p_i, length = nids.shape
+            p_curr = min(p_i, max_paths)
+            node_ids[i, :p_curr, :length] = nids[:p_curr]
+            mask_valid[i, :p_curr, :length] = b["mask_valid"][:p_curr]
+            gate_types[i, :p_curr, :length] = b["gate_types"][:p_curr]
         elif nids.ndim == 1:
             length = nids.shape[0]
             node_ids[i, 0, :length] = nids
@@ -261,13 +268,16 @@ def train_epoch(model, dataloader, optimizer, config, device, epoch):
 def main():
     parser = argparse.ArgumentParser(description="RL Training for Multi-Path Transformer")
     parser.add_argument("--experience_dir", default="data/rl_experience")
-    parser.add_argument("--model", default="checkpoints/reconv_minimal_model.pt")
+    parser.add_argument("--model", default="checkpoints/unlinked_candidate/best_model.pth")
     parser.add_argument("--output", default="checkpoints/reconv_rl_model.pt")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument(
+        "--max_paths", type=int, default=200, help="Limit paths per sample for memory"
+    )
     args = parser.parse_args()
 
     config = TrainConfig(
@@ -278,6 +288,7 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         amp=args.amp,
+        max_paths=args.max_paths,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -302,11 +313,13 @@ def main():
         print("No experience data found. Run collect_experience.py first.")
         return
 
+    import functools
+
     dataloader = DataLoader(
         dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        collate_fn=collate_experience,
+        collate_fn=functools.partial(collate_experience, max_paths_limit=config.max_paths),
         num_workers=args.num_workers,
         pin_memory=True if device.type == "cuda" else False,
     )

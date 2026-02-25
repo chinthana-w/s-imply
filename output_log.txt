@@ -1,0 +1,98 @@
+
+Faults (c1355.bench):   0%|          | 0/1 [00:00<?, ?it/s]/home/local1/miniconda3/envs/deepgate/lib/python3.10/site-packages/torch/nn/modules/transformer.py:515: UserWarning: The PyTorch API of nested tensors is in prototype stage and will change in the near future. We recommend specifying layout=torch.jagged when constructing a nested tensor, as this layout receives active development, has better operator coverage, and works with torch.compile. (Triggered internally at /pytorch/aten/src/ATen/NestedTensorImpl.cpp:178.)
+  output = torch._nested_tensor_from_mask(
+
+Faults (c1355.bench):   0%|          | 0/1 [00:00<?, ?it/s, succ=0, eps=1]
+Faults (c1355.bench): 100%|██████████| 1/1 [00:00<00:00,  1.35it/s, succ=0, eps=1]
+Faults (c1355.bench): 100%|██████████| 1/1 [00:00<00:00,  1.35it/s, succ=0, eps=1]
+
+Faults (c17.bench):   0%|          | 0/1 [00:00<?, ?it/s]
+Faults (c17.bench):   0%|          | 0/1 [00:00<?, ?it/s, succ=0, eps=2]
+Faults (c17.bench): 100%|██████████| 1/1 [00:00<00:00, 442.53it/s, succ=0, eps=2]
+
+Faults (c1908.bench):   0%|          | 0/1 [00:00<?, ?it/s]
+Faults (c1908.bench):   0%|          | 0/1 [00:00<?, ?it/s, succ=0, eps=3]
+Faults (c1908.bench): 100%|██████████| 1/1 [00:00<00:00, 154.99it/s, succ=0, eps=3]
+
+Faults (c2670.bench):   0%|          | 0/1 [00:00<?, ?it/s]
+Faults (c2670.bench):   0%|          | 0/1 [00:00<?, ?it/s, succ=0, eps=4]
+Faults (c2670.bench): 100%|██████████| 1/1 [00:00<00:00, 15.54it/s, succ=0, eps=4]
+
+Faults (c3540.bench):   0%|          | 0/1 [00:00<?, ?it/s]
+Faults (c3540.bench):   0%|          | 0/1 [00:00<?, ?it/s, succ=0, eps=5]
+Faults (c3540.bench): 100%|██████████| 1/1 [00:00<00:00, 66.88it/s, succ=0, eps=5]
+
+Faults (c432.bench):   0%|          | 0/1 [00:00<?, ?it/s]
+Faults (c432.bench):   0%|          | 0/1 [00:00<?, ?it/s, succ=0, eps=6]
+Faults (c432.bench): 100%|██████████| 1/1 [00:00<00:00,  1.72it/s, succ=0, eps=6]
+Faults (c432.bench): 100%|██████████| 1/1 [00:00<00:00,  1.72it/s, succ=0, eps=6]
+
+Faults (c499.bench):   0%|          | 0/1 [00:00<?, ?it/s]
+Faults (c499.bench):   0%|          | 0/1 [00:00<?, ?it/s, succ=0, eps=7]
+Faults (c499.bench): 100%|██████████| 1/1 [00:00<00:00, 108.15it/s, succ=0, eps=7]
+
+Faults (c5315.bench):   0%|          | 0/1 [00:00<?, ?it/s]
+Faults (c5315.bench):   0%|          | 0/1 [00:00<?, ?it/s, succ=0, eps=8]
+Faults (c5315.bench): 100%|██████████| 1/1 [00:00<00:00, 43.86it/s, succ=0, eps=8]
+
+Faults (c6288.bench):   0%|          | 0/1 [00:00<?, ?it/s]
+Faults (c6288.bench):   0%|          | 0/1 [00:01<?, ?it/s, succ=0, eps=9]
+Faults (c6288.bench): 100%|██████████| 1/1 [00:01<00:00,  1.02s/it, succ=0, eps=9]
+Faults (c6288.bench): 100%|██████████| 1/1 [00:01<00:00,  1.02s/it, succ=0, eps=9]
+
+Faults (c7552.bench):   0%|          | 0/1 [00:00<?, ?it/s]
+Faults (c7552.bench):   0%|          | 0/1 [00:00<?, ?it/s, succ=0, eps=10]
+Faults (c7552.bench): 100%|██████████| 1/1 [00:00<00:00, 20.75it/s, succ=0, eps=10]
+
+Faults (c880.bench):   0%|          | 0/1 [00:00<?, ?it/s]
+Faults (c880.bench):   0%|          | 0/1 [00:00<?, ?it/s, succ=0, eps=11]
+Faults (c880.bench): 100%|██████████| 1/1 [00:00<00:00,  7.05it/s, succ=0, eps=11]
+Faults (c880.bench): 100%|██████████| 1/1 [00:00<00:00,  7.05it/s, succ=0, eps=11]
+
+Checking bench_dir: data/bench/ISCAS85
+Processing c1355.bench...
+[INFO] Parse Bench: data/staging/circuit.bench
+    -> Running ai_podem...
+    -> Finished ai_podem (success=False).
+Processing c17.bench...
+[INFO] Parse Bench: data/staging/circuit.bench
+    -> Running ai_podem...
+  Error processing fault 10 attempt 0: list index out of range
+Processing c1908.bench...
+[INFO] Parse Bench: data/staging/circuit.bench
+    -> Running ai_podem...
+    -> Finished ai_podem (success=False).
+Processing c2670.bench...
+[INFO] Parse Bench: data/staging/circuit.bench
+    -> Running ai_podem...
+    -> Finished ai_podem (success=False).
+Processing c3540.bench...
+[INFO] Parse Bench: data/staging/circuit.bench
+    -> Running ai_podem...
+    -> Finished ai_podem (success=False).
+Processing c432.bench...
+[INFO] Parse Bench: data/staging/circuit.bench
+    -> Running ai_podem...
+  Error processing fault 422 attempt 0: list index out of range
+Processing c499.bench...
+[INFO] Parse Bench: data/staging/circuit.bench
+    -> Running ai_podem...
+  Error processing fault 594 attempt 0: list index out of range
+Processing c5315.bench...
+[INFO] Parse Bench: data/staging/circuit.bench
+    -> Running ai_podem...
+    -> Finished ai_podem (success=False).
+Processing c6288.bench...
+[INFO] Parse Bench: data/staging/circuit.bench
+    -> Running ai_podem...
+    -> Finished ai_podem (success=False).
+Processing c7552.bench...
+[INFO] Parse Bench: data/staging/circuit.bench
+    -> Running ai_podem...
+    -> Finished ai_podem (success=False).
+Processing c880.bench...
+[INFO] Parse Bench: data/staging/circuit.bench
+    -> Running ai_podem...
+  Error processing fault 851 attempt 0: list index out of range
+Collection complete. 11 episodes, 0 successful.
+

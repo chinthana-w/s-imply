@@ -138,6 +138,7 @@ def podem(
     total_gates: int,
     backtrace_func: Optional[Callable] = None,
     timeout: float = float("inf"),
+    max_backtracks: int = 100000,
 ) -> bool:
     """Entry point for PODEM algorithm."""
     global \
@@ -152,10 +153,12 @@ def podem(
         backtrace_function, \
         podem_start_time, \
         podem_timeout, \
+        podem_max_backtracks, \
         topological_order
 
     podem_start_time = time.time()
     podem_timeout = timeout
+    podem_max_backtracks = max_backtracks
 
     # Reset per-run statistics (backtrack counts, etc.)
     reset_statistics()
@@ -224,13 +227,14 @@ def podem_recursion(circuit: List[Gate], total_gates: int, fault: Fault) -> int:
         backtrack_count, \
         podem_start_time, \
         podem_timeout, \
+        podem_max_backtracks, \
         topological_order, \
         backtrace_function
     depth += 1
     total_recursive_calls += 1
 
     # Backtrack limit to prevent hanging
-    if backtrack_count > 100000:
+    if backtrack_count > podem_max_backtracks:
         return BACKTRACK_LIMIT
 
     # Wall-clock timeout
@@ -256,6 +260,7 @@ def podem_recursion(circuit: List[Gate], total_gates: int, fault: Fault) -> int:
         # Try desired value
         circuit[pi_id].val = desired_val
         logic_sim.logic_sim(circuit, total_gates, fault, topo_order=topological_order)
+
         res = podem_recursion(circuit, total_gates, fault)
         if res == SUCCESS:
             return SUCCESS
@@ -265,6 +270,7 @@ def podem_recursion(circuit: List[Gate], total_gates: int, fault: Fault) -> int:
         # Backtrack: try flipped value
         circuit[pi_id].val = 1 - desired_val
         logic_sim.logic_sim(circuit, total_gates, fault, topo_order=topological_order)
+
         res = podem_recursion(circuit, total_gates, fault)
         if res == SUCCESS:
             return SUCCESS
@@ -401,8 +407,8 @@ def get_all_faults(circuit: List[Gate], total_gates: int) -> List[Fault]:
     # Skip index 0 (if used as placeholder)
     for i in range(1, total_gates + 1):
         if circuit[i] and circuit[i].type != 0:
-            faults.append(Fault(i, LogicValue.ZERO))
-            faults.append(Fault(i, LogicValue.ONE))
+            faults.append(Fault(i, LogicValue.D))
+            faults.append(Fault(i, LogicValue.DB))
     return faults
 
 

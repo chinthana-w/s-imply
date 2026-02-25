@@ -3,13 +3,14 @@ import os
 import random
 import resource
 import sys
+from typing import List
 
 import torch
 from tqdm import tqdm
 
 from src.atpg.ai_podem import ModelPairPredictor, ai_podem
 from src.atpg.logic_sim_three import reset_gates
-from src.atpg.podem import get_all_faults
+from src.atpg.podem import get_all_faults, get_statistics, reset_statistics
 from src.atpg.recursive_reconv_solver import HierarchicalReconvSolver
 from src.ml.rl.rl_recorder import ExperienceRecorder
 from src.util.io import parse_bench_file
@@ -17,38 +18,39 @@ from src.util.io import parse_bench_file
 # Increase recursion limit and stack size for deep circuit solving
 sys.setrecursionlimit(100000)
 try:
-    # Increase stack size to 256MB
     resource.setrlimit(resource.RLIMIT_STACK, (256 * 1024 * 1024, resource.RLIM_INFINITY))
 except Exception:
-    pass  # May fail on some systems
+    pass
 
 
 def collect_experience(
-    bench_dir: str = "data/bench/ISCAS85",
-    model_path: str = "checkpoints/reconv_minimal_model.pt",
+    bench_dirs: List[str] = ["data/bench/ISCAS85"],
+    model_path: str = "checkpoints/unlinked_candidate/best_model.pth",
     output_dir: str = "data/rl_experience",
     max_faults_per_circuit: int = 50,
+    exploration_attempts: int = 10,
     gpu_id: int = 0,
 ):
     """
-    Run AI-PODEM on benchmarks to collect RL experience.
+    Run AI-PODEM on benchmarks to collect RL experience, emphasizing
+    exploration using random seeds for assignments.
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Benchmarks to process
     benchmarks = []
-    print(f"Checking bench_dir: {bench_dir}")
-    if os.path.exists(bench_dir):
-        # Walk to find .bench files or just list
-        if os.path.isdir(bench_dir):
-            benchmarks = [f for f in os.listdir(bench_dir) if f.endswith(".bench")]
-            benchmarks.sort()
-            print(f"Found {len(benchmarks)} benchmarks: {benchmarks[:5]}...")
+    for bench_dir in bench_dirs:
+        print(f"Checking bench_dir: {bench_dir}")
+        if os.path.exists(bench_dir) and os.path.isdir(bench_dir):
+            files = [(bench_dir, f) for f in os.listdir(bench_dir) if f.endswith(".bench")]
+            benchmarks.extend(files)
         else:
-            print(f"{bench_dir} is not a directory.")
-    else:
-        print(f"Benchmark directory {bench_dir} not found.")
+            print(f"Benchmark directory {bench_dir} not found.")
+
+    if not benchmarks:
+        print("No benchmarks found.")
         return
+
+    benchmarks.sort(key=lambda x: x[1])
 
     recorder = ExperienceRecorder(save_dir=output_dir)
 
@@ -56,31 +58,26 @@ def collect_experience(
     total_episodes = 0
     total_success = 0
 
-    for bench_file in benchmarks:
-        print(f"Processing {bench_file}...")
+    device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+
+    for bench_dir, bench_file in benchmarks:
+        print(f"Processing {bench_file} (from {bench_dir})...")
         circuit_path = os.path.join(bench_dir, bench_file)
 
         try:
             circuit, total_gates = parse_bench_file(circuit_path)
-            print(f"  Parsed {len(circuit)} gates.")
         except Exception as e:
             print(f"Failed to parse {bench_file}: {e}")
             continue
 
         faults = get_all_faults(circuit, total_gates)
-        print(f"  Found {len(faults)} faults.")
         if not faults:
-            print(f"No faults found in {bench_file}")
             continue
 
-        # Shuffle and limit faults
+        # Shuffle and select faults uniformly
         random.shuffle(faults)
         selected_faults = faults[:max_faults_per_circuit]
-        print(f"  Selected {len(selected_faults)} faults for processing.")
 
-        # Load Predictor & Solver once per circuit
-        # (Model loaded onto GPU/CPU inside predictor)
-        device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
         try:
             from src.atpg.ai_podem import AiPodemConfig
 
@@ -96,49 +93,74 @@ def collect_experience(
             print(f"Failed to load predictor for {bench_file}: {e}")
             continue
 
-        # Create solver with recorder
-        solver = HierarchicalReconvSolver(circuit, predictor, recorder=recorder)
-
         pbar = tqdm(selected_faults, desc=f"Faults ({bench_file})")
         for fault in pbar:
-            try:
-                # Reset circuit state before each fault
-                reset_gates(circuit, total_gates)
+            # For each fault, attempt aggressive exploration across multiple seeds
+            # Each seed is treated as an RL episode
+            for attempt in range(exploration_attempts):
+                seed = random.randint(0, 10000)
 
-                # Start Episode
-                recorder.start_episode(f"{bench_file}_{fault.gate_id}_{fault.value}")
+                try:
+                    # Fresh start for the attempt
+                    reset_gates(circuit, total_gates)
+                    reset_statistics()
 
-                # Run AI-PODEM
-                success = ai_podem(
-                    circuit=circuit,
-                    fault=fault,
-                    total_gates=total_gates,
-                    circuit_path=circuit_path,
-                    predictor=predictor,
-                    solver=solver,
-                    enable_ai_activation=True,
-                    enable_ai_propagation=True,
-                    verbose=False,
-                )
+                    # Note: We create a fresh solver per episode so it doesn't hold old caches
+                    solver = HierarchicalReconvSolver(circuit, predictor, recorder=recorder)
 
-                # End Episode
-                final_reward = 10.0 if success else -5.0
-                recorder.finish_episode(final_reward=final_reward)
+                    # Start Episode
+                    episode_id = f"{bench_file}_{fault.gate_id}_{fault.value}_s{seed}"
+                    recorder.start_episode(episode_id)
 
-                total_episodes += 1
-                if success:
-                    total_success += 1
+                    # Note: Need ai_podem to accept seed and pass it to solver.
+                    # As a temporary workaround if it doesn't, solver takes seed directly
+                    # in its API.
+                    # We will rely on ai_podem's internal try loop but cap it to 1 attempt to force
+                    # the exploration loop here to record episodes independently.
 
-            except Exception as e:
-                print(f"  Error processing fault {fault.gate_id}: {e}")
-                recorder.finish_episode(final_reward=-5.0)  # Mark as failure
-                total_episodes += 1
+                    # For data gathering, we only use AI paths (no clean fallback if we want
+                    # purely AI data)
+                    print(f"    -> Running ai_podem...", flush=True)
+                    success = ai_podem(
+                        circuit=circuit,
+                        fault=fault,
+                        total_gates=total_gates,
+                        circuit_path=circuit_path,
+                        predictor=predictor,
+                        solver=solver,
+                        enable_ai_activation=True,
+                        enable_ai_propagation=True,
+                        verbose=False,
+                        seed=seed,
+                    )
+                    print(f"    -> Finished ai_podem (success={success}).", flush=True)
 
-            # Periodic save
-            if total_episodes % 10 == 0:
-                recorder.save_buffer()
+                    stats = get_statistics()
+                    bt_count = stats.get("backtrack_count", 0)
 
-            pbar.set_postfix({"succ": total_success, "eps": total_episodes})
+                    # Reward shaping: Base reward + backtracking penalty
+                    # Reward success heavily, penalize timeouts/huge backtracks
+                    if success:
+                        final_reward = 10.0 - (bt_count * 0.001)  # Penalize inefficient success
+                    else:
+                        final_reward = -5.0 - (bt_count * 0.001)
+
+                    recorder.finish_episode(final_reward=final_reward)
+
+                    total_episodes += 1
+                    if success:
+                        total_success += 1
+
+                except Exception as e:
+                    print(f"  Error processing fault {fault.gate_id} attempt {attempt}: {e}")
+                    recorder.finish_episode(final_reward=-10.0)
+                    total_episodes += 1
+
+                # Periodic save
+                if total_episodes % 20 == 0:
+                    recorder.save_buffer()
+
+                pbar.set_postfix({"succ": total_success, "eps": total_episodes})
 
     # Final save
     recorder.save_buffer()
@@ -146,24 +168,29 @@ def collect_experience(
 
 
 if __name__ == "__main__":
-    # Add CLI later if needed
-
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--bench_dir", default="data/bench/ISCAS85", help="Directory with .bench files"
+        "--bench_dirs",
+        nargs="+",
+        default=["data/bench/ISCAS85"],
+        help="Directories with .bench files",
     )
     parser.add_argument(
         "--model",
-        default="checkpoints/reconv_minimal_model.pt",
+        default="checkpoints/unlinked_candidate/best_model.pth",
         help="Path to model checkpoint",
     )
     parser.add_argument("--max_faults", type=int, default=50, help="Max faults per circuit")
+    parser.add_argument(
+        "--exploration", type=int, default=10, help="Random exploration attempts per fault"
+    )
     parser.add_argument("--gpu", type=int, default=0, help="GPU ID to use")
     args = parser.parse_args()
 
     collect_experience(
-        bench_dir=args.bench_dir,
+        bench_dirs=args.bench_dirs,
         model_path=args.model,
         max_faults_per_circuit=args.max_faults,
+        exploration_attempts=args.exploration,
         gpu_id=args.gpu,
     )

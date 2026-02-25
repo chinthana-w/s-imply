@@ -188,9 +188,9 @@ class ModelPairPredictor(ReconvPairPredictor):
         self.circuit_path = circuit_path
         self.circuit = circuit
         self.config = config
-        self.device = torch.device("cpu")
+        self.device = torch.device(config.device)
         if config.verbose:
-            print("[AI-BT] Forcing CPU for inference due to environment CUDA mismatch (sm_120).")
+            print(f"[AI-BT] Using device: {self.device}")
 
         # Load embeddings (SLOW step: ideally cached)
         self.extractor = EmbeddingExtractor()
@@ -542,6 +542,7 @@ def ai_podem(
     predictor: Optional[ModelPairPredictor] = None,
     solver: Optional[HierarchicalReconvSolver] = None,
     verbose: bool = False,
+    seed: Optional[int] = None,
 ) -> bool:
     """
     AI-Assisted PODEM with configurable modes.
@@ -572,76 +573,116 @@ def ai_podem(
                 predictor = ModelPairPredictor(circuit, circuit_path, config)
             solver = HierarchicalReconvSolver(circuit, predictor)
 
-    ai_assignment = None
-
-    # --- Step 1: AI Justification (Activation) ---
+    # --- Step 1 & 2: AI Justification (Activation) + Hybrid PODEM ---
+    result = False
     if enable_ai_activation and solver:
-        # Target: Fault Activation
         # Target: Fault Activation (If s-a-0 or D, we want 1. If s-a-1 or DB, we want 0)
         activation_val = (
             LogicValue.ONE if fault.value in [LogicValue.ZERO, LogicValue.D] else LogicValue.ZERO
         )
-        if verbose:
-            print(
-                "[AI-PODEM] Attempting AI Justification for Fault "
-                f"{fault.gate_id} @ {activation_val}"
-            )
 
-        ai_assignment = solver.solve(fault.gate_id, activation_val)
+        # If seed is provided, we just do ONE attempt with that specific seed
+        # Otherwise, we rotate through multiple attempts (standard hybrid behavior)
+        max_attempts = 1 if seed is not None else 5
+        for attempt in range(max_attempts):
+            current_seed = seed if seed is not None else (42 + attempt)
 
-        if ai_assignment:
             if verbose:
-                print(f"[AI-PODEM] AI found activation assignment ({len(ai_assignment)} gates).")
-            # Apply to PIs
-            pi_cnt = 0
-            for gid, val in ai_assignment.items():
-                if circuit[gid].type == GateType.INPT:
-                    circuit[gid].val = val
-                    pi_cnt += 1
+                print(
+                    f"[AI-PODEM] Attempt {attempt+1}/{max_attempts}: Justifying Gate "
+                    f"{fault.gate_id} @ {activation_val} (Seed: {current_seed})"
+                )
+            ai_assignment = solver.solve(fault.gate_id, activation_val, seed=current_seed)
+            if ai_assignment:
+                if verbose:
+                    print(
+                        f"[AI-PODEM] AI found activation assignment ({len(ai_assignment)} gates)."
+                    )
+                # Reset and apply to PIs
+                reset_gates(circuit, total_gates)
+                pi_cnt = 0
+                for gid, val in ai_assignment.items():
+                    if circuit[gid].type == GateType.INPT:
+                        circuit[gid].val = val
+                        pi_cnt += 1
+                if verbose:
+                    print(f"[AI-PODEM] Applied {pi_cnt} PI assignments.")
+
+                # Run PODEM from this starting state
+                backtracer = None
+                if enable_ai_propagation and solver:
+                    backtracer = AIBacktracer(solver, verbose=verbose)
+
+                result = mogu_podem_wrapper(
+                    circuit,
+                    fault,
+                    total_gates,
+                    backtrace_func=backtracer,
+                    max_backtracks=5000,
+                )
+                if result:
+                    if verbose:
+                        print(f"[AI-PODEM] Success on attempt {attempt+1}!")
+                        print("Test Pattern:", print_pi(circuit, total_gates))
+                    return True
+                else:
+                    if verbose:
+                        print(f"[AI-PODEM] PODEM failed (or hit limit) on attempt {attempt+1}.")
+            else:
+                if verbose:
+                    print(f"[AI-PODEM] AI Solver failed to find assignment on attempt {attempt+1}.")
+
+        if not result and verbose:
+            print("[AI-PODEM] All AI activation attempts failed.")
+
+    else:
+        # No AI activation pre-fill, just run PODEM (maybe with AI propagation)
+        backtracer = None
+        if enable_ai_propagation and solver:
+            backtracer = AIBacktracer(solver, verbose=verbose)
+        result = mogu_podem_wrapper(
+            circuit,
+            fault,
+            total_gates,
+            backtrace_func=backtracer,
+            max_backtracks=100000,
+        )
+        if result:
             if verbose:
-                print(f"[AI-PODEM] Applied {pi_cnt} PI assignments.")
-        else:
-            if verbose:
-                print("[AI-PODEM] AI Activation failed. Continuing clean.")
-            reset_gates(circuit, total_gates)
+                print("[AI-PODEM] Success (No Activation pre-fill)!")
+                print("Test Pattern:", print_pi(circuit, total_gates))
+            return True
 
-    # --- Step 2: Standard/Hybrid PODEM ---
-    if verbose:
-        print(f"[AI-PODEM] Starting PODEM (AI Prop={enable_ai_propagation})...")
-
-    backtracer = None
-    if enable_ai_propagation and solver:
-        backtracer = AIBacktracer(solver, verbose=verbose)
-
-    result = mogu_podem_wrapper(circuit, fault, total_gates, backtrace_func=backtracer)
-
-    if result:
-        if verbose:
-            print("[AI-PODEM] Success!")
-            print("Test Pattern:", print_pi(circuit, total_gates))
-        return True
-
-    # --- Step 3: Fallback ---
+    # --- Step 3: Global Fallback ---
     # If we used AI Activation and failed, retry Clean
-    if enable_ai_activation and ai_assignment and not result:
+    if enable_ai_activation and not result:
         if verbose:
-            print("[AI-PODEM] AI-Activated run failed. Retrying CLEAN (Standard PODEM)...")
+            print("[AI-PODEM] AI-assisted attempts failed. Retrying CLEAN (Standard PODEM)...")
         reset_gates(circuit, total_gates)
 
-        result_retry = mogu_podem_wrapper(circuit, fault, total_gates, backtrace_func=None)
+        result_retry = mogu_podem_wrapper(
+            circuit, fault, total_gates, backtrace_func=None, max_backtracks=100000
+        )
         if result_retry:
             if verbose:
                 print("[AI-PODEM] Clean retry Success!")
                 print("Test Pattern:", print_pi(circuit, total_gates))
             return True
 
-    print("[AI-PODEM] Failure.")
+    if verbose:
+        print("[AI-PODEM] Failure.")
     return False
 
 
-def mogu_podem_wrapper(circuit, fault, total_gates, backtrace_func=None):
+def mogu_podem_wrapper(circuit, fault, total_gates, backtrace_func=None, max_backtracks=100000):
     # Wrapper to call the global `podem` function from src.atpg.podem
-    return podem(circuit, fault, total_gates, backtrace_func=backtrace_func)
+    return podem(
+        circuit,
+        fault,
+        total_gates,
+        backtrace_func=backtrace_func,
+        max_backtracks=max_backtracks,
+    )
 
 
 if __name__ == "__main__":

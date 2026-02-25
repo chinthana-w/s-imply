@@ -17,6 +17,12 @@ def main():
     parser.add_argument("circuit", type=str, help="Path to circuit .bench file")
     parser.add_argument("fault", type=str, help="Fault string (e.g. '1-0' for gate 1 stuck-at-0)")
     parser.add_argument("--model", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to use for inference (cuda/cpu)",
+    )
     args = parser.parse_args()
 
     print(f"Loading circuit: {args.circuit}")
@@ -37,7 +43,7 @@ def main():
     print("Loading Model...")
     config = AiPodemConfig(
         model_path=args.model,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device=args.device,
         enable_ai_activation=True,
         enable_ai_propagation=True,
     )
@@ -126,7 +132,8 @@ def main():
                 stem = unsolved_pairs[0].get("start", unsolved_pairs[0].get("stem"))
                 print(
                     f"\n{indent}┌────── [AI-Solve] "
-                    f"Intersecting Path Pair: Stem {stem} -> Terminus {gate} {target_str}{seed_info}"
+                    f"Intersecting Path Pair: Stem {stem} -> Terminus {gate} "
+                    f"{target_str}{seed_info}"
                 )
 
                 # Only show assignments relevant to the pair to avoid noise
@@ -504,8 +511,9 @@ def main():
 
                 if not prop_assignment:
                     print(
-                        f"[AI-Prop Step {prop_step}] ✗ AI Solver could not "
-                        f"justify Gate {prop_objective.gate_id}={prop_objective.value}. Falling back to standard backtrace."
+                        f"[AI-Prop Step {prop_step}] ✗ AI Solver could not justify "
+                        f"Gate {prop_objective.gate_id}={prop_objective.value}. Falling back to "
+                        "standard backtrace."
                     )
                     res_fault = original_simple_backtrace(prop_objective, circuit)
                     pi, val = res_fault.gate_id, res_fault.value
@@ -513,7 +521,8 @@ def main():
                         new_pi_assignments = {pi: val}
                     else:
                         print(
-                            f"[AI-Prop Step {prop_step}] ✗ Standard fallback also failed or yielded no new PI."
+                            f"[AI-Prop Step {prop_step}] ✗ Standard fallback also failed or "
+                            "yielded no new PI."
                         )
                         break
                 else:
