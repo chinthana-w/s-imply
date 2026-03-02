@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import abc
 import collections
+import os
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.atpg.reconv_podem import PathConsistencySolver
@@ -55,11 +56,13 @@ class HierarchicalReconvSolver:
         predictor: ReconvPairPredictor,
         recorder=None,
         verbose: bool = False,
+        circuit_path: str = None,
     ):
         self.circuit = circuit
         self.predictor = predictor
         self.recorder = recorder
         self.verbose = verbose
+        self.circuit_path = circuit_path
         self.nodes_visited_limit = 1000
         self.nodes_visited = 0
         self.inference_limit = 1000
@@ -69,7 +72,28 @@ class HierarchicalReconvSolver:
 
         # Populate fanout lists from fanin (if not already present)
         self._populate_fanouts()
-        self.pair_cache = {}  # Cache reconv pairs per root node
+
+        # Try loading pair cache from disk (avoids expensive BFS on second run)
+        self._pair_cache_dirty = False
+        if circuit_path:
+            from src.atpg.reconv_cache import load_pair_cache
+
+            cached = load_pair_cache(circuit_path)
+            if cached is not None:
+                self.pair_cache = cached
+                print(f"[INFO] Loaded reconvergent pair cache for {os.path.basename(circuit_path)}")
+            else:
+                self.pair_cache = {}
+        else:
+            self.pair_cache = {}  # Cache reconv pairs per root node
+
+    def _persist_pair_cache_if_needed(self):
+        """Persist pair cache to disk if it was updated during this run."""
+        if self._pair_cache_dirty and self.circuit_path:
+            from src.atpg.reconv_cache import persist_pair_cache
+
+            persist_pair_cache(self.circuit_path, self.pair_cache)
+            self._pair_cache_dirty = False
 
     def solve(
         self,
@@ -88,8 +112,12 @@ class HierarchicalReconvSolver:
             )
 
         # 1. & 2. Find relevant pairs (use cache to avoid redundant BFS)
+        if len(self.pair_cache) > 200:
+            self.pair_cache.clear()
+
         if target_node not in self.pair_cache:
             self.pair_cache[target_node] = self._collect_and_sort_pairs(target_node)
+            self._pair_cache_dirty = True  # Mark for disk persistence
         pairs_by_reconv = self.pair_cache[target_node]
 
         if self.verbose:
@@ -156,20 +184,22 @@ class HierarchicalReconvSolver:
 
         return pairs_by_reconv
 
-    def _get_transitive_fanin(self, root: int) -> Set[int]:
-        """BFS backwards to find all nodes feeding root."""
+    def _get_transitive_fanin(self, root: int, max_depth: int = 20) -> Set[int]:
+        """BFS backwards to find all nodes feeding root up to max_depth."""
         seen = set()
-        queue = collections.deque([root])
+        queue = collections.deque([(root, 0)])
         seen.add(root)
         while queue:
-            curr = queue.popleft()
+            curr, depth = queue.popleft()
+            if depth >= max_depth:
+                continue
             gate = self.circuit[curr]
             if gate is None:
                 continue
             for fin in gate.fin:
                 if fin not in seen:
                     seen.add(fin)
-                    queue.append(fin)
+                    queue.append((fin, depth + 1))
         return seen
 
     def _populate_fanouts(self):
@@ -260,6 +290,16 @@ class HierarchicalReconvSolver:
     ) -> Optional[Dict[int, LogicValue]]:
         """Queue-based backward justification with just-in-time AI predictor."""
         self.nodes_visited += 1
+
+        # Periodic RAM check (every 50 nodes visited)
+        if self.nodes_visited % 50 == 0:
+            import psutil
+
+            if psutil.virtual_memory().percent > 95:
+                if self.verbose:
+                    print("[Solver] Critical RAM usage. Bailing out.")
+                return None
+
         if self.nodes_visited >= self.nodes_visited_limit:
             return None
 

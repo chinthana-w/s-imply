@@ -1,12 +1,15 @@
-import argparse
+import gc
 import os
 import random
 import resource
 import sys
 from typing import List
 
+import psutil
 import torch
 from tqdm import tqdm
+
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from src.atpg.ai_podem import ModelPairPredictor, ai_podem
 from src.atpg.logic_sim_three import reset_gates
@@ -28,7 +31,7 @@ def collect_experience(
     model_path: str = "checkpoints/unlinked_candidate/best_model.pth",
     output_dir: str = "data/rl_experience",
     max_faults_per_circuit: int = 50,
-    exploration_attempts: int = 10,
+    exploration_attempts: int = 5,
     gpu_id: int = 0,
 ):
     """
@@ -38,18 +41,22 @@ def collect_experience(
     os.makedirs(output_dir, exist_ok=True)
 
     benchmarks = []
-    for bench_dir in bench_dirs:
-        print(f"Checking bench_dir: {bench_dir}")
-        if os.path.exists(bench_dir) and os.path.isdir(bench_dir):
-            files = [(bench_dir, f) for f in os.listdir(bench_dir) if f.endswith(".bench")]
-            benchmarks.extend(files)
+    for bench_path in bench_dirs:
+        print(f"Checking path: {bench_path}")
+        if os.path.exists(bench_path):
+            if os.path.isdir(bench_path):
+                files = [(bench_path, f) for f in os.listdir(bench_path) if f.endswith(".bench")]
+                benchmarks.extend(files)
+            elif os.path.isfile(bench_path) and bench_path.endswith(".bench"):
+                benchmarks.append((os.path.dirname(bench_path), os.path.basename(bench_path)))
         else:
-            print(f"Benchmark directory {bench_dir} not found.")
+            print(f"Benchmark path {bench_path} not found.")
 
     if not benchmarks:
         print("No benchmarks found.")
         return
 
+    # Sort for consistent, reproducible ordering across runs
     benchmarks.sort(key=lambda x: x[1])
 
     recorder = ExperienceRecorder(save_dir=output_dir)
@@ -59,6 +66,36 @@ def collect_experience(
     total_success = 0
 
     device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+
+    # Load the model once and share across all benchmarks to avoid redundant
+    # torch.load + GPU transfers for every circuit.
+    print(f"[INFO] Pre-loading MultiPathTransformer from {model_path} (shared across benchmarks)")
+    try:
+        from src.ml.core.model import MultiPathTransformer
+
+        _model = MultiPathTransformer(
+            input_dim=132,
+            model_dim=512,
+            nhead=4,
+            num_encoder_layers=3,
+            num_interaction_layers=3,
+            dim_feedforward=512,
+        ).to(device)
+        if os.path.exists(model_path):
+            _ckpt = torch.load(model_path, map_location=device)
+            if "model_state_dict" in _ckpt:
+                _model.load_state_dict(_ckpt["model_state_dict"])
+            elif "state_dict" in _ckpt:
+                _model.load_state_dict(_ckpt["state_dict"])
+            else:
+                _model.load_state_dict(_ckpt)
+        _model.eval()
+        shared_model = _model
+        del _ckpt
+        gc.collect()
+    except Exception as e:
+        print(f"[Warning] Could not pre-load shared model: {e}. Will load per benchmark.")
+        shared_model = None
 
     for bench_dir, bench_file in benchmarks:
         print(f"Processing {bench_file} (from {bench_dir})...")
@@ -88,10 +125,18 @@ def collect_experience(
                 enable_ai_propagation=True,
                 verbose=False,
             )
-            predictor = ModelPairPredictor(circuit, circuit_path, cfg)
+            # Pass shared model to avoid redundant loading
+            predictor = ModelPairPredictor(
+                circuit, circuit_path, cfg, pre_loaded_model=shared_model
+            )
         except Exception as e:
             print(f"Failed to load predictor for {bench_file}: {e}")
             continue
+
+        # Create solver once per benchmark, passing circuit_path for disk-backed pair cache
+        solver = HierarchicalReconvSolver(
+            circuit, predictor, recorder=recorder, circuit_path=circuit_path
+        )
 
         pbar = tqdm(selected_faults, desc=f"Faults ({bench_file})")
         for fault in pbar:
@@ -105,9 +150,6 @@ def collect_experience(
                     reset_gates(circuit, total_gates)
                     reset_statistics()
 
-                    # Note: We create a fresh solver per episode so it doesn't hold old caches
-                    solver = HierarchicalReconvSolver(circuit, predictor, recorder=recorder)
-
                     # Start Episode
                     episode_id = f"{bench_file}_{fault.gate_id}_{fault.value}_s{seed}"
                     recorder.start_episode(episode_id)
@@ -120,7 +162,7 @@ def collect_experience(
 
                     # For data gathering, we only use AI paths (no clean fallback if we want
                     # purely AI data)
-                    print(f"    -> Running ai_podem...", flush=True)
+                    print("    -> Running ai_podem...", flush=True)
                     success = ai_podem(
                         circuit=circuit,
                         fault=fault,
@@ -156,11 +198,48 @@ def collect_experience(
                     recorder.finish_episode(final_reward=-10.0)
                     total_episodes += 1
 
-                # Periodic save
-                if total_episodes % 20 == 0:
+                # Periodic save or RAM-triggered save
+                ram_percent = psutil.virtual_memory().percent
+                if total_episodes % 10 == 0 or ram_percent > 85:
+                    if ram_percent > 80:
+                        print(
+                            f"\n[Warning] High RAM usage ({ram_percent}%). "
+                            "Forcing buffer save and cleanup..."
+                        )
                     recorder.save_buffer()
+                    # Intensive cleanup
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
-                pbar.set_postfix({"succ": total_success, "eps": total_episodes})
+                pbar.set_postfix(
+                    {"succ": total_success, "eps": total_episodes, "ram": f"{ram_percent}%"}
+                )
+
+                # Stop this circuit early if RAM is dangerously high
+                if ram_percent > 92:
+                    print(f"\n[Critical] RAM at {ram_percent}%. Stopping {bench_file} early.")
+                    break
+
+        # Explicitly clear predictor cache and predictor itself to free memory
+        if "predictor" in locals():
+            if hasattr(predictor, "prediction_cache"):
+                predictor.prediction_cache.clear()
+            del predictor
+
+        if "solver" in locals():
+            if hasattr(solver, "_persist_pair_cache_if_needed"):
+                solver._persist_pair_cache_if_needed()  # Save pair topology to disk
+            if hasattr(solver, "pair_cache"):
+                solver.pair_cache.clear()
+            del solver
+
+        if "circuit" in locals():
+            del circuit
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Final save
     recorder.save_buffer()
@@ -168,7 +247,10 @@ def collect_experience(
 
 
 if __name__ == "__main__":
+    import argparse
+
     parser = argparse.ArgumentParser()
+
     parser.add_argument(
         "--bench_dirs",
         nargs="+",
@@ -182,7 +264,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--max_faults", type=int, default=50, help="Max faults per circuit")
     parser.add_argument(
-        "--exploration", type=int, default=10, help="Random exploration attempts per fault"
+        "--exploration", type=int, default=5, help="Random exploration attempts per fault"
     )
     parser.add_argument("--gpu", type=int, default=0, help="GPU ID to use")
     args = parser.parse_args()

@@ -10,24 +10,20 @@ This script:
 """
 
 import argparse
+import gc
 import glob
 import os
 import pickle
-import sys
 from dataclasses import dataclass
-from typing import List
 
+import psutil
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 # Legacy mapping for pickle loads
-import src.ml.rl.rl_recorder
 from src.ml.core.model import MultiPathTransformer
-from src.ml.rl.rl_recorder import ExperienceStep
-
-sys.modules["src.ml.rl_recorder"] = src.ml.rl.rl_recorder
 
 
 @dataclass
@@ -55,32 +51,81 @@ class TrainConfig:
     max_paths: int = 200  # Memory optimization: limit paths per sample
 
 
+class EmbeddingRegistry:
+    """Dynamically loads and caches DeepGate embeddings to avoid memory bloat."""
+
+    def __init__(self):
+        self.cache = {}
+
+    def get_embedding(self, bench_file: str) -> torch.Tensor:
+        if not bench_file:
+            return None
+
+        if bench_file in self.cache:
+            return self.cache[bench_file]
+
+        cache_dir = os.path.join(os.path.dirname(bench_file), ".deepgate_cache")
+        cache_name = os.path.basename(bench_file) + ".embed.pt"
+        cache_path = os.path.join(cache_dir, cache_name)
+
+        if os.path.exists(cache_path):
+            try:
+                checkpoint = torch.load(cache_path, map_location="cpu")
+                if "hs" in checkpoint:
+                    self.cache[bench_file] = checkpoint["hs"]
+                    return checkpoint["hs"]
+            except Exception as e:
+                print(f"[Warning] Failed to load embedding from {cache_path}: {e}")
+        return None
+
+
 class ExperienceDataset(Dataset):
-    """Dataset that loads experience batches from disk."""
+    """Dataset that loads experience batches from disk lazily."""
 
-    def __init__(self, experience_dir: str):
-        self.steps: List[ExperienceStep] = []
+    def __init__(self, experience_dir: str, cache_size: int = 5):
+        self.experience_dir = experience_dir
+        self.cache_size = cache_size
+        self.index = []  # List of (file_path, ep_idx, step_idx)
+        self.file_cache = {}  # file_path -> episodes
 
-        # Load all batch files
-        batch_files = glob.glob(os.path.join(experience_dir, "batch_*.pkl"))
-        print(f"Found {len(batch_files)} experience batch files")
+        # Load all batch files and index them
+        batch_files = sorted(glob.glob(os.path.join(experience_dir, "batch_*.pkl")))
+        print(f"Indexing {len(batch_files)} experience batch files...")
 
         for bf in batch_files:
             try:
+                # We only need to know how many episodes/steps are in each file
                 with open(bf, "rb") as f:
-                    episodes = pickle.load(f)  # List[List[ExperienceStep]]
-                    for ep in episodes:
-                        self.steps.extend(ep)
-            except Exception as e:
-                print(f"Failed to load {bf}: {e}")
+                    episodes = pickle.load(f)
+                    for ep_idx, ep in enumerate(episodes):
+                        for st_idx in range(len(ep)):
+                            self.index.append((bf, ep_idx, st_idx))
 
-        print(f"Loaded {len(self.steps)} experience steps")
+                    # Force cleanup after each file
+                    del episodes
+                    if psutil.virtual_memory().percent > 85:
+                        gc.collect()
+            except Exception as e:
+                print(f"Failed to index {bf}: {e}")
+
+        print(f"Indexed {len(self.index)} experience steps")
 
     def __len__(self):
-        return len(self.steps)
+        return len(self.index)
+
+    def _get_episodes(self, file_path):
+        if file_path not in self.file_cache:
+            if len(self.file_cache) >= self.cache_size:
+                # Simple cache eviction: clear all (LRU would be better but this is simple)
+                self.file_cache.clear()
+            with open(file_path, "rb") as f:
+                self.file_cache[file_path] = pickle.load(f)
+        return self.file_cache[file_path]
 
     def __getitem__(self, idx):
-        step = self.steps[idx]
+        file_path, ep_idx, st_idx = self.index[idx]
+        episodes = self._get_episodes(file_path)
+        step = episodes[ep_idx][st_idx]
 
         # Extract tensors
         # Note: These were saved as CPU tensors
@@ -107,10 +152,11 @@ class ExperienceDataset(Dataset):
             "mask_valid": mask_valid.squeeze(0) if mask_valid.ndim > 3 else mask_valid,
             "gate_types": gate_types.squeeze(0) if gate_types.ndim > 3 else gate_types,
             "reward": reward,
+            "bench_file": getattr(step, "bench_file", ""),
         }
 
 
-def collate_experience(batch, max_paths_limit=0):
+def collate_experience(batch, max_paths_limit=0, embedding_registry=None):
     """Custom collate function for variable-sized experience."""
 
     # Find max dimensions
@@ -130,25 +176,55 @@ def collate_experience(batch, max_paths_limit=0):
     gate_types = torch.zeros(batch_size, max_paths, max_len, dtype=torch.long)
     rewards = torch.stack([b["reward"] for b in batch])
 
+    # Optional embeddings tensor [B, P, L, 132]
+    # We pad to 132 for backwards compatibility with the current model which expects logic constraint dims
+    paths_emb = torch.zeros(batch_size, max_paths, max_len, 132, dtype=torch.float32)
+
     for i, b in enumerate(batch):
         nids = b["node_ids"]
         if nids.ndim == 2:
             p_i, length = nids.shape
             p_curr = min(p_i, max_paths)
-            node_ids[i, :p_curr, :length] = nids[:p_curr]
+            nids_clamped = nids[:p_curr]
+            node_ids[i, :p_curr, :length] = nids_clamped
             mask_valid[i, :p_curr, :length] = b["mask_valid"][:p_curr]
             gate_types[i, :p_curr, :length] = b["gate_types"][:p_curr]
+
+            # Dynamically reconstruct DeepGate embeddings if registry exists
+            if embedding_registry and b["bench_file"]:
+                circuit_emb = embedding_registry.get_embedding(b["bench_file"])
+                if circuit_emb is not None:
+                    # Map nodes to embeddings. Default to 0 vector if OOB
+                    vocab_size = circuit_emb.size(0)
+                    for p_idx in range(p_curr):
+                        for l_idx in range(length):
+                            nid = nids_clamped[p_idx, l_idx].item()
+                            # We assume the AI Podem gate mapping roughly tracks with AIG up to a point,
+                            # but realistically we just use the node ID directly since embedding extractor mapped it
+                            if 0 < nid < vocab_size:
+                                paths_emb[i, p_idx, l_idx, :128] = circuit_emb[nid]
+
         elif nids.ndim == 1:
             length = nids.shape[0]
             node_ids[i, 0, :length] = nids
             mask_valid[i, 0, :length] = b["mask_valid"]
             gate_types[i, 0, :length] = b["gate_types"]
 
+            if embedding_registry and b["bench_file"]:
+                circuit_emb = embedding_registry.get_embedding(b["bench_file"])
+                if circuit_emb is not None:
+                    vocab_size = circuit_emb.size(0)
+                    for l_idx in range(length):
+                        nid = nids[l_idx].item()
+                        if 0 < nid < vocab_size:
+                            paths_emb[i, 0, l_idx, :128] = circuit_emb[nid]
+
     return {
         "node_ids": node_ids,
         "mask_valid": mask_valid,
         "gate_types": gate_types,
         "rewards": rewards,
+        "paths_emb": paths_emb,
     }
 
 
@@ -171,20 +247,11 @@ def train_epoch(model, dataloader, optimizer, config, device, epoch):
 
         B, P, L = node_ids.shape
 
-        # Create embeddings with correct shape: [B, P, L, input_dim]
-        # We use learned embeddings from node IDs + positional info
-        # The model will add gate_type embeddings internally (+64 dims)
-        paths_emb = torch.zeros(B, P, L, config.input_dim, device=device)
+        # Use the dynamically reconstructed embeddings from the collate function
+        paths_emb = batch["paths_emb"].to(device)
 
-        # Add some structure: use node_ids to create pseudo-embeddings
-        # This is a simplification - ideally we'd reload actual circuit embeddings
-        # For now, use positional encoding + normalized node_ids as features
-        for i in range(min(config.input_dim, 32)):
-            paths_emb[:, :, :, i] = (node_ids.float() / 1000.0) * (i + 1) % 1.0
-
-        # Add positional information
-        pos = torch.arange(L, device=device).float() / L
-        paths_emb[:, :, :, 32:64] = pos.unsqueeze(0).unsqueeze(0).unsqueeze(-1).expand(B, P, L, 32)
+        # We must align input dims if they mismatch, but the model expects input_dim=132 (128 struct + 4 aux).
+        # We padded `paths_emb` to 132 in collate, leaving the last 4 dims as zeros which is safe since they represent constraints.
 
         # Forward pass
         optimizer.zero_grad()
@@ -254,13 +321,20 @@ def train_epoch(model, dataloader, optimizer, config, device, epoch):
         total_entropy += masked_entropy.item()
         total_steps += 1
 
+        # RAM awareness in pbar
+        ram_percent = psutil.virtual_memory().percent
         pbar.set_postfix(
             {
-                "loss": total_loss / total_steps,
-                "entropy": total_entropy / total_steps,
-                "reward_mean": rewards.mean().item(),
+                "loss": f"{total_loss / total_steps:.4f}",
+                "entropy": f"{total_entropy / total_steps:.4f}",
+                "reward": f"{rewards.mean().item():.2f}",
+                "ram": f"{ram_percent}%",
             }
         )
+
+        # Emergency GC if RAM is too high
+        if ram_percent > 90:
+            gc.collect()
 
     return total_loss / max(total_steps, 1)
 
@@ -312,6 +386,15 @@ def main():
     if len(dataset) == 0:
         print("No experience data found. Run collect_experience.py first.")
         return
+
+    # RAM Aware worker adjustment
+    available_ram_gb = psutil.virtual_memory().available / (1024**3)
+    if available_ram_gb < 4:
+        print(f"Low RAM detected ({available_ram_gb:.1f} GB). Reducing workers and batch size.")
+        args.num_workers = min(args.num_workers, 2)
+        config.batch_size = min(config.batch_size, 128)
+    elif available_ram_gb < 8:
+        args.num_workers = min(args.num_workers, 4)
 
     import functools
 

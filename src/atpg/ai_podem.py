@@ -184,7 +184,13 @@ def post_process_logic_gates(
 
 
 class ModelPairPredictor(ReconvPairPredictor):
-    def __init__(self, circuit: List[Gate], circuit_path: str, config: AiPodemConfig):
+    def __init__(
+        self,
+        circuit: List[Gate],
+        circuit_path: str,
+        config: AiPodemConfig,
+        pre_loaded_model=None,
+    ):
         self.circuit_path = circuit_path
         self.circuit = circuit
         self.config = config
@@ -192,17 +198,23 @@ class ModelPairPredictor(ReconvPairPredictor):
         if config.verbose:
             print(f"[AI-BT] Using device: {self.device}")
 
-        # Load embeddings (SLOW step: ideally cached)
+        # Load embeddings — uses disk cache keyed on circuit_path
         self.extractor = EmbeddingExtractor()
-        # DeepGate is strictly required — no dummy fallback.
-        self.struct_emb, _, self.gate_mapping, _ = self.extractor.extract_embeddings(circuit_path)
+        self.struct_emb, _, self.gate_mapping, _ = self.extractor.extract_embeddings(
+            circuit_path,
+            pre_parsed_circuit=circuit,  # Avoids redundant re-parse inside extractor
+        )
         self.struct_emb = self.struct_emb.to(self.device)
         # Map str(id) -> int(aig_id)
         self.gate_mapping = {int(k): int(v) for k, v in self.gate_mapping.items()}
         self.prediction_cache = {}
 
-        # Load Model
-        self.model = self._load_model(config.model_path)
+        # Use pre-loaded model if provided (avoids redundant torch.load per benchmark)
+        if pre_loaded_model is not None:
+            self.model = pre_loaded_model
+        else:
+            self.model = self._load_model(config.model_path)
+
         self.solver = PathConsistencySolver(circuit)
 
     def _load_model(self, model_path: str):
@@ -250,6 +262,10 @@ class ModelPairPredictor(ReconvPairPredictor):
             (nid, val) for nid, val in constraints.items() if nid in path_nodes
         )
         cache_key = (pair_info["start"], pair_info["reconv"], relevant_constraints)
+
+        if len(self.prediction_cache) > 500:
+            self.prediction_cache.clear()
+
         if cache_key in self.prediction_cache:
             return self.prediction_cache[cache_key]
 
@@ -412,6 +428,7 @@ class ModelPairPredictor(ReconvPairPredictor):
             paths,
             predicted_assignment,
             inputs_snapshot,
+            bench_file=self.circuit_path,
         )
         self.prediction_cache[cache_key] = res
         return res
@@ -424,6 +441,7 @@ class ModelPairPredictor(ReconvPairPredictor):
         paths,
         predicted_assignment,
         inputs_snapshot,
+        bench_file="",
     ):
         violations = self._verify_assignment_logic(predicted_assignment, constraints)
 

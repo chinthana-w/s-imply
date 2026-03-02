@@ -10,7 +10,9 @@ import subprocess
 import sys
 from datetime import datetime
 
-import torch
+import psutil
+
+# import torch (Moved inside functions to save memory)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -26,27 +28,63 @@ def run_experience_collection(args):
     """Stage 1: Collect experience data from AI-PODEM runs"""
     print_section("STAGE 1: Experience Collection")
 
+    import torch
+
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    available_ram_gb = psutil.virtual_memory().available / (1024**3)
 
     if num_gpus > 1:
-        print(f"Detected {num_gpus} GPUs. Spawning parallel collection processes...")
+        # Avoid OOM by capping processes if RAM is low
+        # Assume each collection process needs ~5GB (DeepGate + Model + Circuit)
+        ram_capped_gpus = int(available_ram_gb // 5)
+        if ram_capped_gpus < num_gpus:
+            print(
+                f"  [Warning] Low RAM ({available_ram_gb:.1f} GB). "
+                f"Capping collection to {ram_capped_gpus} parallel processes."
+            )
+            num_gpus = max(1, ram_capped_gpus)
+
+        # Gather all benchmarks first
+        all_benchmarks = []
+        for d in args.bench_dirs:
+            if os.path.exists(d):
+                if os.path.isdir(d):
+                    for f in os.listdir(d):
+                        if f.endswith(".bench"):
+                            all_benchmarks.append(os.path.join(d, f))
+                elif os.path.isfile(d) and d.endswith(".bench"):
+                    all_benchmarks.append(d)
+
+        all_benchmarks.sort()
+        if not all_benchmarks:
+            print("❌ No benchmark files found in specified directories.")
+            return False
+
+        print(
+            f"Discovered {len(all_benchmarks)} benchmarks. Distributing across {num_gpus} GPUs..."
+        )
+
         processes = []
         for i in range(num_gpus):
-            # We can split benchmarks or just let them pick random faults
-            # For now, just run on multiple GPUs
+            # Chunking logic
+            chunk = all_benchmarks[i::num_gpus]
+            if not chunk:
+                continue
+
             cmd = [
-                "python",
+                sys.executable,
                 "-m",
                 "scripts.collect_experience",
                 "--max_faults",
                 str(args.max_faults // num_gpus),
-                "--bench_dirs",
             ]
-            cmd.extend(args.bench_dirs)
-            cmd.extend(["--gpu", str(i)])
 
             if args.model:
                 cmd.extend(["--model", args.model])
+
+            cmd.extend(["--gpu", str(i)])
+            cmd.extend(["--exploration", str(args.exploration)])
+            cmd.extend(["--bench_dirs"] + chunk)
 
             print(f"  [GPU {i}] Running: {' '.join(cmd)}")
             p = subprocess.Popen(cmd, cwd=os.path.dirname(os.path.dirname(__file__)))
@@ -186,6 +224,12 @@ Examples:
         nargs="+",
         default=["data/bench/ISCAS85", "data/bench/iscas89"],
         help="Directories with .bench files (default: ISCAS85 and iscas89)",
+    )
+    collect_group.add_argument(
+        "--exploration",
+        type=int,
+        default=5,
+        help="Random exploration attempts per fault (default: 5)",
     )
 
     # Training parameters

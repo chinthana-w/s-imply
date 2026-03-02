@@ -14,6 +14,7 @@ class ExperienceStep:
     mask_valid: Any = None
     gate_types: Any = None
     files: Any = None
+    bench_file: str = ""
 
     # Action data
     # We store the *assignments* chosen by the model
@@ -48,17 +49,26 @@ class ExperienceRecorder:
         self.episode_id = episode_id or str(uuid.uuid4())
         self.current_episode_steps = []
 
-    def log_step(self, node_ids, mask_valid, gate_types, files, pair_info, selected_assignment):
+    def log_step(
+        self, node_ids, mask_valid, gate_types, files, pair_info, selected_assignment, bench_file=""
+    ):
+        # Cap steps per episode to prevent memory bombs (e.g., from excessive backtracking)
+        if len(self.current_episode_steps) >= 5000:
+            return None
+
         # Clone tensors to CPU to save memory on GPU/avoid referencing active graph
         step = ExperienceStep(
-            node_ids=node_ids.cpu().detach() if isinstance(node_ids, torch.Tensor) else node_ids,
-            mask_valid=mask_valid.cpu().detach()
+            node_ids=node_ids.cpu().detach().clone()
+            if isinstance(node_ids, torch.Tensor)
+            else node_ids,
+            mask_valid=mask_valid.cpu().detach().clone()
             if isinstance(mask_valid, torch.Tensor)
             else mask_valid,
-            gate_types=gate_types.cpu().detach()
+            gate_types=gate_types.cpu().detach().clone()
             if isinstance(gate_types, torch.Tensor)
             else gate_types,
             files=files,
+            bench_file=bench_file,
             pair_info=pair_info,
             selected_assignment=selected_assignment,
         )
