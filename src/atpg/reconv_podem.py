@@ -43,6 +43,9 @@ import collections
 import os
 import pickle
 import random
+import re
+import shutil
+import signal
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -1452,8 +1455,49 @@ class RecursiveStructureSolver:
 ## Legacy logic-justification utilities removed (paths-only datasets).
 
 
+def _is_sequential(bench_path: str) -> bool:
+    """Return True if the bench file contains sequential elements.
+
+    Three detection strategies are applied, from cheapest to most thorough:
+
+    1. **Name heuristic**: ISCAS89 (``s####.bench``) and ITC99 (``b##.bench``)
+       circuits are always sequential by convention.
+    2. **Text scan**: any gate definition that uses ``DFF`` or ``LATCH`` as a
+       gate type (e.g. ``q = DFF(d)``), covering formats with explicit markers.
+    3. **Parser fallback**: ``parse_bench_file`` maps unknown gate types to
+       ``GateType.INPT``. A gate that is ``INPT`` *and* has fanins was parsed
+       from an unknown type (e.g. ``DFF``). This catches formats where DFF is
+       written in the body without an ``INPUT(...)`` declaration.
+    """
+    basename = os.path.splitext(os.path.basename(bench_path))[0]
+    # ISCAS89: s\d+  |  ITC99: b\d+
+    if re.fullmatch(r"s\d+", basename, re.IGNORECASE) or re.fullmatch(
+        r"b\d+", basename, re.IGNORECASE
+    ):
+        return True
+
+    _SEQ_PATTERN = re.compile(r"=\s*(DFF|LATCH)\s*\(", re.IGNORECASE)
+    with open(bench_path) as f:
+        for line in f:
+            if _SEQ_PATTERN.search(line):
+                return True
+
+    # Parser-level check: INPT-typed gate with fanins → parsed from unknown type
+    try:
+        circuit, _ = parse_bench_file(bench_path)
+        for gate in circuit:
+            if gate is None:
+                continue
+            if gate.type == GateType.INPT and gate.fin and len(gate.fin) > 0:
+                return True
+    except Exception:
+        pass  # If parsing fails we'll catch it in the main loop anyway
+
+    return False
+
+
 def build_dataset(
-    base_path: str,
+    base_path: str | List[str],
 ) -> List[Dict[str, Any]]:
     """Build a dataset of reconvergent path pairs with structural embeddings.
 
@@ -1463,8 +1507,8 @@ def build_dataset(
 
     Parameters
     ----------
-    base_path : str
-        Directory containing .bench files.
+    base_path : str | list[str]
+        One directory (or a list of directories) containing .bench files.
 
     Returns
     -------
@@ -1475,46 +1519,79 @@ def build_dataset(
         - 'struct_emb': torch.Tensor - structural embeddings
         - 'gate_mapping': dict - mapping from original to AIG gate IDs
     """
-    bench_files = [
-        os.path.join(base_path, f) for f in os.listdir(base_path) if f.endswith(".bench")
-    ]
+    dirs = [base_path] if isinstance(base_path, str) else list(base_path)
+    bench_files = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            print(f"[WARNING] Benchmark directory not found, skipping: {d}")
+            continue
+        # Walk recursively so nested layouts (e.g. RCCG/<circuit>/<circuit>.bench)
+        # are discovered automatically.
+        for root, _, files in os.walk(d):
+            bench_files.extend(
+                os.path.join(root, f) for f in files if f.endswith(".bench")
+            )
+
+    _CIRCUIT_TIMEOUT_SECS = 30 * 60  # 30 minutes per circuit
+
+    def _timeout_handler(signum, frame):  # noqa: ARG001
+        raise TimeoutError("Circuit processing exceeded 30-minute limit")
+
+    # Install the SIGALRM handler when called from the main thread; fall back
+    # to no-timeout silently when called from a worker thread.
+    _timeout_supported = False
+    try:
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        _timeout_supported = True
+    except (OSError, ValueError):
+        print("[WARNING] SIGALRM not available — per-circuit timeout disabled")
 
     dataset: List[Dict[str, Any]] = []
     extractor = EmbeddingExtractor()
 
-    for bench_file in bench_files:
-        print(f"Processing {bench_file}...")
-        circuit, _ = parse_bench_file(bench_file)
+    try:
+        for bench_file in bench_files:
+            if _is_sequential(bench_file):
+                print(f"  [SKIP] Sequential circuit detected: {bench_file}")
+                continue
+            print(f"Processing {bench_file}...")
+            if _timeout_supported:
+                signal.alarm(_CIRCUIT_TIMEOUT_SECS)
+            try:
+                circuit, _ = parse_bench_file(bench_file)
 
-        # Extract embeddings for this circuit
-        try:
-            struct_emb, func_emb, gate_mapping, original_circuit = extractor.extract_embeddings(
-                bench_file
-            )
-            print(f"  Extracted embeddings: struct_emb shape {struct_emb.shape}")
-        except Exception as e:
-            print(f"  [WARNING] Failed to extract embeddings: {e}")
-            print(f"  Skipping {bench_file}")
-            continue
+                # Extract embeddings for this circuit
+                struct_emb, func_emb, gate_mapping, _ = extractor.extract_embeddings(
+                    bench_file
+                )
+                print(f"  Extracted embeddings: struct_emb shape {struct_emb.shape}")
 
-        # Enumerate all reconvergent pairs (subject to beam/depth constraints)
-        infos: List[Dict[str, Any]] = find_all_reconv_pairs(circuit, beam_width=16, max_depth=25)
-        print(f"  Found {len(infos)} reconvergent path pairs")
+                # Enumerate all reconvergent pairs (subject to beam/depth constraints)
+                infos: List[Dict[str, Any]] = find_all_reconv_pairs(
+                    circuit, beam_width=16, max_depth=25
+                )
+                print(f"  Found {len(infos)} reconvergent path pairs")
 
-        # Add each reconvergent pair as a separate dataset entry
-        for info in infos:
-            entry = {
-                "file": bench_file,
-                "info": info,
-                "struct_emb": struct_emb,
-                "gate_mapping": gate_mapping,
-            }
-            dataset.append(entry)
-
-            # The following f-string was a standalone expression and not used.
-            # It is removed as part of breaking long lines/cleaning up
-            # unused expressions.
-        # The closing parenthesis for the f-string was also removed.
+                # Add each reconvergent pair as a separate dataset entry
+                for info in infos:
+                    dataset.append(
+                        {
+                            "file": bench_file,
+                            "info": info,
+                            "struct_emb": struct_emb,
+                            "gate_mapping": gate_mapping,
+                        }
+                    )
+            except TimeoutError:
+                print(f"  [WARNING] Timeout after 30 minutes — skipping {bench_file}")
+            except Exception as e:
+                print(f"  [WARNING] Failed to process {bench_file}: {e}")
+                print(f"  Skipping {bench_file}")
+            finally:
+                if _timeout_supported:
+                    signal.alarm(0)  # cancel any pending alarm
+    finally:
+        extractor.cleanup()
 
     return dataset
 
@@ -1555,16 +1632,51 @@ def load_dataset(dataset_path):
 
 
 if __name__ == "__main__":
-    # Simple test if run directly
-    # We need a dummy circuit or file to test.
-    # For now, just print usage or run on default if exists.
-    input_dir = "data/bench/ISCAS85/"
-    output_path = "data/datasets/reconv_dataset.pkl"
+    import argparse
 
-    if os.path.exists(input_dir):
-        dataset = build_dataset(
-            base_path=input_dir,
-        )
-        save_dataset(dataset, output_path)
+    parser = argparse.ArgumentParser(
+        description="Build reconvergent dataset from one or more benchmark directories"
+    )
+    parser.add_argument(
+        "--bench-dirs",
+        nargs="+",
+        default=[
+            "data/bench/ISCAS85",
+            "data/bench/iscas89",
+            "data/bench/ITC99",
+            "data/bench/RCCG",
+        ],
+        help=(
+            "Directories to search recursively for .bench files "
+            "(default: ISCAS85 + iscas89 + ITC99 + RCCG). "
+            "Sequential circuits (s####, b## naming or explicit DFF/LATCH gates) "
+            "are detected and skipped automatically."
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        default="data/datasets/reconv_dataset_combinational.pkl",
+        help="Output pickle path",
+    )
+    _args = parser.parse_args()
+
+    # Clean up stale staging directories left by previous interrupted runs
+    _data_dir = "data"
+    if os.path.isdir(_data_dir):
+        _cur_pid = os.getpid()
+        for _entry in os.listdir(_data_dir):
+            if _entry.startswith("staging_") and _entry != f"staging_{_cur_pid}":
+                _stale = os.path.join(_data_dir, _entry)
+                try:
+                    shutil.rmtree(_stale)
+                    print(f"[INFO] Removed stale staging dir: {_stale}")
+                except Exception as _e:
+                    print(f"[WARNING] Could not remove stale staging dir {_stale}: {_e}")
+
+    _bench_dirs = [d for d in _args.bench_dirs if os.path.isdir(d)]
+    if not _bench_dirs:
+        print("No valid benchmark directories found. Check --bench-dirs.")
     else:
-        print(f"Input directory {input_dir} not found. Please provide a valid path.")
+        print(f"Building dataset from: {_bench_dirs}")
+        _dataset = build_dataset(_bench_dirs)
+        save_dataset(_dataset, _args.output)

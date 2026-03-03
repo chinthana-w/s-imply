@@ -48,6 +48,124 @@ from src.ml.core.model import MultiPathTransformer
 warnings.filterwarnings("ignore", message="The PyTorch API of nested tensors is in prototype stage")
 
 
+def _curriculum_constraint_prob(epoch: int, total_epochs: int) -> float:
+    """Return stepped constraint probability for curriculum training.
+
+    Phase 1 (first 25% epochs): 0%
+    Phase 2 (remaining 75%): 0% -> 75% in +15% steps
+    """
+    if total_epochs <= 0:
+        return 0.0
+
+    free_epochs = max(1, total_epochs // 4)
+    if epoch <= free_epochs:
+        return 0.0
+
+    ramp_levels = [0.0, 0.15, 0.30, 0.45, 0.60, 0.75]
+    ramp_epochs = max(1, total_epochs - free_epochs)
+    ramp_pos = epoch - free_epochs - 1
+    level_idx = min(len(ramp_levels) - 1, (ramp_pos * len(ramp_levels)) // ramp_epochs)
+    return ramp_levels[level_idx]
+
+
+def _build_training_constraints(
+    node_ids: torch.Tensor,
+    masks: torch.Tensor,
+    epoch: int,
+    total_epochs: int,
+    terminus_vals: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generate curriculum constraints with always-constrained path termini.
+
+    Args:
+        terminus_vals: [B] optional pre-computed terminus targets (e.g. from anchor).
+            If None, random 0/1 is used per sample. Providing circuit-consistent values
+            (from the anchor) avoids conflicts with gate-logic loss and reduces c_viol.
+
+    Returns:
+        constraint_mask: [B, P, L] bool
+        constraint_vals: [B, P, L] long (0 or 1)
+    """
+    device = node_ids.device
+    B, P, L = node_ids.shape
+    valid_nodes = masks & (node_ids > 0)
+
+    c_mask = torch.zeros_like(node_ids, dtype=torch.bool)
+    c_vals = torch.zeros_like(node_ids, dtype=torch.long)
+
+    # Pick one target value per sample and apply it to all valid path termini.
+    # Prefer circuit-consistent values derived from anchor over pure random.
+    if terminus_vals is None:
+        terminus_vals = torch.randint(0, 2, (B,), device=device, dtype=torch.long)
+    for b in range(B):
+        for p in range(P):
+            valid_len = int(masks[b, p].sum().item())
+            if valid_len <= 0:
+                continue
+            l_idx = valid_len - 1
+            if node_ids[b, p, l_idx] <= 0:
+                continue
+            c_mask[b, p, l_idx] = True
+            c_vals[b, p, l_idx] = terminus_vals[b]
+
+    # Additional constraints follow stepped curriculum only on non-terminus nodes.
+    extra_prob = _curriculum_constraint_prob(epoch, total_epochs)
+    if extra_prob > 0.0:
+        extra_candidates = valid_nodes & (~c_mask)
+        sampled = (torch.rand_like(node_ids, dtype=torch.float) < extra_prob) & extra_candidates
+        c_mask = c_mask | sampled
+        random_vals = torch.randint_like(node_ids, 0, 2)
+        c_vals[sampled] = random_vals[sampled]
+
+    return c_mask, c_vals
+
+
+def _shuffle_paths_training_batch(
+    paths: torch.Tensor,
+    masks: torch.Tensor,
+    node_ids: torch.Tensor,
+    gate_types: Optional[torch.Tensor] = None,
+    anchor_p: Optional[torch.Tensor] = None,
+    constraint_mask: Optional[torch.Tensor] = None,
+    constraint_vals: Optional[torch.Tensor] = None,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    """Shuffle path dimension during training while keeping related tensors aligned."""
+    B, P, _, _ = paths.shape
+    perm = torch.argsort(torch.rand(B, P, device=paths.device), dim=1)
+
+    gather_pl = perm.unsqueeze(-1).expand(-1, -1, paths.size(2))
+    gather_pld = gather_pl.unsqueeze(-1).expand(-1, -1, -1, paths.size(3))
+
+    paths = torch.gather(paths, dim=1, index=gather_pld)
+    masks = torch.gather(masks, dim=1, index=gather_pl)
+    node_ids = torch.gather(node_ids, dim=1, index=gather_pl)
+
+    if gate_types is not None:
+        gate_types = torch.gather(gate_types, dim=1, index=gather_pl)
+
+    if constraint_mask is not None:
+        constraint_mask = torch.gather(constraint_mask, dim=1, index=gather_pl)
+
+    if constraint_vals is not None:
+        constraint_vals = torch.gather(constraint_vals, dim=1, index=gather_pl)
+
+    if anchor_p is not None:
+        inverse_perm = torch.argsort(perm, dim=1)
+        valid_anchor = anchor_p >= 0
+        mapped_anchor = inverse_perm.gather(1, anchor_p.clamp(min=0).unsqueeze(1)).squeeze(1)
+        anchor_p = torch.where(valid_anchor, mapped_anchor, anchor_p)
+
+    return paths, masks, node_ids, gate_types, anchor_p, constraint_mask, constraint_vals
+
+
 @dataclass
 class TrainConfig:
     dataset: str
@@ -110,6 +228,10 @@ class TrainConfig:
     shard_cache_size: int = 1
     max_paths: int = 200
     pretrained: Optional[str] = None
+
+    # Constraint loss weight — increase (e.g. 5.0) to force the model to honour
+    # constraints even when they conflict with the soft-edge gate-logic loss.
+    lambda_constraint: float = 1.0
 
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
@@ -232,7 +354,7 @@ def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     optim: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
+    scaler: torch.cuda.amp.GradScaler,
     device: torch.device,
     cfg: TrainConfig,
     epoch: int = 1,
@@ -260,22 +382,12 @@ def train_one_epoch(
             else min(cfg.max_train_batches, target_batches)
         )
 
-    # Curriculum: Phase 1 (0-25%) = Pure Learning (No Constraints)
-    #             Phase 2 (25%-100%) = Linear Ramp (0 -> Max Constraints)
-    constraint_prob = 0.0
-    if cfg.constrained_curriculum and cfg.epochs > 0:
-        free_epochs = cfg.epochs // 4
-        if epoch <= free_epochs:
-            constraint_prob = 0.0
-        else:
-            # Progress within the ramp-up phase (0.0 to 1.0)
-            ramp_epochs = cfg.epochs - free_epochs
-            epoch_in_ramp = epoch - free_epochs
-            ramp_progress = epoch_in_ramp / max(1, ramp_epochs)
-            constraint_prob = cfg.max_constraint_prob * ramp_progress
+    constraint_prob = (
+        _curriculum_constraint_prob(epoch, cfg.epochs) if cfg.constrained_curriculum else 0.0
+    )
 
     if cfg.verbose:
-        free_epochs_disp = cfg.epochs // 4
+        free_epochs_disp = max(1, cfg.epochs // 4)
         print(
             f"[curriculum] epoch={epoch} constraint_prob={constraint_prob:.3f} "
             f"(Phase {'1' if epoch <= free_epochs_disp else '2'})"
@@ -302,6 +414,38 @@ def train_one_epoch(
             else None
         )
 
+        # Resolve gate types before shuffling so all per-path tensors can be shuffled together.
+        if "gate_types" in batch:
+            gtypes = batch["gate_types"].to(device)
+        else:
+            gtypes = resolve_gate_types(node_ids, files, device)
+
+        # Keep anchor path indices aligned if dataset supplied anchors.
+        batch_anchor_p = batch.get("anchor_p", None)
+        if batch_anchor_p is not None:
+            batch_anchor_p = batch_anchor_p.to(device)
+
+        # Shuffle path order during training.
+        (
+            paths,
+            masks,
+            node_ids,
+            gtypes,
+            batch_anchor_p,
+            c_mask,
+            c_vals,
+        ) = _shuffle_paths_training_batch(
+            paths=paths,
+            masks=masks,
+            node_ids=node_ids,
+            gate_types=gtypes,
+            anchor_p=batch_anchor_p,
+            constraint_mask=c_mask,
+            constraint_vals=c_vals,
+        )
+        if gtypes is None:
+            raise RuntimeError("Gate types must be available during training.")
+
         # 1. Initialize Logic Value Vector to "Unknown" [0, 0, 1] ONLY IF dataset didn't do it
         # (inject_constraints=True in dataset already handles this)
         if cfg.add_logic_value and not cfg.inject_constraints:
@@ -312,16 +456,49 @@ def train_one_epoch(
                 paths[..., D_cur - 2] = 0.0
                 paths[..., D_cur - 1] = 1.0
 
-        # 2. Support manual constraint generation if dataset didn't provide them
-        if c_mask is None and not cfg.inject_constraints:
-            c_prob = cfg.max_constraint_prob if cfg.constrained_curriculum else 0.0
+        # 2. Curriculum constraints: phase-1 terminus-only, then stepped ramp constraints.
+        if cfg.constrained_curriculum:
+            # Derive circuit-consistent terminus targets from the batch anchor when
+            # the anchor node sits at the path terminus.  This replaces pure-random
+            # values that conflict with gate-logic ~22% of the time and cause a
+            # training plateau that no amount of extra epochs can resolve.
+            _terminus_vals: Optional[torch.Tensor] = None
+            if batch_anchor_p is not None:
+                al_batch = batch.get("anchor_l")
+                av_batch = batch.get("anchor_v")
+                if al_batch is not None and av_batch is not None:
+                    al_dev = al_batch.to(device)
+                    av_dev = av_batch.to(device)
+                    B_cur = node_ids.shape[0]
+                    valid_anchor = batch_anchor_p >= 0
+                    if valid_anchor.any():
+                        anc_p_safe = batch_anchor_p.clamp(0, masks.shape[1] - 1)
+                        anc_lens = (
+                            masks[torch.arange(B_cur, device=device), anc_p_safe].long().sum(dim=1)
+                        )
+                        anc_terminus = (anc_lens - 1).clamp(min=0)
+                        at_term = valid_anchor & (al_dev == anc_terminus) & (av_dev >= 0)
+                        if at_term.any():
+                            _terminus_vals = torch.randint(
+                                0, 2, (B_cur,), device=device, dtype=torch.long
+                            )
+                            _terminus_vals[at_term] = av_dev[at_term].long().clamp(0, 1)
+            c_mask, c_vals = _build_training_constraints(
+                node_ids=node_ids,
+                masks=masks,
+                epoch=epoch,
+                total_epochs=cfg.epochs,
+                terminus_vals=_terminus_vals,
+            )
+        elif c_mask is None and not cfg.inject_constraints:
+            c_prob = cfg.max_constraint_prob
             if c_prob > 0:
                 c_mask, c_vals = generate_constraints(node_ids, files, c_prob)
                 c_mask = c_mask.to(device)
                 c_vals = c_vals.to(device)
 
         # 3. Inject constraints (either from batch or manually generated) into embeddings
-        if cfg.add_logic_value and c_mask is not None:
+        if cfg.add_logic_value and c_mask is not None and c_vals is not None:
             if c_mask.any():
                 D = paths.shape[-1]
                 if D >= 3:
@@ -333,7 +510,7 @@ def train_one_epoch(
                     paths_flat[mask_flat, D - 3 : D] = one_hot
 
         # Anchor hint generation if needed
-        if cfg.anchor_hint and "anchor_p" not in batch:
+        if cfg.anchor_hint and batch_anchor_p is None:
             ap_cpu, al_cpu, av_cpu, s_cpu = _generate_anchor(
                 node_ids.detach().cpu(), masks.detach().cpu(), files, cfg.prefer_value
             )
@@ -345,25 +522,18 @@ def train_one_epoch(
                 paths, anchor_p, anchor_l, anchor_v, enable=cfg.add_logic_value
             )
         else:
-            anchor_p = batch.get("anchor_p", None)
+            anchor_p = batch_anchor_p
             if anchor_p is not None:
-                anchor_p = anchor_p.to(device)
                 anchor_l = batch["anchor_l"].to(device)
                 anchor_v = batch["anchor_v"].to(device)
                 solv_labels = batch["solvability"].to(device)
             else:
                 anchor_p = anchor_l = anchor_v = solv_labels = None  # type: ignore
 
-        # Resolve gate types
-        if "gate_types" in batch:
-            gtypes = batch["gate_types"].to(device)
-        else:
-            gtypes = resolve_gate_types(node_ids, files, device)
-
         # Gumbel Annealing
         gumbel_t = max(0.1, cfg.gumbel_temp * (cfg.gumbel_anneal_rate ** (epoch - 1)))
 
-        with torch.amp.autocast("cuda", enabled=cfg.amp):
+        with torch.amp.autocast("cuda", enabled=cfg.amp):  # type: ignore[attr-defined]
             logits, solv_logits = model(
                 paths,
                 masks,
@@ -390,6 +560,7 @@ def train_one_epoch(
                 normalize_reward=cfg.normalize_reward,
                 anchor_alpha=cfg.anchor_reward_alpha,
                 gumbel_temp=gumbel_t,
+                lambda_constraint=cfg.lambda_constraint,
             )
 
         # NaN/Inf guard: skip corrupt batches
@@ -410,10 +581,10 @@ def train_one_epoch(
             optim.zero_grad(set_to_none=True)
 
         total_loss += float(loss_val.item())
-        total_reward += float(avg_reward.mean().item())
-        total_valid += float(valid_rate.mean().item())
-        total_edge_acc += float(batch_edge_acc.mean().item())
-        total_trivial += float(batch_c_viol.mean().item())
+        total_reward += float(avg_reward)
+        total_valid += float(valid_rate)
+        total_edge_acc += float(batch_edge_acc)
+        total_trivial += float(batch_c_viol)
         total_batches += 1
 
         # 4. RAM AWARENESS in main loop
@@ -465,7 +636,11 @@ def train_one_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: nn.Module, loader: DataLoader, device: torch.device, cfg: TrainConfig
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    cfg: TrainConfig,
+    epoch: int = 1,
 ) -> Tuple[float, float, float, float, float]:
     model.eval()
     (
@@ -505,6 +680,15 @@ def evaluate(
         c_mask = batch["constraint_mask"].to(device) if "constraint_mask" in batch else None
         c_vals = batch["constraint_vals"].to(device) if "constraint_vals" in batch else None
 
+        # Extract anchor early so constraint building can use circuit-consistent values.
+        if "anchor_p" in batch:
+            anchor_p = batch["anchor_p"].to(device)
+            anchor_l = batch["anchor_l"].to(device)
+            anchor_v = batch["anchor_v"].to(device)
+            solv_labels = batch["solvability"].to(device)
+        else:
+            anchor_p = anchor_l = anchor_v = solv_labels = None  # type: ignore
+
         # 1. Initialize Logic Value Vector to "Unknown" [0, 0, 1] ONLY IF dataset didn't do it
         if cfg.add_logic_value and not cfg.inject_constraints:
             D_cur = paths.shape[-1]
@@ -513,16 +697,42 @@ def evaluate(
                 paths[..., D_cur - 2] = 0.0
                 paths[..., D_cur - 1] = 1.0
 
-        # 2. Support manual constraint generation if dataset didn't provide them
-        if c_mask is None and not cfg.inject_constraints:
-            c_prob = cfg.max_constraint_prob if cfg.constrained_curriculum else 0.0
+        # 2. Keep evaluation curriculum-consistent with training schedule.
+        if cfg.constrained_curriculum:
+            # Mirror the anchor-guided terminus derivation used in train_one_epoch
+            # so validation c_viol is measured on achievable constraint targets.
+            _eval_terminus_vals: Optional[torch.Tensor] = None
+            if anchor_p is not None and anchor_l is not None and anchor_v is not None:
+                B_cur = node_ids.shape[0]
+                valid_anchor = anchor_p >= 0
+                if valid_anchor.any():
+                    anc_p_safe = anchor_p.clamp(0, masks.shape[1] - 1)
+                    anc_lens = (
+                        masks[torch.arange(B_cur, device=device), anc_p_safe].long().sum(dim=1)
+                    )
+                    anc_terminus = (anc_lens - 1).clamp(min=0)
+                    at_term = valid_anchor & (anchor_l == anc_terminus) & (anchor_v >= 0)
+                    if at_term.any():
+                        _eval_terminus_vals = torch.randint(
+                            0, 2, (B_cur,), device=device, dtype=torch.long
+                        )
+                        _eval_terminus_vals[at_term] = anchor_v[at_term].long().clamp(0, 1)
+            c_mask, c_vals = _build_training_constraints(
+                node_ids=node_ids,
+                masks=masks,
+                epoch=epoch,
+                total_epochs=cfg.epochs,
+                terminus_vals=_eval_terminus_vals,
+            )
+        elif c_mask is None and not cfg.inject_constraints:
+            c_prob = cfg.max_constraint_prob
             if c_prob > 0:
                 c_mask, c_vals = generate_constraints(node_ids, files, c_prob)
                 c_mask = c_mask.to(device)
                 c_vals = c_vals.to(device)
 
         # 3. Inject constraints into embeddings
-        if cfg.add_logic_value and c_mask is not None:
+        if cfg.add_logic_value and c_mask is not None and c_vals is not None:
             if c_mask.any():
                 D = paths.shape[-1]
                 if D >= 3:
@@ -533,21 +743,12 @@ def evaluate(
                     mask_flat = c_mask.view(-1)
                     paths_flat[mask_flat, D - 3 : D] = one_hot
 
-        # Use pre-computed anchors from shards (avoid on-the-fly solver)
-        if "anchor_p" in batch:
-            anchor_p = batch["anchor_p"].to(device)
-            anchor_l = batch["anchor_l"].to(device)
-            anchor_v = batch["anchor_v"].to(device)
-            solv_labels = batch["solvability"].to(device)
-        else:
-            anchor_p = anchor_l = anchor_v = solv_labels = None  # type: ignore
-
         if "gate_types" in batch:
             gtypes = batch["gate_types"].to(device)
         else:
             gtypes = resolve_gate_types(node_ids, files, device)
 
-        with torch.amp.autocast("cuda", enabled=cfg.amp):
+        with torch.amp.autocast("cuda", enabled=cfg.amp):  # type: ignore[attr-defined]
             logits, solv_logits = model(
                 paths, masks, gate_types=gtypes if cfg.use_gate_type_embedding else None
             )
@@ -570,14 +771,15 @@ def evaluate(
                 normalize_reward=cfg.normalize_reward,
                 anchor_alpha=cfg.anchor_reward_alpha,
                 gumbel_temp=0.1,
+                lambda_constraint=cfg.lambda_constraint,
             )
 
         loss_val = loss.mean()
         total_loss += float(loss_val.item())
-        total_reward += float(avg_reward.mean().item())
-        total_valid += float(valid_rate.mean().item())
-        total_edge_acc += float(batch_edge_acc.mean().item())
-        total_trivial += float(batch_c_viol.mean().item())
+        total_reward += float(avg_reward)
+        total_valid += float(valid_rate)
+        total_edge_acc += float(batch_edge_acc)
+        total_trivial += float(batch_c_viol)
         total_batches += 1
 
         if cfg.verbose and cfg.log_interval > 0 and (batch_idx + 1) % cfg.log_interval == 0:
@@ -618,9 +820,10 @@ def evaluate(
 
 def save_checkpoint(path: str, model: nn.Module, cfg: TrainConfig, best: bool = False) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    inner: nn.Module = getattr(model, "module", model)
     torch.save(
         {
-            "state_dict": (model.module if hasattr(model, "module") else model).state_dict(),
+            "state_dict": inner.state_dict(),
             "config": asdict(cfg),
             "best": best,
         },
@@ -667,6 +870,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         max_paths=getattr(args, "max_paths", 200),
         inject_constraints=getattr(args, "inject_constraints", False),
         pretrained=getattr(args, "pretrained", None),
+        lambda_constraint=getattr(args, "lambda_constraint", 1.0),
     )
 
     # Diagnostic logs for memory
@@ -784,7 +988,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             print(f"Warning: Failed to load weights: {e}")
 
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
-    scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp)  # type: ignore[attr-defined]
 
     # Cosine LR scheduler with linear warmup
     warmup_epochs = min(3, cfg.epochs // 4)
@@ -810,7 +1014,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         tr_loss, tr_reward, tr_acc, tr_edge, tr_c_viol = train_one_epoch(
             model, train_loader, optim, scaler, device, cfg, epoch=epoch
         )
-        va_loss, va_reward, va_acc, va_edge, va_c_viol = evaluate(model, val_loader, device, cfg)
+        va_loss, va_reward, va_acc, va_edge, va_c_viol = evaluate(
+            model, val_loader, device, cfg, epoch=epoch
+        )
 
         current_lr = optim.param_groups[0]["lr"]
         print(
@@ -1045,6 +1251,15 @@ def build_argparser() -> argparse.ArgumentParser:
         type=int,
         default=200,
         help="Maximum number of paths per sample (truncation) to prevent OOM.",
+    )
+    t.add_argument(
+        "--lambda-constraint",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight for constraint CE loss term. Increase to 3–5 when c_viol "
+            "is stuck: the constraint signal must outweigh the soft-edge gate-logic loss."
+        ),
     )
 
     return p
