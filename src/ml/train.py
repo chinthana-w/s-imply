@@ -233,6 +233,10 @@ class TrainConfig:
     # constraints even when they conflict with the soft-edge gate-logic loss.
     lambda_constraint: float = 1.0
 
+    # CUDA OOM recovery: exponential backoff retry settings.
+    oom_max_retries: int = 3   # number of retry attempts before skipping a batch
+    oom_base_wait: float = 2.0  # base wait in seconds; actual wait = base * 2^attempt
+
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
     # Use config processed_dir if provided, else auto-detect
@@ -533,52 +537,92 @@ def train_one_epoch(
         # Gumbel Annealing
         gumbel_t = max(0.1, cfg.gumbel_temp * (cfg.gumbel_anneal_rate ** (epoch - 1)))
 
-        with torch.amp.autocast("cuda", enabled=cfg.amp):  # type: ignore[attr-defined]
-            logits, solv_logits = model(
-                paths,
-                masks,
-                gate_types=gtypes if cfg.use_gate_type_embedding else None,
-                checkpointing=cfg.checkpointing,
-            )
+        # Forward + loss + backward with OOM exponential backoff.
+        # On CUDA OOM: free cache, wait 2^attempt seconds, then retry.
+        # After max_oom_retries failures the batch is skipped to preserve progress.
+        # Initialize to satisfy type-checkers; these are always set on a successful iteration.
+        loss_val: torch.Tensor = torch.tensor(0.0)
+        avg_reward = valid_rate = batch_edge_acc = batch_c_viol = 0.0
+        logits = solv_logits = None
+        _oom_batch_skipped = False
+        for _oom_attempt in range(cfg.oom_max_retries + 1):
+            try:
+                with torch.amp.autocast("cuda", enabled=cfg.amp):  # type: ignore[attr-defined]
+                    logits, solv_logits = model(
+                        paths,
+                        masks,
+                        gate_types=gtypes if cfg.use_gate_type_embedding else None,
+                        checkpointing=cfg.checkpointing,
+                    )
 
-            loss, avg_reward, valid_rate, batch_edge_acc, batch_c_viol = reinforce_loss(
-                logits=logits,
-                gate_types=gtypes,
-                mask_valid=masks,
-                solvability_logits=solv_logits,
-                solvability_labels=solv_labels,
-                anchor_p=anchor_p,
-                anchor_l=anchor_l,
-                anchor_v=anchor_v,
-                entropy_beta=cfg.entropy_beta,
-                constraint_mask=c_mask,
-                constraint_vals=c_vals,
-                node_ids=node_ids,
-                lambda_logic=cfg.lambda_logic,
-                lambda_full_logic=cfg.lambda_full_logic,
-                soft_edge_lambda=cfg.soft_edge_lambda,
-                normalize_reward=cfg.normalize_reward,
-                anchor_alpha=cfg.anchor_reward_alpha,
-                gumbel_temp=gumbel_t,
-                lambda_constraint=cfg.lambda_constraint,
-            )
+                    loss, avg_reward, valid_rate, batch_edge_acc, batch_c_viol = reinforce_loss(
+                        logits=logits,
+                        gate_types=gtypes,
+                        mask_valid=masks,
+                        solvability_logits=solv_logits,
+                        solvability_labels=solv_labels,
+                        anchor_p=anchor_p,
+                        anchor_l=anchor_l,
+                        anchor_v=anchor_v,
+                        entropy_beta=cfg.entropy_beta,
+                        constraint_mask=c_mask,
+                        constraint_vals=c_vals,
+                        node_ids=node_ids,
+                        lambda_logic=cfg.lambda_logic,
+                        lambda_full_logic=cfg.lambda_full_logic,
+                        soft_edge_lambda=cfg.soft_edge_lambda,
+                        normalize_reward=cfg.normalize_reward,
+                        anchor_alpha=cfg.anchor_reward_alpha,
+                        gumbel_temp=gumbel_t,
+                        lambda_constraint=cfg.lambda_constraint,
+                    )
 
-        # NaN/Inf guard: skip corrupt batches
-        loss_val = loss.mean()
-        if not torch.isfinite(loss_val):
-            print(f"[WARNING] Non-finite loss at batch {batch_idx}, skipping.")
-            optim.zero_grad(set_to_none=True)
+                # NaN/Inf guard: skip corrupt batches
+                loss_val = loss.mean()
+                if not torch.isfinite(loss_val):
+                    print(f"[WARNING] Non-finite loss at batch {batch_idx}, skipping.")
+                    optim.zero_grad(set_to_none=True)
+                    _oom_batch_skipped = True
+                    break
+
+                scaler.scale(loss_val / cfg.grad_accum).backward()
+
+                if (batch_idx + 1) % cfg.grad_accum == 0:
+                    # Gradient clipping to prevent AMP-induced explosions
+                    scaler.unscale_(optim)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optim)
+                    scaler.update()
+                    optim.zero_grad(set_to_none=True)
+
+                break  # success — exit OOM retry loop
+
+            except torch.cuda.OutOfMemoryError:
+                import gc
+                import time as _time
+
+                optim.zero_grad(set_to_none=True)
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                if _oom_attempt < cfg.oom_max_retries:
+                    wait = cfg.oom_base_wait * (2**_oom_attempt)
+                    print(
+                        f"[OOM] batch {batch_idx} attempt {_oom_attempt + 1}"
+                        f"/{cfg.oom_max_retries}: retrying in {wait}s ...",
+                        flush=True,
+                    )
+                    _time.sleep(wait)
+                else:
+                    print(
+                        f"[OOM] batch {batch_idx}: exhausted {cfg.oom_max_retries} retries,"
+                        " skipping batch.",
+                        flush=True,
+                    )
+                    _oom_batch_skipped = True
+
+        if _oom_batch_skipped:
             continue
-
-        scaler.scale(loss_val / cfg.grad_accum).backward()
-
-        if (batch_idx + 1) % cfg.grad_accum == 0:
-            # Gradient clipping to prevent AMP-induced explosions
-            scaler.unscale_(optim)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optim)
-            scaler.update()
-            optim.zero_grad(set_to_none=True)
 
         total_loss += float(loss_val.item())
         total_reward += float(avg_reward)
@@ -871,6 +915,8 @@ def cmd_train(args: argparse.Namespace) -> None:
         inject_constraints=getattr(args, "inject_constraints", False),
         pretrained=getattr(args, "pretrained", None),
         lambda_constraint=getattr(args, "lambda_constraint", 1.0),
+        oom_max_retries=getattr(args, "oom_max_retries", 3),
+        oom_base_wait=getattr(args, "oom_base_wait", 2.0),
     )
 
     # Diagnostic logs for memory
@@ -988,7 +1034,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             print(f"Warning: Failed to load weights: {e}")
 
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp)  # type: ignore[attr-defined]
+    scaler = torch.amp.GradScaler('cuda', enabled=cfg.amp)  # type: ignore[attr-defined]
 
     # Cosine LR scheduler with linear warmup
     warmup_epochs = min(3, cfg.epochs // 4)
@@ -1260,6 +1306,18 @@ def build_argparser() -> argparse.ArgumentParser:
             "Weight for constraint CE loss term. Increase to 3–5 when c_viol "
             "is stuck: the constraint signal must outweigh the soft-edge gate-logic loss."
         ),
+    )
+    t.add_argument(
+        "--oom-max-retries",
+        type=int,
+        default=3,
+        help="Maximum CUDA OOM retry attempts per batch before skipping it (exponential backoff).",
+    )
+    t.add_argument(
+        "--oom-base-wait",
+        type=float,
+        default=2.0,
+        help="Base wait (s) for CUDA OOM exponential backoff; actual wait = base * 2^attempt.",
     )
 
     return p

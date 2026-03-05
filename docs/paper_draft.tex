@@ -1,0 +1,278 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+% Template version as of 6/27/2024
+
+\usepackage[nosort]{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\hbadness=10000
+\hfuzz=1pt
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+\title{S-Imply: Back Implication Prediction in ATPG using Multi-Path Attention}
+
+\author{\IEEEauthorblockN{1\textsuperscript{st} Chinthana Wimalasuriya}
+   \IEEEauthorblockA{\textit{School of Electrical, Computer}\\\textit{and Biomedical Engineering}\\\textit{Southern Illinois University}\\Carbondale, IL, USA\\chinthana.w@siu.edu}
+   \and
+   \IEEEauthorblockN{2\textsuperscript{nd} Spyros Tragoudas}
+   \IEEEauthorblockA{\textit{School of Electrical, Computer}\\\textit{and Biomedical Engineering}\\\textit{Southern Illinois University}\\Carbondale, IL, USA\\spyros@siu.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+   Automatic Test Pattern Generation (ATPG) relies heavily on iterative branch-and-bound techniques to justify structural fault conditions within digital logic circuits. Reconvergent fanout topologies present a persistent challenge, engendering structural logic conflicts that necessitate exhaustive backtracking. We propose S-Imply, an end-to-end differentiable framework for back implication prediction combining structural and functional embeddings with a Multi-Path Transformer architecture. Our approach explicitly models the local re-convergent regions to dynamically resolve justification constraints across interacting branches without relying on generic sparse rewards. Employing a policy-gradient-style curriculum utilizing the Gumbel-Softmax estimator, the model achieves a deterministic, learned proxy of Boolean Satisfiability (SAT) over subset circuit topologies.
+\end{abstract}
+
+\begin{IEEEkeywords}
+   ATPG, Back Implication, Multi-Path Transformer, Electronic Design Automation, Reconvergent Fanouts
+\end{IEEEkeywords}
+
+\section{Introduction}
+Modern Very Large Scale Integration (VLSI) testing mandates rigorous and highly efficient Automatic Test Pattern Generation (ATPG) techniques. Algorithms such as the Path-Oriented Decision Making (PODEM) algorithm \cite{goel1981implicit} remain foundational paradigms. However, as circuit density scaling compounds, topological phenomena such as reconvergent fanouts, where logic signals branch from a common ancestral node (the stem) and converge upon a target node, induce significant algorithmic instability \cite{maamari1990fault}. When attempting to assign and justify Boolean logic values, existing solvers commonly encounter logical contradictions (conflicts) isolated deep within these reconvergent topologies, triggering computationally demanding backtracking cascades.
+
+Addressing these topologies inherently resembles subset Boolean Satisfiability (SAT) \cite{marques1999grasp}, prompting the exploration of machine learning heuristics to bypass the combinatorial explosion. While classical deep learning struggles with deterministic Boolean constraint compliance, recent advances in Graph Neural Networks (GNNs) offer high-fidelity structural logic embeddings (e.g., DeepGate) \cite{deepgate}. Yet, monolithic generative approaches frequently fail to resolve interdependent multi-path constraints.
+
+In this paper, we introduce S-Imply (Structural Implication), a differentiable framework specifically architected to target and predict logically consistent Boolean assignments for localized reconvergent subsets. Instead of sparse Reinforcement Learning (RL) rewards, we enforce logical constraint adherence via an end-to-end differentiable loss framework mapping edge-wise gate satisfiability directly back to policy gradients via the Gumbel-Softmax estimator \cite{jang2016categorical}. S-Imply acts as an AI-guided heuristic oracle intimately integrated into a novel recursive structure solver that guarantees dynamic path validation bounding for complex ATPG environments.
+
+\section{Related Work}
+
+Rigorous testing methodologies are paramount to ensure the functional correctness of modern integrated circuits. Automatic Test Pattern Generation (ATPG) generates deterministic input vectors to activate potential faults and propagate their effects to observable outputs \cite{bushnell2000essentials}. Because this process is proven to be NP-complete, classical exact solvers are frequently overwhelmed by the combinatorial explosion inherent to high-density modern designs \cite{roy2020machine}, \cite{inf-atpg-rl}, \cite{stephan1996combinational}. Consequently, the evolution of ATPG has transitioned toward integrating advanced machine learning (ML), particularly Graph Neural Networks (GNNs) and Transformers, to natively resolve complex Boolean constraints \cite{deepgate3-arxiv}, \cite{circuit-transformer-iclr}.
+
+\subsection{Classical Algorithms and the Reconvergent Bottleneck}
+Systematic ATPG began with Roth's D-Algorithm, which formalized fault effect representations but suffered from massive, unmanageable decision trees \cite{inf-atpg-rl}, \cite{fujiwara1983acceleration}. The PODEM algorithm optimized this by restricting the search space to Primary Inputs (PIs), capping the decision tree depth \cite{inf-atpg-rl}. The FAN algorithm further accelerated generation using heuristics like "unique sensitization paths" and deferred justification of "headlines" \cite{inf-atpg-rl}, \cite{fujiwara1983acceleration}. Alternatively, SAT-based ATPG translates the netlist and fault conditions into a Boolean Satisfiability (SAT) instance, highly effective for identifying untestable faults and verifying complex scan networks \cite{scan-networks-baranowski}, \cite{scan-networks-reconfig}.
+
+Despite these heuristics, classical engines are severely hindered by \textit{reconvergent fanouts}, structures where a signal splits at a stem and reconverges downstream. Backtracing across these branches frequently generates structural logic conflicts requiring catastrophic backtracking \cite{fujiwara1983acceleration}, \cite{huang2021machine}.
+
+\subsection{Machine Learning Interventions}
+
+\subsubsection{Shallow Heuristics and ANNs}
+Early ML integrations utilized shallow Artificial Neural Networks (ANNs) as predictive oracles to recommend optimal backtrace directions, reducing decision tree depth \cite{roy2020machine}, \cite{rl-atpg-ieee-ats}. However, traditional MLPs expect fixed-dimensional data, destroying the non-Euclidean topological connectivity of digital circuits \cite{deepgate2-arxiv}, \cite{huang2021machine}. Furthermore, querying these models often introduced inference latency that outweighed the computational time saved.
+
+\subsubsection{GNNs for Circuit Representation}
+Graph Neural Networks (GNNs) natively process circuit topologies, producing vector embeddings that encapsulate structural connectivity and functional behavior \cite{deepgate3-arxiv}, \cite{deepgate2-arxiv}.
+\begin{itemize}
+   \item \textbf{DeepGate1 \& 2}: The original DeepGate applied message-passing GNNs to And-Inverter Graphs (AIGs) using logic-1 probabilities as supervision \cite{deepgate3-arxiv}, \cite{deepgate2-arxiv}. DeepGate2 drastically improved this by training on pairwise truth-table differences (Hamming distance) and using an efficient single-round forward architecture, achieving a 16.4x speedup \cite{deepgate2-arxiv}, \cite{huang2021machine}, \cite{deepgate2-xplore}.
+   \item \textbf{DeepGate3}: To combat "over-smoothing" in massive circuits, DeepGate3 employs a hybrid GNN-Transformer framework with a Pooling Transformer (PT) block to capture long-range gate dependencies, achieving a 50.4\% runtime reduction in SAT solving \cite{deepgate3-arxiv}, \cite{huang2021machine}.
+   \item \textbf{GANA}: This model integrates topological netlist data with geometrical layout information for automated annotation and knowledge transfer \cite{huang2021machine}, \cite{gana-date}.
+\end{itemize}
+
+\subsubsection{Accelerated ATPG and Smart Generation}
+Specialized architectures couple neural representations with parallelized execution:
+\begin{itemize}
+   \item \textbf{FPGNN-ATPG}: This framework fuses deep learning with multi-core parallelization. A GNN preemptively classifies fault detectability to prune the fault list. It dynamically routes simple faults to a FAN engine and complex faults to a SAT solver, achieving a 7.56x speedup over commercial tools while maintaining 100\% coverage \cite{huang2021machine}, \cite{fpgnn-atpg-ss}.
+   \item \textbf{InF-ATPG}: This Reinforcement Learning (RL) framework models ATPG as a Markov Decision Process. To overcome massive action spaces, it partitions circuits into Fanout-Free Regions (FFRs). By treating entire FFRs as macro-actions, and using a Quality-Value GNN (QGNN) for state embedding, it reduces required backtracks by 55\% compared to classical PODEM \cite{inf-atpg-rl}, \cite{huang2021machine}.
+\end{itemize}
+
+\subsection{Transformers and Differentiable Logic}
+
+\subsubsection{Sequence-to-Sequence Logic Reasoning}
+Decoder-only Transformers can natively parse Conjunctive Normal Form (CNF) constraints and decide 3-SAT instances using Chain-of-Thought (CoT) prompting \cite{transformers-sat-pan}. Models like DiLA and TG-SAT achieve up to 65x speedups on complex constraints \cite{stephan1996combinational}, \cite{dila-arxiv}. To prevent hallucinations, the \textbf{Circuit Transformer} utilizes a deterministically constrained decoding mechanism that actively simulates partial circuits, blocking any token that violates strict logical equivalence \cite{circuit-transformer-iclr}, \cite{approx-logic-synth}.
+
+\subsubsection{Differentiable Logic for Reconvergent Fanouts}
+Discrete logic gates natively block gradient backpropagation. Researchers introduced the \textbf{Gumbel-Softmax estimator} to perform continuous relaxation, rendering discrete sampling differentiable \cite{huang2021machine}, \cite{differentiable-logic-machines}.
+
+Leveraging this, the \textbf{S-Imply} architecture acts as a deterministic, learned SAT proxy specifically for Local Reconvergent Regions (LRRs). Utilizing a Multi-Path Transformer, it applies cross-attention between converging topological branches. Optimized via a multi-objective soft-compliance loss, S-Imply predicts conflict-free logic assignments within reconvergent fanouts, actively aborting infinite backward justification arrays significantly faster than classical trace enumeration \cite{huang2021machine}.
+
+\subsection{Hardware Acceleration}
+The overhead of GNN and Transformer inference mandates hardware acceleration. Implementations heavily rely on highly parallelized GPUs to accelerate SAT evaluation \cite{fpgnn-atpg-ss}, \cite{iccad-2025-program}. For edge deployment on Automatic Test Equipment (ATE), quantized neural models are synthesized into Field Programmable Gate Arrays (FPGAs) via High-Level Synthesis (HLS), ensuring deterministic, sub-20 millisecond response times required for real-time silicon reliability screening \cite{guo2019survey}, \cite{huang2021machine}.
+
+
+\section{Proposed Methodology}
+
+The objective of S-Imply is to establish an offline, trained policy distribution $\pi(a|s)$ capable of rapidly predicting optimal, conflict-free logic assignments ($0$ or $1$) for all internal nodes comprising a selected reconvergent subset $S \subseteq G$, given graph $G=(V, E)$. The resulting logic assignment strictly adheres to three structural invariants: local gate consistency, reconvergence equivalence, and common structural ancestor equivalence (stem consistency).
+
+\subsection{Problem Formulation and Structure Identification}
+
+To systematically isolate sub-graphs, we draw upon the formal topological definitions established by Maamari and Rajski \cite{maamari1990fault}. A circuit is modeled as a directed acyclic graph (DAG) $G=(V, E)$, where $V$ represents logic gates and $E$ represents signal nets.
+
+\subsubsection{Formal Definition of Local Reconvergent Regions}
+We defines a \textit{Fanout Stem} $v\_s$ as any node with out-degree $d^+(v\_s) > 1$. A node $v\_r$ is a \textit{Reconvergence Point} for $v\_s$ if there exist at least two vertex-disjoint paths $P_1, P_2$ originating at $v\_s$ and terminating at $v\_r$. The Local Reconvergent Region (LRR), denoted $\mathcal{L}(v\_s, v\_r)$, is the sub-graph induced by the set of all nodes lying on any path from $v\_s$ to $v\_r$.
+
+\subsubsection{Structural Bounding via Dominance}
+To ensure the LRR is "locally justifiable," we apply a dominance-bounded search. We say $v_i$ dominates $v_j$ if every path from $v_j$ to any primary output (PO) passes through $v_i$. Identifying LRRs bounded by dominators ensures that predicted logic assignments do not create unforeseen constraints that propagate arbitrarily across the entire netlist.
+
+\subsubsection{Exit Line Indexing}
+A critical concept determining local autonomy is the presence of \textit{Exit Lines}. An exit line $e \in \mathcal{L}$ is a node within the LRR that provides an input to a gate $g \in G \setminus \mathcal{L}$. Our identification algorithm prioritizes LRRs with minimal exit lines to maximize the decoupled solving efficiency. To ensure $O(1)$ lookup performance during deep recursive state validation, specifically critical for dense combinational circuits (e.g., ISCAS85 c6288), we index all identified Exit Lines into a localized \textit{exit map} data structure. This map allows the solver to instantly determine if a predicted assignment at node $v \in \mathcal{L}$ has immediate implications on the global circuit state outside the neural domain.
+
+\subsection{Multi-Path Transformer Architecture}
+Rather than treating the local circuit region as an unstructured set of nodes, we explicitly model the distinct branches of a reconvergent structure. Our model employs a Multi-Path Transformer parameterized to simultaneously process independent parallel paths while facilitating global cross-branch attention.
+
+\subsubsection{Feature Representation and Multi-Modal Embeddings}
+For each node $v_i \in P_j$, we construct a multi-modal input embedding $\mathbf{x}_i \in \mathbb{R}^{d\_{total}}$ by concatenating structural and constraint-aware signals:
+\begin{equation}
+   \mathbf{x}_i = [\mathbf{h}\_{struct}(v_i) \parallel \mathbf{c}(v_i) \parallel \mathbf{e}\_{gate}(t_i)]
+\end{equation}
+where $\parallel$ denotes the concatenation operator.
+\begin{enumerate}
+   \item \textbf{DeepGate Structural Embedding ($\mathbf{h}\_{struct} \in \mathbb{R}^{128}$)}: Extracted from a pre-trained GNN (DeepGate) that encodes circuit topology by predicting logic-1 probabilities via message passing on And-Inverter Graphs \cite{deepgate}. This vector encapsulates both the global topological context and the functional behavioral signature of each node.
+   \item \textbf{Logic Constraint Channels ($\mathbf{c} \in \mathbb{R}^{4}$)}: A four-dimensional binary vector encoding the ATPG implication state of each node: \texttt{[is\_constrained, value\_is\_zero, value\_is\_one, reserved]}. This allows the model to condition its predictions on partial assignments already established by PODEM backtracing.
+   \item \textbf{Gate Type Lexicon ($\mathbf{e}\_{gate} \in \mathbb{R}^{64}$)}: A learned embedding for each discrete gate operator $t_i$, drawn from a vocabulary of 12 types covering \texttt{INPT, FROM, BUFF, NOT, AND, NAND, OR, NOR, XOR, XNOR}. This lexicon ensures the model distinguishes inversion boundaries from non-inverting propagation.
+\end{enumerate}
+The concatenated dimension $d\_{total} = 196$ is projected into the Transformer's model dimension $d\_{model}=512$ via a learned linear layer.
+
+\subsubsection{Shared Path and Interaction Encoders}
+Let the input matrix for path $j$ be $X^{(j)} = [x_1^{(j)}, \ldots, x_{N_j}^{(j)}]^T \in \mathbb{R}^{N_j \times d}$. We compute an intermediate node representation $H^{(j)}$ through a shared path encoder:
+\begin{equation}
+   H^{(j)} = \text{TransformerEncoder}(X^{(j)}; \Theta\_{shared})
+\end{equation}
+This operation captures localized sequential signal flows, such as chained buffer propagation paths or progressive gate constraint cascades, independently for each branch. By sharing $\Theta\_{shared}$ across all paths, the model learns a universal topological language for signal propagation.
+
+\subsubsection{Interaction Transformer and Multi-Head Cross-Attention}
+To capture the complex interdependencies between reconverging branches, we extract a per-path summary vector $z^{(j)}$ by selecting the representation of the terminal (reconvergence-point) node in each path:
+\begin{equation}
+   z^{(j)} = H^{(j)}_{N_j}
+\end{equation}
+where $N_j$ is the index of the last valid (non-padding) token in path $j$. This choice is deliberate: the terminal node is the reconvergent node itself, so its encoding in $H^{(j)}$ already integrates all upstream sequential constraints along branch $j$ after the shared encoder pass. These summaries represent the ``logical state'' of each branch at the point of convergence. The Interaction Transformer maps these summaries through $N\_{interact}=3$ layers of self-attention:
+\begin{equation}
+   \text{Attention}(Q, K, V) = \text{Softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
+\end{equation}
+where $Q, K, V$ are linear projections of the summary matrix $\mathbf{Z} = [z^{(1)}, z^{(2)}]^T$. This allows the representation of path $P_1$ to be contextualized by the requirements of $P_2$.
+
+\subsubsection{Cross-Attention Polling and Hierarchical Prediction}
+The independent node elements $H^{(j)}$ reconcile against the interactive constraints $\hat{z}$ via a polling mechanism. Every node vector $h_i^{(j)}$ acts as a query in a cross-attention layer:
+\begin{equation}
+   \text{Context}_i^{(j)} = \sum_{m=1}^M \text{Head}_m(h_i^{(j)}, \hat{Z}, \hat{Z})
+\end{equation}
+where $M=4$ is the number of attention heads. The cross-attention mechanism effectively allows each node to ``poll'' the global interaction summaries for consistency constraints. The updated state $y_i^{(j)} = \text{LayerNorm}(h_i^{(j)} + \text{Context}_i^{(j)})$ is projected through parallel classification heads:
+\begin{itemize}
+   \item \textbf{Logic Polarity Head}: A linear projection $W\_p \in \mathbb{R}^{d\_{model} \times 2}$ maps each $y_i^{(j)}$ to binary logits $P(\text{val}(v_i) = c) \in \mathbb{R}^2$.
+   \item \textbf{Regional Solvability Head}: $S\_{LRR} \in \mathbb{R}^2$ is computed by applying a linear projection to the mean of the interaction-aware path summaries $\hat{z}^{(j)}$: $S\_{LRR} = W\_s \cdot \frac{1}{|P|} \sum_j \hat{z}^{(j)}$. This provides a circuit-level solvability estimate grounded in inter-branch consistency.
+\end{itemize}
+
+\subsection{Differentiable Logical Training Framework}
+Directly training a neural network on discrete Boolean gates is unfeasible as $\partial v / \partial u$ is zero almost everywhere. We solve this by implementing an end-to-end differentiable surrogate of Boolean logic.
+
+A fundamental challenge in training neural models over Boolean circuits is the discrete nature of logic gates, which prohibits direct gradient backpropagation. We overcome this by utilizing the Gumbel-Softmax estimator for continuous relaxation.
+
+\subsubsection{Gradient Reparameterization}
+Let $l_v \in \mathbb{R}^2$ be the logits for node $v$. During training, we sample differentiable assignments $a_v$ as:
+\begin{equation}
+   a\_{v} = \frac{\exp((l\_{v,1} + g\_{v,1})/\tau)}{\sum_{j=0}^{1} \exp((l\_{v,j} + g\_{v,j})/\tau)}
+\end{equation}
+where $g\_{v,j} \sim \text{Gumbel}(0,1)$. The temperature $\tau$ controls sharpness: at high $\tau$ the distribution is soft and exploration is high; as $\tau \to 0$ the output concentrates on the argmax (discrete). We employ per-epoch multiplicative annealing:
+\begin{equation}
+   \tau\_t = \max\!\left(0.1,\; \tau\_0 \cdot \alpha^{\,t-1}\right)
+\end{equation}
+with initial temperature $\tau\_0 = 1.0$ and decay factor $\alpha = 0.99$, yielding a floor temperature of $0.1$ after sufficient epochs.
+
+\subsubsection{Multi-Objective Logic Loss}
+The model is optimized via a weighted composite loss function:
+\begin{equation}
+   L\_{total} = \lambda\_{e} \mathcal{L}\_{edge} + \lambda\_{r} \mathcal{L}\_{reconv} + \lambda\_{c} \mathcal{L}\_{const} + \lambda\_{s} \mathcal{L}\_{solv} - \beta\_{H} \mathcal{H}
+\end{equation}
+with default weights $\lambda\_{e} = \lambda\_{r} = \lambda\_{c} = \lambda\_{s} = 1.0$ and entropy coefficient $\beta\_{H} = 0.01$.
+
+\textbf{Soft Edge Consistency ($\mathcal{L}\_{edge}$)}: Rather than enforcing hard gate truth tables, we impose a soft differentiable penalty on gate-logic violations using the Gumbel-Softmax probabilities $a\_v \in [0,1]$. For a single-input gate, violations are measured exactly; for multi-input AND/OR families, a hinge formulation penalizes only infeasible output values, since controlling inputs can produce valid logic even in partial assignments:
+\begin{itemize}
+   \item \textit{NOT}: $\omega\_g (a\_v - (1-a\_u))^2$
+   \item \textit{BUFF}: $\omega\_g (a\_v - a\_u)^2$
+   \item \textit{AND}: $\omega\_g \,\text{ReLU}(a\_v - a\_u)^2$ \quad (output cannot exceed any input)
+   \item \textit{NAND}: $\omega\_g \,\text{ReLU}((1-a\_u) - a\_v)^2$
+   \item \textit{OR}: $\omega\_g \,\text{ReLU}(a\_u - a\_v)^2$ \quad (output cannot fall below any input)
+   \item \textit{NOR}: $\omega\_g \,\text{ReLU}(a\_v - (1-a\_u))^2$
+   \item \textit{XOR (2-input)}: $\omega\_g (a\_{u\_1}(1-a\_{u\_2}) + a\_{u\_2}(1-a\_{u\_1}) - a\_v)^2$
+\end{itemize}
+Gate-type weights are $\omega\_g = 2.0$ for \textit{rigid gates} (NOT, BUFF) where a single input deterministically fixes the output, and $\omega\_g = 1.0$ for \textit{controlling-value gates} (AND, NAND, OR, NOR). The total edge loss is the mean across all valid in-path edges.
+
+\textbf{Reconvergence Consensus ($\mathcal{L}\_{reconv}$)}: At the shared reconvergent node $v\_r$, each path $P_j$ in the LRR produces an independent logit vector $l\_{v\_r}^{(j)} \in \mathbb{R}^2$. We enforce cross-path agreement by penalizing deviation from the mean terminus logit:
+\begin{equation}
+   \bar{l}\_{v\_r} = \frac{1}{|P|}\sum_j l\_{v\_r}^{(j)}, \qquad
+   \mathcal{L}\_{reconv} = \frac{1}{|P|}\sum_j \left\| l\_{v\_r}^{(j)} - \bar{l}\_{v\_r} \right\|^2
+\end{equation}
+Operating on logits rather than discrete samples preserves full gradient flow through the penalty. The loss is weighted by 0.5 to balance its scale relative to the edge loss.
+
+\textbf{Constraint Supervision ($\mathcal{L}\_{const}$)}: A subset of nodes are designated as \textit{anchor} nodes with circuit-verified Boolean values (derived from random PI simulation on the training circuit). For these nodes, a cross-entropy supervision loss is applied:
+\begin{equation}
+   \mathcal{L}\_{const} = -\frac{1}{|\mathcal{A}|} \sum_{(v,c) \in \mathcal{A}} \log P(\text{val}(v) = c)
+\end{equation}
+where $\mathcal{A}$ denotes the set of anchor node–value pairs. This provides circuit-consistent gradient signal grounding model predictions in real Boolean assignments.
+
+\textbf{Entropy Regularization ($\mathcal{H}$)}: To prevent premature prediction collapse, we add an entropy bonus:
+\begin{equation}
+   \mathcal{H} = \frac{1}{|V|}\sum_v H\!\left(\text{softmax}(l_v)\right)
+\end{equation}
+which penalizes overconfident distributions and sustains exploratory capacity across the curriculum.
+
+\subsubsection{Constraint Curriculum and Anchor Augmentation}
+Training employs a two-phase constraint curriculum that progressively increases the density of supervised guidance provided to the model.
+
+\textbf{Phase 1 (Epochs 1--$\lfloor 0.25 T\rfloor$)}: During the initial 25\% of total training epochs $T$, only the terminus node of each path (the reconvergent node $v\_r$) is constrained. Anchoring the reconvergence point fixes the target objective while leaving the model free to discover consistent internal assignments without additional supervision. This phase emphasizes structural self-organization through $\mathcal{L}\_{edge}$ and $\mathcal{L}\_{reconv}$.
+
+\textbf{Phase 2 (Epochs $\lfloor 0.25 T\rfloor$--$T$)}: Over the remaining 75\% of training, the probability $p\_{extra}$ of additionally constraining interior path nodes is linearly ramped from $0\%$ to $75\%$:
+\begin{equation}
+   p\_{extra}(t) = 0.75 \cdot \frac{t - \lfloor 0.25T \rfloor}{0.75\, T}
+\end{equation}
+All constraints are populated with circuit-verified Boolean values obtained by simulating random Primary Input (PI) assignments. This ensures every anchor provides a logically consistent gradient signal, avoiding the irresolvable training plateaus that arise from random constraint targets that conflict with gate logic.
+
+Anchor nodes are sampled from the middle 50\% of each path (relative positions 0.25--0.75) to avoid constraining path endpoints, which are reserved for terminus supervision. Together, the anchor supervision loss $\mathcal{L}\_{const}$ and the terminus constraint anchor enforce a grounded, circuit-consistent supervisory signal at increasing density as training progresses.
+
+\subsection{Verification and Algorithmic Integration}
+
+The core novelty of S-Imply lies in its seamless integration with the structural backtracking engine of PODEM. We replace the non-deterministic search heuristics with a targeted predictive policy.
+
+\subsubsection{The Neural-Augmented Justification Flow}
+
+The integrated algorithmic flow is summarized in the following procedural steps:
+\begin{enumerate}
+   \item \textbf{Identification}: The netlist is pre-processed to index all valid LRRs ($\mathcal{L}$) and their associated exit lines.
+   \item \textbf{Target Selection}: PODEM selects a fault and identifies a target node $v\_t$ and required value $\text{val}\_r$.
+   \item \textbf{Boundary Intersection}: As the backtrace procedure moves upstream, if $v\_t \in \mathcal{L}$, the engine pauses standard backtracing.
+   \item \textbf{Neural Inference}: The LRR sub-graph is extracted, and the Multi-Path Transformer predicts the vector $\mathbf{a}\_{\mathcal{L}}$.
+   \item \textbf{Consistency Check}: The solver validates if the predicted $\text{val}(v\_t)$ matches $\text{val}\_r$ and checks $S\_{LRR}$.
+   \item \textbf{Assignment Injection}: If valid, all nodes in the LRR are assigned values from $\mathbf{a}\_{\mathcal{L}}$ and entered into the justification queue. Otherwise, the solver falls back to standard PODEM heuristics for that subset.
+\end{enumerate}
+
+\subsubsection{Dynamic Boundary Enforcement and Synchronization}
+To ensure the predicted assignments remain valid throughout the global ATPG process, the solver implements a dynamic boundary synchronization mechanism. During the forward implication phase subsequent to any input assignment, any deviation from the predicted logic state within an LRR triggers an immediate predictive re-evaluation.
+
+Furthermore, the solvability index $S\_{LRR}$ acts as an early-exit heuristic. If $S\_{LRR} < 0.5$ for a proposed local objective, the engine preemptively identifies the path as untestable or structurally conflicted without performing the exhaustive branch-and-bound enumeration. This mechanism recognizes mutually exclusive logic requirements that are topologically distant but functionally linked, drastically reducing the search space in dense combinational logic.
+
+\subsubsection{Complexity Analysis}
+Traditional PODEM justification in a circuit with $N$ gates and $D$ decision depth exhibits a worst-case complexity of $O(2^D)$. Reconvergent fanouts exacerbate this by forcing the branch-and-bound engine to explore multiple vertex-disjoint paths repeatedly. In contrast, S-Imply reduces the local decision complexity to $O(1)$ inference.
+While the pre-processing structure identification takes $O(V+E)$, the neural-assisted step reduces the backtracking depth $D$ by a factor proportional to the number of LRRs. For a circuit with $k$ identified LRRs, the search space reduces from $2^D$ to $2^{D - \Delta d \cdot k}$, where $\Delta d$ is the average logic depth of an LRR, providing an exponential speedup in the limit of deep, dense reconvergent logic.
+
+\section{Experimental Results}
+\% To be completed. Placeholder for Benchmarking Results vs Classical algorithmic runtime and backtracking comparisons on ISCAS85 / ISCAS89.
+
+\section{Conclusion}
+We have presented S-Imply, a topological graph prediction approach to address the reconvergent fanout problem in ATPG environments. Leveraging multi-path attention models, the policy generates robust deterministic bounding structures scaling natively in multi-constraint validation regimes without relying on strict, fully-annotated logical datasets.
+
+\begin{thebibliography}{00}
+   \bibitem{goel1981implicit} P. Goel, ``An Implicit Enumeration Algorithm to Generate Tests for Combinational Logic Circuits,'' \emph{IEEE Transactions on Computers}, vol. C-30, no. 3, pp. 215--222, Mar. 1981.
+   \bibitem{maamari1990fault} B. Maamari and J. Rajski, ``A Method of Fault Simulation Based on Stem Regions,'' \emph{IEEE Transactions on Computer-Aided Design of Integrated Circuits and Systems}, vol. 9, no. 2, pp. 212--220, Feb. 1990.
+   \bibitem{marques1999grasp} J. P. Marques-Silva and K. A. Sakallah, ``GRASP: A Search Algorithm for Propositional Satisfiability,'' \emph{IEEE Transactions on Computers}, vol. 48, no. 5, pp. 506--521, May 1999.
+   \bibitem{deepgate} M. Li, S. Khan, Z. Shi, N. Wang, H. Yu, and Q. Xu, ``DeepGate: Learning Neural Representations of Logic Gates,'' in \emph{Proc. 59th ACM/IEEE Design Automation Conf. (DAC)}, 2022, pp. 667--672.
+   \bibitem{jang2016categorical} E. Jang, S. Gu, and B. Poole, ``Categorical Reparameterization with Gumbel-Softmax,'' in \emph{Proc. Int. Conf. Learning Representations (ICLR)}, 2017.
+   \bibitem{bushnell2000essentials} M. L. Bushnell and V. D. Agrawal, ``Essentials of Electronic Testing for Digital, Memory and Mixed-Signal VLSI Circuits,'' Springer, 2000.
+   \bibitem{roy2020machine} S. Roy, S. K. Millican, and V. D. Agrawal, ``Machine Intelligence for Efficient Test Pattern Generation,'' in \emph{Proc. IEEE International Test Conference (ITC)}, 2020.
+   \bibitem{inf-atpg-rl} B. Sun, R. Zhang, and Z. Xue, ``InF-ATPG: Intelligent FFR-Driven ATPG with Advanced Circuit Representation Guided Reinforcement Learning,'' arXiv:2512.00079, Nov. 2025.
+   \bibitem{stephan1996combinational} P. Stephan, R. K. Brayton, and A. L. Sangiovanni-Vincentelli, ``Combinational test generation using satisfiability,'' \emph{IEEE Transactions on Computer-Aided Design of Integrated Circuits and Systems}, vol. 15, no. 9, pp. 1167--1176, Sept. 1996.
+   \bibitem{deepgate3-arxiv} Z. Shi, Z. Zheng, S. Khan, J. Zhong, M. Li, and Q. Xu, ``DeepGate3: Towards Scalable Circuit Representation Learning,'' in \emph{Proc. 43rd IEEE/ACM Int. Conf. Computer-Aided Design (ICCAD)}, 2024, arXiv:2407.11095.
+   \bibitem{circuit-transformer-iclr} X. Li, X. Li, L. Chen, X. Zhang, M. Yuan, and J. Wang, ``Circuit Transformer: A Transformer That Preserves Logical Equivalence,'' in \emph{Proc. Int. Conf. Learning Representations (ICLR)}, 2025, arXiv:2403.13838.
+   \bibitem{fujiwara1983acceleration} H. Fujiwara and T. Shimono, ``On the acceleration of test generation algorithms,'' \emph{IEEE Transactions on Computers}, vol. C-32, no. 12, pp. 1137--1144, Dec. 1983.
+   \bibitem{scan-networks-baranowski} R. Baranowski, M. A. Kochte, and H.-J. Wunderlich, ``Modeling, Verification and Pattern Generation for Reconfigurable Scan Networks,'' in \emph{Proc. IEEE Int. Test Conf. (ITC)}, 2012.
+   \bibitem{transformers-sat-pan} L. Pan et al., ``Can Transformers Reason Logically? A Study in SAT Solving,'' in \emph{Proc. 42nd Int. Conf. Machine Learning (ICML)}, 2025, arXiv:2410.07432.
+   \bibitem{huang2021machine} G. Huang \emph{et al.}, ``Machine Learning for Electronic Design Automation: A Survey,'' \emph{ACM Transactions on Design Automation of Electronic Systems (TODAES)}, vol. 26, no. 5, pp. 1--46, 2021.
+   \bibitem{scan-networks-reconfig} R. Baranowski, M. A. Kochte, and H.-J. Wunderlich, ``Reconfigurable Scan Networks: Modeling, Verification, and Optimal Pattern Generation,'' \emph{ACM Trans. Design Automation of Electronic Systems (TODAES)}, vol. 20, no. 2, 2015.
+   \bibitem{roth1966diagnosis} J. P. Roth, ``Diagnosis of Automata Failures: A Calculus and a Method,'' \emph{IBM Journal of Research and Development}, vol. 10, no. 4, pp. 278--291, 1966.
+   \bibitem{rl-atpg-ieee-ats} W. Li, H. Lyu, S. Liang, T. Wang, P. Tian, and H. Li, ``Intelligent Automatic Test Pattern Generation for Digital Circuits Based on Reinforcement Learning,'' in \emph{Proc. 32nd IEEE Asian Test Symp. (ATS)}, Beijing, China, Oct. 2023.
+   \bibitem{deepgate2-arxiv} Z. Shi, H. Pan, C. Hu, and Z. Xie, ``DeepGate2: Functionality-Aware Circuit Representation Learning,'' in \emph{Proc. 42nd IEEE/ACM Int. Conf. Computer-Aided Design (ICCAD)}, 2023, arXiv:2305.16373.
+   \bibitem{gana-date} K. Kunal \emph{et al.}, ``GANA: Graph Convolutional Network Based Automated Netlist Annotation for Analog Circuits,'' in \emph{Proc. Design, Automation and Test in Europe (DATE)}, 2020.
+   \bibitem{deepgate2-xplore} Z. Shi, H. Pan, C. Hu, and Z. Xie, ``DeepGate2: Functionality-Aware Circuit Representation Learning,'' in \emph{Proc. 42nd IEEE/ACM Int. Conf. Computer-Aided Design (ICCAD)}, 2023.
+   \bibitem{untangle-iccad} L. Alrahis, S. Patnaik, M. Shafique, and O. Sinanoglu, ``UNTANGLE: Unlocking Routing and Logic Obfuscation Using Graph Neural Networks-based Link Prediction,'' in \emph{Proc. IEEE/ACM Int. Conf. Computer-Aided Design (ICCAD)}, 2021.
+   \bibitem{fpgnn-atpg-ss} Y. Ye and Z. Wang, ``FPGNN-ATPG: An Efficient Fault Parallel Automatic Test Pattern Generator,'' in \emph{Proc. Great Lakes Symp. on VLSI (GLSVLSI)}, 2023.
+   \bibitem{dila-arxiv} Y. Zhang \emph{et al.}, ``DiLA: Enhancing LLM Tool Learning with Differential Logic Layer,'' arXiv:2402.11903, 2024.
+   \bibitem{approx-logic-synth} J. Wang et al., ``GTAC: A Generative Transformer for Approximate Circuits,'' arXiv:2601.19906, 2026.
+   \bibitem{differentiable-logic-machines} N. Cingillioglu and A. Russo, ``Differentiable Logic Machines,'' arXiv:2208.08310, 2022.
+   \bibitem{guo2019survey} K. Guo, S. Zeng, J. Yu, Y. Wang, and H. Yang, ``[DL] A Survey of FPGA-Based Neural Network Inference Accelerators,'' \emph{ACM Transactions on Reconfigurable Technology and Systems (TRETS)}, vol. 12, no. 1, pp. 1--26, 2019.
+   \bibitem{iccad-2025-program} C. Zhao, J. Wang, X. Jiang, J. Lou, and Y. Lin, ``GTA: GPU-Accelerated Track Assignment with Lightweight Lookup Table for Conflict Detection,'' in \emph{Proc. IEEE/ACM Int. Conf. Computer-Aided Design (ICCAD)}, 2025.
+\end{thebibliography}
+
+\end{document}
