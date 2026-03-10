@@ -20,12 +20,14 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import time
 import warnings
 from dataclasses import asdict, dataclass
 from typing import Optional, Tuple
 
+import psutil
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -33,6 +35,7 @@ from tqdm import tqdm
 
 from src.ml.core.dataset import (
     ReconvergentPathsDataset,
+    ShardBatchSampler,
     _generate_anchor,
     _inject_anchor_into_embeddings,
     generate_constraints,
@@ -49,10 +52,10 @@ warnings.filterwarnings("ignore", message="The PyTorch API of nested tensors is 
 
 
 def _curriculum_constraint_prob(epoch: int, total_epochs: int) -> float:
-    """Return stepped constraint probability for curriculum training.
+    """Return constraint probability for curriculum training.
 
     Phase 1 (first 25% epochs): 0%
-    Phase 2 (remaining 75%): 0% -> 75% in +15% steps
+    Phase 2 (remaining 75%): fixed 0.8
     """
     if total_epochs <= 0:
         return 0.0
@@ -61,11 +64,7 @@ def _curriculum_constraint_prob(epoch: int, total_epochs: int) -> float:
     if epoch <= free_epochs:
         return 0.0
 
-    ramp_levels = [0.0, 0.15, 0.30, 0.45, 0.60, 0.75]
-    ramp_epochs = max(1, total_epochs - free_epochs)
-    ramp_pos = epoch - free_epochs - 1
-    level_idx = min(len(ramp_levels) - 1, (ramp_pos * len(ramp_levels)) // ramp_epochs)
-    return ramp_levels[level_idx]
+    return 0.8
 
 
 def _build_training_constraints(
@@ -87,7 +86,7 @@ def _build_training_constraints(
         constraint_vals: [B, P, L] long (0 or 1)
     """
     device = node_ids.device
-    B, P, L = node_ids.shape
+    B, P, _ = node_ids.shape
     valid_nodes = masks & (node_ids > 0)
 
     c_mask = torch.zeros_like(node_ids, dtype=torch.bool)
@@ -97,16 +96,22 @@ def _build_training_constraints(
     # Prefer circuit-consistent values derived from anchor over pure random.
     if terminus_vals is None:
         terminus_vals = torch.randint(0, 2, (B,), device=device, dtype=torch.long)
-    for b in range(B):
-        for p in range(P):
-            valid_len = int(masks[b, p].sum().item())
-            if valid_len <= 0:
-                continue
-            l_idx = valid_len - 1
-            if node_ids[b, p, l_idx] <= 0:
-                continue
-            c_mask[b, p, l_idx] = True
-            c_vals[b, p, l_idx] = terminus_vals[b]
+
+    # Vectorised terminus detection — replaces the O(B*P) Python loop.
+    # valid_len[b, p] = number of valid positions in path p of sample b.
+    valid_len = masks.long().sum(dim=2)  # [B, P]
+    term_idx = (valid_len - 1).clamp(min=0)  # [B, P] index of last valid position
+    has_valid = valid_len > 0  # [B, P]
+
+    # Gather node_ids at the terminus position for each (b, p).
+    term_node = node_ids.gather(2, term_idx.unsqueeze(2)).squeeze(2)  # [B, P]
+    terminus_ok = has_valid & (term_node > 0)  # [B, P]
+
+    # Write terminus constraint: scatter True/value only where terminus_ok.
+    c_mask.scatter_(2, term_idx.unsqueeze(2), terminus_ok.unsqueeze(2))
+    # Broadcast terminus_vals [B] -> [B, P] -> [B, P, 1] for scatter.
+    tv_bp = terminus_vals.unsqueeze(1).expand(B, P)
+    c_vals.scatter_(2, term_idx.unsqueeze(2), (tv_bp * terminus_ok.long()).unsqueeze(2))
 
     # Additional constraints follow stepped curriculum only on non-terminus nodes.
     extra_prob = _curriculum_constraint_prob(epoch, total_epochs)
@@ -236,6 +241,7 @@ class TrainConfig:
     # CUDA OOM recovery: exponential backoff retry settings.
     oom_max_retries: int = 3   # number of retry attempts before skipping a batch
     oom_base_wait: float = 2.0  # base wait in seconds; actual wait = base * 2^attempt
+    resume: bool = False  # if True, load full training state from output/resume.pth
 
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
@@ -263,15 +269,6 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
     if cfg.max_paths > 0:
         final_collate_fn = functools.partial(reconv_collate, max_paths=cfg.max_paths)
 
-    # CAPPING: Shard cache size per worker (compute before dataset construction)
-    effective_shard_cache = cfg.shard_cache_size
-    if cfg.num_workers >= 4 and effective_shard_cache > 2:
-        print(
-            f"[RECONV-MEM] High worker count ({cfg.num_workers}). "
-            "Capping shard_cache_size to 2 per worker."
-        )
-        effective_shard_cache = 2
-
     print(f"Creating dataset (device={dataset_device})...", flush=True)
     dataset = ReconvergentPathsDataset(
         cfg.dataset,
@@ -282,20 +279,107 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
         add_logic_value=cfg.add_logic_value,
         anchor_in_dataset=cfg.dataset_anchor_hint,
         max_len_filter=cfg.max_len,
-        cache_size=effective_shard_cache,
+        cache_size=cfg.shard_cache_size,
         inject_constraints=cfg.inject_constraints,
         constraint_prob=cfg.max_constraint_prob if cfg.inject_constraints else 0.0,
     )
+
+    # Use ShardBatchSampler when shards are available: groups all indices from the
+    # same shard into each batch so get_shard_batch() can slice the whole batch in
+    # one tensor op instead of 4096 individual .clone() calls.  num_workers=0 is
+    # intentional — the shard is already in RAM and a single slice in the main
+    # process is ~10x faster than forking workers that each re-clone per sample.
+    use_shard_sampler = getattr(dataset, "_use_processed", False)
+
+    if use_shard_sampler:
+        # Keep all shards resident — set cache_size to total shards before warmup,
+        # otherwise the default cache_size=1 would evict shards during warmup and
+        # get_shard_batch() would raise KeyError when it tries to access an evicted shard.
+        dataset.cache_size = len(dataset._shard_lens)
+        dataset.warmup_shards(0)  # 0 = all shards
+        print(f"Dataset ready: {len(dataset)} samples across {len(dataset._shard_lens)} shards.")
+
+        # Split at the shard level: last 10% of shards → val, rest → train.
+        n_shards = len(dataset._shard_lens)
+        n_val_shards = max(1, n_shards // 10)
+        train_shard_lens = dataset._shard_lens[: n_shards - n_val_shards]
+        val_shard_lens = dataset._shard_lens[n_shards - n_val_shards :]
+        # Adjust val offsets: ShardBatchSampler needs lens + correct global offsets,
+        # so build separate samplers with an offset shift for the val portion.
+        val_offset = sum(train_shard_lens)
+
+        class _OffsetShardBatchSampler(ShardBatchSampler):
+            """ShardBatchSampler with a fixed global index offset for val shards."""
+
+            def __init__(self, shard_lens, batch_size, offset, shuffle):
+                super().__init__(shard_lens, batch_size, shuffle=shuffle)
+                self._global_offset = offset
+                # Recompute offsets relative to the full dataset
+                off = offset
+                self._offsets = []
+                for n in shard_lens:
+                    self._offsets.append(off)
+                    off += n
+
+        train_sampler = ShardBatchSampler(
+            train_shard_lens, cfg.batch_size, shuffle=True
+        )
+        val_sampler = _OffsetShardBatchSampler(
+            val_shard_lens, cfg.batch_size, offset=val_offset, shuffle=False
+        )
+
+        # PyTorch's DataLoader always calls dataset[i] for each index yielded by
+        # batch_sampler, then passes the list of results to collate_fn.  We cannot
+        # intercept the raw index list that way.  Instead, wrap the samplers in a
+        # simple IterableDataset that calls get_shard_batch() directly and yields
+        # ready-made batch dicts — no __getitem__ or collate involved.
+        from torch.utils.data import IterableDataset as _IterableDataset
+
+        class _ShardIterDataset(_IterableDataset):
+            def __init__(self, ds, sampler):
+                self._ds = ds
+                self._sampler = sampler
+
+            def __iter__(self):
+                for idx_list in self._sampler:
+                    yield self._ds.get_shard_batch(idx_list)
+
+            def __len__(self):
+                return len(self._sampler)
+
+        def _identity_collate(x):
+            # With batch_size=None on an IterableDataset, PyTorch passes the
+            # yielded item directly (not wrapped in a list) — just return it.
+            return x
+
+        n_train = sum(train_shard_lens)
+        n_val = sum(val_shard_lens)
+        print(f"Shard split: {n_train} train / {n_val} val (num_workers=0, shard-slice mode)")
+        train_loader = DataLoader(
+            _ShardIterDataset(dataset, train_sampler),
+            batch_size=None,
+            collate_fn=_identity_collate,
+            num_workers=0,
+        )
+        val_loader = DataLoader(
+            _ShardIterDataset(dataset, val_sampler),
+            batch_size=None,
+            collate_fn=_identity_collate,
+            num_workers=0,
+        )
+        print("DataLoaders initialized (shard-slice mode).", flush=True)
+        return train_loader, val_loader
+
+    # Fallback: raw pickle path — use worker-based loading as before
+    dataset.warmup_shards(cfg.shard_cache_size)
+
     print(f"Dataset ready. Splitting {len(dataset)} samples...", flush=True)
-    # Minimal split: 90/10 train/val
     n = len(dataset)
     n_train = max(1, int(0.9 * n))
     n_val = max(1, n - n_train)
     train_set, val_set = torch.utils.data.random_split(dataset, [n_train, n_val])
     print(f"Split done: {n_train} train, {n_val} val.", flush=True)
 
-    # TUNING: For large batch sizes, we MUST reduce prefetch_factor to save RAM
-    # With batch=1024 and factor=2, 8 workers buffer 16k samples (~20GB RAM!)
     prefetch = 2
     if cfg.batch_size >= 512:
         prefetch = 1
@@ -304,7 +388,6 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
             f"Reducing prefetch_factor to {prefetch} to save RAM."
         )
 
-    # Use workers and pinned memory for faster host->device transfer when on CUDA
     if device.type == "cuda":
         print(
             f"Initializing DataLoaders (workers={cfg.num_workers}, batch_size={cfg.batch_size})...",
@@ -332,7 +415,6 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
         )
         print("DataLoaders initialized.", flush=True)
     else:
-        # For CPU
         train_loader = DataLoader(
             train_set,
             batch_size=cfg.batch_size,
@@ -358,7 +440,7 @@ def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     optim: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: object,
     device: torch.device,
     cfg: TrainConfig,
     epoch: int = 1,
@@ -399,10 +481,12 @@ def train_one_epoch(
 
     if cfg.verbose:
         print(f"Starting epoch {epoch} loop (waiting for DataLoader)...", flush=True)
+    # Compute once per epoch — constant within an epoch.
+    gumbel_t = max(0.1, cfg.gumbel_temp * (cfg.gumbel_anneal_rate ** (epoch - 1)))
+
     pbar = tqdm(loader, desc=f"Epoch {epoch}", total=target_batches, unit="batch")
 
     for batch_idx, batch in enumerate(pbar):
-        pbar.set_description(f"Epoch {epoch}")
         paths = batch["paths_emb"].to(device, non_blocking=True)
         masks = batch["attn_mask"].to(device, non_blocking=True)
         node_ids = batch["node_ids"].to(device, non_blocking=True)
@@ -534,9 +618,6 @@ def train_one_epoch(
             else:
                 anchor_p = anchor_l = anchor_v = solv_labels = None  # type: ignore
 
-        # Gumbel Annealing
-        gumbel_t = max(0.1, cfg.gumbel_temp * (cfg.gumbel_anneal_rate ** (epoch - 1)))
-
         # Forward + loss + backward with OOM exponential backoff.
         # On CUDA OOM: free cache, wait 2^attempt seconds, then retry.
         # After max_oom_retries failures the batch is skipped to preserve progress.
@@ -598,7 +679,6 @@ def train_one_epoch(
                 break  # success — exit OOM retry loop
 
             except torch.cuda.OutOfMemoryError:
-                import gc
                 import time as _time
 
                 optim.zero_grad(set_to_none=True)
@@ -633,17 +713,18 @@ def train_one_epoch(
 
         # 4. RAM AWARENESS in main loop
         if (batch_idx + 1) % 50 == 0:
-            import gc
-
-            import psutil
-
             mem = psutil.virtual_memory()
             if mem.percent > 90.0:
                 print(f"[RECONV-MEM] Main loop detected high RAM ({mem.percent}%). Cleaning up.")
                 gc.collect()
                 torch.cuda.empty_cache()
 
-        if cfg.verbose and cfg.log_interval > 0 and (batch_idx + 1) % cfg.log_interval == 0:
+        if (
+            cfg.verbose
+            and cfg.log_interval > 0
+            and (batch_idx + 1) % cfg.log_interval == 0
+            and logits is not None
+        ):
             dbg = _debug_metrics_from_logits(
                 logits,
                 node_ids,
@@ -862,17 +943,37 @@ def evaluate(
     )
 
 
-def save_checkpoint(path: str, model: nn.Module, cfg: TrainConfig, best: bool = False) -> None:
+def save_checkpoint(
+    path: str,
+    model: nn.Module,
+    cfg: TrainConfig,
+    best: bool = False,
+    epoch: int = 0,
+    optim: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[object] = None,
+    scaler: Optional[object] = None,
+    best_val: float = float("inf"),
+) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     inner: nn.Module = getattr(model, "module", model)
-    torch.save(
-        {
-            "state_dict": inner.state_dict(),
-            "config": asdict(cfg),
-            "best": best,
-        },
-        path,
-    )
+    payload: dict = {
+        "state_dict": inner.state_dict(),
+        "config": asdict(cfg),
+        "best": best,
+        "epoch": epoch,
+        "best_val": best_val,
+    }
+    if optim is not None:
+        payload["optim_state_dict"] = optim.state_dict()
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+    if scaler is not None:
+        payload["scaler_state_dict"] = scaler.state_dict()
+    # Atomic write: save to a temp file then rename so a crash mid-save never
+    # corrupts the checkpoint that was already there.
+    tmp_path = path + ".tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def cmd_train(args: argparse.Namespace) -> None:
@@ -917,6 +1018,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         lambda_constraint=getattr(args, "lambda_constraint", 1.0),
         oom_max_retries=getattr(args, "oom_max_retries", 3),
         oom_base_wait=getattr(args, "oom_base_wait", 2.0),
+        resume=getattr(args, "resume", False),
     )
 
     # Diagnostic logs for memory
@@ -950,8 +1052,11 @@ def cmd_train(args: argparse.Namespace) -> None:
     )
     start_time = time.time()
 
-    # Get a single sample directly from the underlying dataset
-    probe_sample = train_loader.dataset[0]
+    # Get a single sample directly from the underlying dataset.
+    # train_loader.dataset may be a _ShardIterDataset wrapper; fall back to the
+    # inner ReconvergentPathsDataset which always supports __getitem__.
+    probe_ds = getattr(train_loader.dataset, "_ds", train_loader.dataset)
+    probe_sample = probe_ds[0]
     raw_dim = int(probe_sample["paths_emb"].shape[-1])
 
     # Account for the padding that reconv_collate performs (divisibility by nhead)
@@ -1043,26 +1148,99 @@ def cmd_train(args: argparse.Namespace) -> None:
     )
 
     best_val = float("inf")
+    start_epoch = 1
+
+    # Resume training state (optimizer, scheduler, scaler, epoch) if the
+    # resume checkpoint carries them.  Weight-only checkpoints (e.g. --pretrained)
+    # already loaded the model weights above; we only restore training state
+    # from a full resume checkpoint stored in cfg.output.
+    resume_ckpt_path = os.path.join(cfg.output, "resume.pth")
+    if cfg.resume and os.path.isfile(resume_ckpt_path):
+        print(f"Resuming full training state from {resume_ckpt_path}...")
+        resume_state = torch.load(resume_ckpt_path, map_location=device)
+        start_epoch = int(resume_state.get("epoch", 0)) + 1
+        best_val = float(resume_state.get("best_val", float("inf")))
+        if "optim_state_dict" in resume_state:
+            optim.load_state_dict(resume_state["optim_state_dict"])
+        if "scheduler_state_dict" in resume_state:
+            scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        if "scaler_state_dict" in resume_state:
+            scaler.load_state_dict(resume_state["scaler_state_dict"])
+        print(f"Resumed from epoch {start_epoch - 1}. best_val={best_val:.4f}")
+    elif cfg.resume:
+        print(
+            f"[WARNING] --resume requested but {resume_ckpt_path} not found. "
+            "Starting from scratch."
+        )
+
     if cfg.verbose:
         nb_train = len(train_loader) if hasattr(train_loader, "__len__") else 0
         nb_val = len(val_loader) if hasattr(val_loader, "__len__") else 0
         print(
-            f"Starting training: train_batches={nb_train}, "
-            f"val_batches={nb_val}, batch_size={cfg.batch_size}"
+            f"Starting training: epoch={start_epoch}/{cfg.epochs} "
+            f"train_batches={nb_train}, val_batches={nb_val}, batch_size={cfg.batch_size}"
         )
-    for epoch in range(1, cfg.epochs + 1):
+
+    _MAX_EPOCH_RETRIES = 5
+
+    for epoch in range(start_epoch, cfg.epochs + 1):
         # LR Warmup (first few epochs)
         if epoch <= warmup_epochs:
             warmup_lr = cfg.lr * (epoch / max(1, warmup_epochs))
             for pg in optim.param_groups:
                 pg["lr"] = warmup_lr
 
-        tr_loss, tr_reward, tr_acc, tr_edge, tr_c_viol = train_one_epoch(
-            model, train_loader, optim, scaler, device, cfg, epoch=epoch
-        )
-        va_loss, va_reward, va_acc, va_edge, va_c_viol = evaluate(
-            model, val_loader, device, cfg, epoch=epoch
-        )
+        # Retry loop: on any crash (DataLoader worker killed, CUDA error, etc.)
+        # rebuild the DataLoader and retry the epoch up to _MAX_EPOCH_RETRIES times.
+        tr_loss = tr_reward = tr_acc = tr_edge = tr_c_viol = 0.0
+        va_loss = va_reward = va_acc = va_edge = va_c_viol = 0.0
+        for _attempt in range(1, _MAX_EPOCH_RETRIES + 1):
+            try:
+                tr_loss, tr_reward, tr_acc, tr_edge, tr_c_viol = train_one_epoch(
+                    model, train_loader, optim, scaler, device, cfg, epoch=epoch
+                )
+                va_loss, va_reward, va_acc, va_edge, va_c_viol = evaluate(
+                    model, val_loader, device, cfg, epoch=epoch
+                )
+                break  # success — exit retry loop
+            except Exception as exc:
+                print(
+                    f"\n[EPOCH RETRY] Epoch {epoch} attempt {_attempt}/{_MAX_EPOCH_RETRIES} "
+                    f"failed: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                if _attempt == _MAX_EPOCH_RETRIES:
+                    # Save an emergency checkpoint before propagating so we don't
+                    # lose the progress from epochs before this one.
+                    emergency_path = os.path.join(cfg.output, "emergency.pth")
+                    print(
+                        f"[EPOCH RETRY] All {_MAX_EPOCH_RETRIES} attempts exhausted. "
+                        f"Saving emergency checkpoint to {emergency_path} and re-raising.",
+                        flush=True,
+                    )
+                    save_checkpoint(
+                        emergency_path,
+                        model,
+                        cfg,
+                        best=False,
+                        epoch=epoch - 1,
+                        optim=optim,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        best_val=best_val,
+                    )
+                    raise
+                # Rebuild DataLoaders to get fresh worker processes.
+                print(
+                    f"[EPOCH RETRY] Rebuilding DataLoaders for retry {_attempt + 1}...",
+                    flush=True,
+                )
+                try:
+                    del train_loader, val_loader
+                except Exception:
+                    pass
+                gc.collect()
+                train_loader, val_loader = make_dataloaders(cfg, device)
 
         current_lr = optim.param_groups[0]["lr"]
         print(
@@ -1078,19 +1256,41 @@ def cmd_train(args: argparse.Namespace) -> None:
         if epoch > warmup_epochs:
             scheduler.step()
 
-        # Save periodic checkpoint
+        # Always save the resumable training state so any crash can be recovered.
+        save_checkpoint(
+            resume_ckpt_path,
+            model,
+            cfg,
+            best=False,
+            epoch=epoch,
+            optim=optim,
+            scheduler=scheduler,
+            scaler=scaler,
+            best_val=best_val,
+        )
+
+        # Save periodic weights-only snapshot every 10 epochs
         if epoch % 10 == 0 or epoch == cfg.epochs:
             save_checkpoint(
                 os.path.join(cfg.output, f"checkpoint_epoch_{epoch}.pth"),
                 model,
                 cfg,
                 best=False,
+                epoch=epoch,
+                best_val=best_val,
             )
 
         # Save best by validation loss (minimize)
         if va_loss < best_val:
             best_val = va_loss
-            save_checkpoint(os.path.join(cfg.output, "best_model.pth"), model, cfg, best=True)
+            save_checkpoint(
+                os.path.join(cfg.output, "best_model.pth"),
+                model,
+                cfg,
+                best=True,
+                epoch=epoch,
+                best_val=best_val,
+            )
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -1318,6 +1518,15 @@ def build_argparser() -> argparse.ArgumentParser:
         type=float,
         default=2.0,
         help="Base wait (s) for CUDA OOM exponential backoff; actual wait = base * 2^attempt.",
+    )
+    t.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume full training state (epoch, optimizer, scheduler, scaler) "
+            "from <output>/resume.pth. Use this after a crash to continue without "
+            "losing progress."
+        ),
     )
 
     return p

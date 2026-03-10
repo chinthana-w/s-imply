@@ -12,13 +12,84 @@ import json
 import os
 import pickle
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
 from src.util.io import parse_bench_file
+
+
+class ShardBatchSampler(Sampler):
+    """Batch sampler that groups indices by shard to avoid cross-shard random access.
+
+    Each batch contains indices from a single shard, enabling the DataLoader to use
+    tensor slicing instead of per-sample cloning. Shards are shuffled each epoch;
+    within each shard indices are also shuffled.
+
+    Parameters
+    ----------
+    shard_lens : list[int]
+        Number of samples in each shard (from dataset._shard_lens).
+    batch_size : int
+        Target batch size.
+    shuffle : bool
+        Whether to shuffle shard order and intra-shard order each iteration.
+    drop_last : bool
+        Whether to drop the last incomplete batch within each shard.
+    """
+
+    def __init__(
+        self,
+        shard_lens: List[int],
+        batch_size: int,
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ) -> None:
+        self.shard_lens = shard_lens
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+
+        # Precompute shard start offsets
+        self._offsets: List[int] = []
+        off = 0
+        for n in shard_lens:
+            self._offsets.append(off)
+            off += n
+
+    def __iter__(self) -> Iterator[List[int]]:
+        import random
+
+        shard_order = list(range(len(self.shard_lens)))
+        if self.shuffle:
+            random.shuffle(shard_order)
+
+        for shard_idx in shard_order:
+            n = self.shard_lens[shard_idx]
+            offset = self._offsets[shard_idx]
+            local_indices = list(range(n))
+            if self.shuffle:
+                random.shuffle(local_indices)
+            global_indices = [offset + i for i in local_indices]
+            # Yield batches from this shard
+            for start in range(0, len(global_indices), self.batch_size):
+                batch = global_indices[start : start + self.batch_size]
+                if self.drop_last and len(batch) < self.batch_size:
+                    continue
+                yield batch
+
+    def __len__(self) -> int:
+        import math
+
+        total = 0
+        for n in self.shard_lens:
+            if self.drop_last:
+                total += n // self.batch_size
+            else:
+                total += math.ceil(n / self.batch_size)
+        return total
 
 
 class ReconvergentPathsDataset(Dataset):
@@ -229,6 +300,37 @@ class ReconvergentPathsDataset(Dataset):
         except Exception:
             pass
 
+    def warmup_shards(self, n: int = 0) -> None:
+        """Pre-load the first *n* shards (or all shards if n<=0) into the shard cache.
+
+        Call this in the main process before spawning DataLoader workers.  Workers
+        inherit the already-loaded tensors via copy-on-write fork semantics, so they
+        start with a warm cache and incur zero cold-start disk I/O.
+        """
+        if not self._use_processed:
+            return
+        import gc
+
+        n_shards = len(self._shard_files)
+        target = n_shards if n <= 0 else min(n, n_shards)
+        print(f"[DataLoader warmup] Pre-loading {target}/{n_shards} shards...", flush=True)
+        for i in range(target):
+            if i not in self._shard_cache:
+                path = self._shard_files[i]
+                try:
+                    data = torch.load(path, map_location="cpu", weights_only=True)
+                    self._shard_cache[i] = data
+                    # Do NOT enforce cache_size here — warmup is intentionally loading
+                    # all shards so they stay resident.  Eviction during warmup would
+                    # defeat the purpose and cause KeyError in get_shard_batch().
+                except Exception as e:
+                    print(f"[DataLoader warmup] Failed to load shard {path}: {e}")
+                    raise
+            if (i + 1) % 5 == 0 or i + 1 == target:
+                print(f"[DataLoader warmup] {i + 1}/{target} shards loaded.", flush=True)
+        gc.collect()
+        print("[DataLoader warmup] Done.", flush=True)
+
     def _get_shard_for_idx(self, idx: int) -> Tuple[int, int]:
         """Find which shard contains the global index."""
         # Binary search or linear scan (linear is fine for <1000 shards)
@@ -263,8 +365,11 @@ class ReconvergentPathsDataset(Dataset):
         # Load new shard
         path = self._shard_files[shard_idx]
         try:
-            # Bypass unpickling CPU overhead with memory mapping
-            data = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+            # Do NOT use mmap=True here: persistent workers hold mmap'd tensors across
+            # hundreds of epochs, and evicting a shard from the LRU cache drops the Python
+            # reference while the OS mmap region may still be referenced mid-clone by another
+            # codepath, causing SIGTRAP in long-running workers (observed at epoch ~421).
+            data = torch.load(path, map_location="cpu", weights_only=True)
             self._shard_cache[shard_idx] = data
 
             # Enforce cache size
@@ -422,6 +527,68 @@ class ReconvergentPathsDataset(Dataset):
             res["constraint_mask"] = c_mask_tensor
             res["constraint_vals"] = c_vals_tensor
         return res
+
+    def get_shard_batch(self, indices: List[int]) -> Dict[str, Any]:
+        """Return a batch dict by slicing shard tensors directly.
+
+        All indices MUST belong to the same shard (guaranteed by ShardBatchSampler).
+        This avoids 4096 individual .clone() calls per batch and uses a single tensor
+        slice instead, giving ~10x faster batch construction.
+
+        Falls back to stacking __getitem__ results if not in shard mode.
+        """
+        if not getattr(self, "_use_processed", False):
+            # Slow path: fall back to item-by-item
+            return reconv_collate([self[i] for i in indices])
+
+        # All indices are in the same shard — find it from the first index
+        shard_idx, local_0 = self._get_shard_for_idx(indices[0])
+        if shard_idx not in self._shard_cache:
+            self._ensure_shard_loaded(shard_idx)
+        data = self._shard_cache[shard_idx]
+
+        # Compute local indices (offset already subtracted by _get_shard_for_idx)
+        shard_offset = sum(self._shard_lens[:shard_idx])
+        local_idxs = [i - shard_offset for i in indices]
+
+        # Single slice per tensor — O(1) copy instead of O(batch_size) clones
+        paths_emb = data["paths_emb"][local_idxs].to(torch.float32)
+
+        # Pad feature dim to next multiple of 4 (same as reconv_collate) so the model's
+        # input_proj receives the expected width after gate-type embedding concatenation.
+        D_raw = paths_emb.shape[-1]
+        D_pad = D_raw if D_raw % 4 == 0 else ((D_raw // 4) + 1) * 4
+        if D_pad != D_raw:
+            pad = torch.zeros(*paths_emb.shape[:-1], D_pad - D_raw, dtype=paths_emb.dtype)
+            paths_emb = torch.cat([paths_emb, pad], dim=-1)
+        attn_mask = data["attn_mask"][local_idxs].clone()
+        node_ids = data["node_ids"][local_idxs].clone()
+        gate_types = (
+            data["gate_types"][local_idxs].clone()
+            if "gate_types" in data
+            else torch.full_like(node_ids, -1)
+        )
+        files = [data["files"][i] for i in local_idxs]
+
+        out: Dict[str, Any] = {
+            "paths_emb": paths_emb,
+            "attn_mask": attn_mask,
+            "node_ids": node_ids,
+            "gate_types": gate_types,
+            "files": files,
+        }
+
+        if "anchor_p" in data:
+            out["anchor_p"] = data["anchor_p"][local_idxs].clone()
+            out["anchor_l"] = data["anchor_l"][local_idxs].clone()
+            out["anchor_v"] = data["anchor_v"][local_idxs].clone()
+            out["solvability"] = data["solvability"][local_idxs].clone()
+
+        if self.inject_constraints and "constraint_mask" in data:
+            out["constraint_mask"] = data["constraint_mask"][local_idxs].clone()
+            out["constraint_vals"] = data["constraint_vals"][local_idxs].clone()
+
+        return out
 
     def _solve_sample_assignment(
         self, info: Dict[str, Any], file_path: str
