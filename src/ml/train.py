@@ -449,7 +449,7 @@ def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     optim: torch.optim.Optimizer,
-    scaler: object,
+    scaler: torch.amp.GradScaler,  # type: ignore[name-defined]
     device: torch.device,
     cfg: TrainConfig,
     epoch: int = 1,
@@ -965,7 +965,7 @@ def save_checkpoint(
     best: bool = False,
     epoch: int = 0,
     optim: Optional[torch.optim.Optimizer] = None,
-    scheduler: Optional[object] = None,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     scaler: Optional[object] = None,
     best_val: float = float("inf"),
 ) -> None:
