@@ -1,4 +1,25 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python.analysis.exclude": [
+        "**/processed_full/**",
+        "**/processed_50pct/**",
+        "**/fault_chunks/**",
+        "**/*.pt",
+        "**/*.pkl",
+        "**/*.pth",
+        "**/checkpoints/**"
+    ],
+    "files.watcherExclude": {
+        "**/processed_full/**": true,
+        "**/processed_50pct/**": true,
+        "**/fault_chunks/**": true,
+        "**/*.pt": true,
+        "**/*.pkl": true,
+        "**/checkpoints/**": true
+    },
+    "files.exclude": {
+        "**/*.pt": true,
+        "**/*.pkl": true
+    }
 }

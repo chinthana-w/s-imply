@@ -1262,10 +1262,10 @@ class ReconvergentPathsDataset(Dataset):
             buf.clear()
 
         total_in = sum(shard_lens) if shard_lens else 0
-        est_out = int(total_in * fraction) if total_in else "?"
+        est_out = f"{int(total_in * fraction):,}" if total_in else "?"
         print(
             f"Subsetting {len(all_shards)} shards at {fraction*100:.0f}% "
-            f"(~{est_out:,} samples) → {output_dir}"
+            f"(~{est_out} samples) → {output_dir}"
         )
 
         for shard_path in tqdm(all_shards, desc="Shards"):

@@ -700,6 +700,7 @@ def ai_podem(
     verbose: bool = False,
     seed: Optional[int] = None,
     no_fallback: bool = False,
+    max_backtracks: int = 5000,
 ) -> bool:
     """
     AI-Assisted PODEM with configurable modes.
@@ -775,7 +776,7 @@ def ai_podem(
                     fault,
                     total_gates,
                     backtrace_func=backtracer,
-                    max_backtracks=5000,
+                    max_backtracks=max_backtracks,
                 )
                 if result:
                     if verbose:
