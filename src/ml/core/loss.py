@@ -413,7 +413,6 @@ def reinforce_loss(
     anchor_alpha: float = 0.1,
     gumbel_temp: float = 1.0,
     lambda_solvability: float = 1.0,
-    lambda_constraint: float = 1.0,
 ) -> tuple[torch.Tensor, float, float, float, float]:
     """Compute Loss using Gumbel-Softmax for differentiable logic consistency.
 
@@ -437,23 +436,11 @@ def reinforce_loss(
         dim=-1
     )  # [B, P, L] - No grad flow through argmax usually, but OK here as we use one_hot for loss
 
-    # constraint_metrics
-    constraint_loss = torch.tensor(0.0, device=logits.device)
     constraint_violation_rate = torch.tensor(0.0, device=logits.device)
 
     # Enforce constraints if provided
     if constraint_mask is not None and constraint_vals is not None:
         if constraint_mask.any():
-            valid_constraints = constraint_mask.view(-1)
-            flat_logits = logits.view(-1, 2)
-            flat_targets = constraint_vals.view(-1)
-
-            # CE Loss on constrained nodes (Supervised)
-            c_loss = F.cross_entropy(
-                flat_logits[valid_constraints], flat_targets[valid_constraints]
-            )
-            constraint_loss = c_loss * lambda_constraint
-
             # Metric: Violation rate — must be computed BEFORE forcing, so it
             # reflects the model's actual (unforced) predictions.
             preds = actions[constraint_mask]
@@ -675,9 +662,14 @@ def reinforce_loss(
             sup_loss = F.cross_entropy(pred_logits, targets)
             loss_terms.append(sup_loss)
 
+    # 4b. Constraint CE Loss (forces model outputs to match circuit constraints)
+    if constraint_mask is not None and constraint_vals is not None and constraint_mask.any():
+        c_logits = logits[constraint_mask]
+        c_targets = constraint_vals[constraint_mask].long()
+        constraint_loss = F.cross_entropy(c_logits, c_targets)
+        loss_terms.append(constraint_loss * 5.0)
+
     # 5. Add accumulated auxiliary losses
-    if constraint_loss.requires_grad or constraint_loss.item() > 0:
-        loss_terms.append(constraint_loss)
     if solvability_loss.requires_grad or solvability_loss.item() > 0:
         loss_terms.append(solvability_loss)
 

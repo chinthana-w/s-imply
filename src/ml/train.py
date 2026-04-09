@@ -157,10 +157,6 @@ class TrainConfig:
     # Solvability head loss weight. Set to 0.0 to disable when UNSAT labels are absent.
     lambda_solvability: float = 1.0
 
-    # Constraint loss weight — increase (e.g. 5.0) to force the model to honour
-    # constraints even when they conflict with the soft-edge gate-logic loss.
-    lambda_constraint: float = 1.0
-
     # Cross-path shared-node consistency loss weight.
     # Penalises contradictory predictions for the same circuit node across paths.
     # Addresses the failure mode where a shared stem (e.g. a NAND gate on 3
@@ -536,7 +532,6 @@ def train_one_epoch(
                         normalize_reward=cfg.normalize_reward,
                         anchor_alpha=cfg.anchor_reward_alpha,
                         gumbel_temp=gumbel_t,
-                        lambda_constraint=cfg.lambda_constraint,
                         lambda_shared_node=cfg.lambda_shared_node,
                         lambda_solvability=cfg.lambda_solvability,
                     )
@@ -745,7 +740,6 @@ def evaluate(
                 normalize_reward=cfg.normalize_reward,
                 anchor_alpha=cfg.anchor_reward_alpha,
                 gumbel_temp=0.1,
-                lambda_constraint=cfg.lambda_constraint,
                 lambda_shared_node=cfg.lambda_shared_node,
                 lambda_solvability=cfg.lambda_solvability,
             )
@@ -864,7 +858,6 @@ def cmd_train(args: argparse.Namespace) -> None:
         max_paths=getattr(args, "max_paths", 200),
         pretrained=getattr(args, "pretrained", None),
         lambda_solvability=getattr(args, "lambda_solvability", 1.0),
-        lambda_constraint=getattr(args, "lambda_constraint", 1.0),
         lambda_shared_node=getattr(args, "lambda_shared_node", 1.0),
         oom_max_retries=getattr(args, "oom_max_retries", 3),
         oom_base_wait=getattr(args, "oom_base_wait", 2.0),
@@ -1322,7 +1315,7 @@ def build_argparser() -> argparse.ArgumentParser:
     t.add_argument(
         "--shard-cache-size",
         type=int,
-        default=25,
+        default=5,
         help="Number of shards to cache in memory per worker. Maximize this to fill RAM.",
     )
     t.add_argument(
@@ -1338,15 +1331,6 @@ def build_argparser() -> argparse.ArgumentParser:
         help=(
             "Weight for solvability head CE loss. Set to 0.0 when the dataset "
             "has no UNSAT samples to avoid the head overfitting to always-SAT."
-        ),
-    )
-    t.add_argument(
-        "--lambda-constraint",
-        type=float,
-        default=1.0,
-        help=(
-            "Weight for constraint CE loss term. Increase to 3–5 when c_viol "
-            "is stuck: the constraint signal must outweigh the soft-edge gate-logic loss."
         ),
     )
     t.add_argument(
