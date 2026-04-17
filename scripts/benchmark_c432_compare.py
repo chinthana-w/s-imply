@@ -7,7 +7,7 @@ import pandas as pd
 # Add root to sys.path
 sys.path.append(os.getcwd())
 
-from src.atpg.ai_podem import HierarchicalReconvSolver, ModelPairPredictor, ai_podem
+from src.atpg.ai_podem import AiPodemConfig, HierarchicalReconvSolver, ModelPairPredictor, ai_podem
 from src.atpg.logic_sim_three import reset_gates
 from src.atpg.podem import (
     get_all_faults,
@@ -34,7 +34,14 @@ def run_mode(bench_path, model_path, mode, faults, circuit, total_gates):
     if mode in ("ai_activation", "ai_all"):
         print(f"  [{mode}] Initializing AI Model...")
         try:
-            predictor = ModelPairPredictor(bench_path, model_path, circuit)
+            import torch
+            config = AiPodemConfig(
+                model_path=model_path,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                enable_ai_activation=(mode in ("ai_activation", "ai_all")),
+                enable_ai_propagation=(mode == "ai_all"),
+            )
+            predictor = ModelPairPredictor(circuit, bench_path, config)
             solver = HierarchicalReconvSolver(circuit, predictor)
         except Exception as e:
             print(f"  [ERROR] Failed to initialize AI: {e}")
@@ -43,7 +50,6 @@ def run_mode(bench_path, model_path, mode, faults, circuit, total_gates):
     for i, fault in enumerate(faults):
         # Reset per fault
         reset_gates(circuit, total_gates)
-        reset_statistics()
         # Initialize calculates distance maps. Costly?
         # For vanilla, we did it once per circuit.
         # But `podem` might modify structures?
@@ -76,6 +82,7 @@ def run_mode(bench_path, model_path, mode, faults, circuit, total_gates):
                     enable_ai_propagation=False,
                     predictor=predictor,
                     solver=solver,
+                    no_fallback=True,
                 )
             elif mode == "ai_all":
                 detected = ai_podem(
@@ -88,6 +95,7 @@ def run_mode(bench_path, model_path, mode, faults, circuit, total_gates):
                     enable_ai_propagation=True,
                     predictor=predictor,
                     solver=solver,
+                    no_fallback=True,
                 )
         except Exception as e:
             print(f"  [Error] Fault {i} ({fault}): {e}")
@@ -111,14 +119,14 @@ def run_mode(bench_path, model_path, mode, faults, circuit, total_gates):
 
 
 def main():
-    bench_path = "data/bench/ISCAS85/c432.bench"
-    model_path = "checkpoints/reconv_optimized/best_model.pth"
+    bench_path = "data/bench/ISCAS85/c1908.bench"
+    model_path = "checkpoints/supervised_v5/best_model.pth"
 
     if not os.path.exists(model_path):
         print(f"Model not found at {model_path}, trying minimal model...")
         model_path = "checkpoints/reconv_minimal_model.pt"
 
-    print("Benchmarking c432.bench")
+    print(f"Benchmarking {os.path.basename(bench_path)}")
     print(f"Model: {model_path}")
 
     circuit, total_gates = parse_bench_file(bench_path)

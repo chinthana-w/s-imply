@@ -803,7 +803,7 @@ def ai_podem(
             fault,
             total_gates,
             backtrace_func=backtracer,
-            max_backtracks=100000,
+            max_backtracks=2000,
         )
         if result:
             if verbose:
@@ -821,7 +821,7 @@ def ai_podem(
         reset_gates(circuit, total_gates)
 
         result_retry = mogu_podem_wrapper(
-            circuit, fault, total_gates, backtrace_func=None, max_backtracks=100000
+            circuit, fault, total_gates, backtrace_func=None, max_backtracks=2000
         )
         if result_retry:
             if verbose:
@@ -834,7 +834,7 @@ def ai_podem(
     return False
 
 
-def mogu_podem_wrapper(circuit, fault, total_gates, backtrace_func=None, max_backtracks=100000):
+def mogu_podem_wrapper(circuit, fault, total_gates, backtrace_func=None, max_backtracks=2000):
     # Wrapper to call the global `podem` function from src.atpg.podem
     return podem(
         circuit,

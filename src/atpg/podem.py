@@ -138,7 +138,7 @@ def podem(
     total_gates: int,
     backtrace_func: Optional[Callable] = None,
     timeout: float = float("inf"),
-    max_backtracks: int = 100000,
+    max_backtracks: int = 2000,
 ) -> bool:
     """Entry point for PODEM algorithm."""
     global \
@@ -230,6 +230,8 @@ def podem_recursion(circuit: List[Gate], total_gates: int, fault: Fault) -> int:
         podem_max_backtracks, \
         topological_order, \
         backtrace_function
+    if depth > 5000:
+        return BACKTRACK_LIMIT
     depth += 1
     total_recursive_calls += 1
 

@@ -7,7 +7,7 @@ import pandas as pd
 # Add root to sys.path
 sys.path.append(os.getcwd())
 
-from src.atpg.ai_podem import HierarchicalReconvSolver, ModelPairPredictor, ai_podem
+from src.atpg.ai_podem import AiPodemConfig, HierarchicalReconvSolver, ModelPairPredictor, ai_podem
 from src.atpg.logic_sim_three import reset_gates
 from src.atpg.podem import (
     get_all_faults,
@@ -38,7 +38,14 @@ def run_benchmark(bench_path: str, model_path: str, mode: str = "vanilla", limit
     solver = None
     if mode in ("ai_activation", "ai_all"):
         print(f"  [{mode}] Initializing AI Model/Predictor/Solver...")
-        predictor = ModelPairPredictor(bench_path, model_path, circuit)
+        import torch
+        config = AiPodemConfig(
+            model_path=model_path,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            enable_ai_activation=(mode in ("ai_activation", "ai_all")),
+            enable_ai_propagation=(mode == "ai_all"),
+        )
+        predictor = ModelPairPredictor(circuit, bench_path, config)
         solver = HierarchicalReconvSolver(circuit, predictor)
 
     reset_statistics()
@@ -105,7 +112,7 @@ def run_benchmark(bench_path: str, model_path: str, mode: str = "vanilla", limit
 
 def main():
     # Use best model
-    model_path = "checkpoints/reconv_optimized/best_model.pth"
+    model_path = "checkpoints/supervised_v5/best_model.pth"
     if not os.path.exists(model_path):
         model_path = "checkpoints/reconv_minimal_model.pt"
 
