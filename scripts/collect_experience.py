@@ -1,22 +1,26 @@
-import gc
+import sys
 import os
+
+# Ensure project root is on PYTHONPATH for script-style execution
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import gc
 import random
 import resource
-import sys
 from typing import List
 
 import psutil
 import torch
 from tqdm import tqdm
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-
-from src.atpg.ai_podem import ModelPairPredictor, ai_podem
-from src.atpg.logic_sim_three import reset_gates
-from src.atpg.podem import get_all_faults, get_statistics, reset_statistics
-from src.atpg.recursive_reconv_solver import HierarchicalReconvSolver
-from src.ml.rl.rl_recorder import ExperienceRecorder
-from src.util.io import parse_bench_file
+# Local package imports (may require modified PYTHONPATH when running as script)
+# noqa: E402 - imports are intentionally after sys.path modification
+from src.atpg.ai_podem import ModelPairPredictor, ai_podem  # noqa: E402
+from src.atpg.logic_sim_three import reset_gates  # noqa: E402
+from src.atpg.podem import get_all_faults, get_statistics, reset_statistics  # noqa: E402
+from src.atpg.recursive_reconv_solver import HierarchicalReconvSolver  # noqa: E402
+from src.ml.rl.rl_recorder import ExperienceRecorder  # noqa: E402
+from src.util.io import parse_bench_file  # noqa: E402
 
 # Increase recursion limit and stack size for deep circuit solving
 sys.setrecursionlimit(100000)

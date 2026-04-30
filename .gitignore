@@ -214,3 +214,5 @@ checkpoints/
 # claude
 .claude/.nfs*
 .claude/**/.nfs*
+.codex
+.vscode/settings.json
