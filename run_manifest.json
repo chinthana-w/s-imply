@@ -1,0 +1,17 @@
+{
+  "job_type": "eval",
+  "target_script": "src.ml.train",
+  "args": [
+    "train",
+    "--dataset", "data/datasets/reconv_dataset.pkl",
+    "--output", "checkpoints/test_run",
+    "--epochs", "1",
+    "--pretrained", "checkpoints/supervised_v5/best_model.pth",
+    "--lambda-supervised-node", "1.0"
+  ],
+  "environment": "deepgate",
+  "hardware": {
+    "gpus": 1,
+    "vram_gb": 16
+  }
+}

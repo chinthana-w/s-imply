@@ -4,16 +4,19 @@ Diagnostic: verify the three fixes applied:
   2. Solvability loss weights now [1.0, 10.0] (UNSAT upweighted)
   3. Model predictions now differ meaningfully when constraints are applied
 """
-import sys, io, contextlib
+import contextlib
+import io
+import sys
+
 sys.path.insert(0, ".")
 
 import torch
 import torch.nn.functional as F
 
+from src.atpg.ai_podem import AiPodemConfig, HierarchicalReconvSolver, ModelPairPredictor
+from src.ml.core.loss import calculate_shared_node_consistency_loss, reinforce_loss
 from src.util.io import parse_bench_file
-from src.atpg.ai_podem import ModelPairPredictor, AiPodemConfig, HierarchicalReconvSolver
 from src.util.struct import GateType, LogicValue
-from src.ml.core.loss import reinforce_loss, calculate_shared_node_consistency_loss
 
 BENCH = "data/bench/ISCAS85/c432.bench"
 MODEL = "checkpoints/supervised_v3/best_model.pth"
@@ -178,7 +181,7 @@ loss_correct_unsat = F.cross_entropy(unsat_logits, unsat_label, weight=w_fixed).
 loss_wrong_sat     = F.cross_entropy(unsat_logits, sat_label,   weight=w_fixed).item()
 loss_wrong_unsat   = F.cross_entropy(sat_logits,   unsat_label, weight=w_fixed).item()
 
-print(f"\nWith FIXED weights [1.0, 10.0]:")
+print("\nWith FIXED weights [1.0, 10.0]:")
 print(f"  Correct SAT prediction loss:    {loss_correct_sat:.4f}")
 print(f"  Correct UNSAT prediction loss:  {loss_correct_unsat:.4f}")
 print(f"  Wrong prediction on SAT sample: {loss_wrong_sat:.4f}")
@@ -262,7 +265,7 @@ shared_loss = calculate_shared_node_consistency_loss(
     probs=probs_synth,
     mask_valid=mask_synth,
 )
-print(f"\nSynthetic contradiction (node 213: path0=1, path1=0):")
+print("\nSynthetic contradiction (node 213: path0=1, path1=0):")
 print(f"  Shared-node consistency loss = {shared_loss.item():.4f}  (should be > 0)")
 print(f"  {'PENALIZES CONTRADICTION ✓' if shared_loss.item() > 0 else 'BUG: no penalty ✗'}")
 
@@ -277,7 +280,7 @@ shared_loss_ok = calculate_shared_node_consistency_loss(
     probs=probs_consist,
     mask_valid=mask_synth,
 )
-print(f"\nConsistent case (node 213: both paths=1):")
+print("\nConsistent case (node 213: both paths=1):")
 print(f"  Shared-node consistency loss = {shared_loss_ok.item():.4f}  (should be 0)")
 print(f"  {'NO PENALTY ✓' if shared_loss_ok.item() == 0 else 'BUG: unexpected penalty ✗'}")
 

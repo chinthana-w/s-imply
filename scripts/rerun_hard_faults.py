@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+
 import pandas as pd
 import torch
 
@@ -19,6 +20,7 @@ from src.atpg.podem import (
     simple_backtrace,
 )
 from src.util.io import parse_bench_file
+
 
 def main():
     bench_path = "data/bench/ISCAS85/c1908.bench"

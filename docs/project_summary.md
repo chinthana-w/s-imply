@@ -236,6 +236,42 @@ fault/pattern trace supervision:
     with deterministic multi-candidate decoding, so repeated runs are
     reproducible while still checking multiple candidate patterns per logic cone.
 
+### H. Multi-Agent Orchestration Workflow
+**Timestamp: 2026-05-04**
+Added a coordinator-first multi-agent workflow scaffold:
+-   **Coordinator Package**: `src/orchestration/` defines specialist routing for
+    ATPG, ML training, benchmark/result analysis, docs, theory, and review work.
+-   **Allowlisted Tools**: Local helpers summarize benchmark CSV/JSON artifacts,
+    inspect checkpoint configs, dry-run focused tests and small benchmarks, and
+    validate result claims with artifact provenance.
+-   **LangGraph Hook**: `src/orchestration/langgraph_app.py` exposes an optional
+    minimal graph wrapper while keeping LangGraph out of the required import path.
+-   **Theory Documentation Gate**: `.agent/rules/theory-doc-sync.md` and the
+    orchestration tool `check_theory_doc_sync` require `docs/paper_draft.tex`
+    updates whenever theoretical-framework changes are made.
+-   **Notion Canonical Docs**: The Docs/Results agent treats the Notion page
+    "Back Implication Prediction using Attention" as the canonical method/results
+    page and records experiment steps as dated log entries with commands,
+    artifacts, results, and next steps.
+
+### I. Persistent Orchestration Runner
+**Timestamp: 2026-05-04**
+Extended the orchestration scaffold into a persistent runner workflow:
+-   **Run Ledger**: `python -m src.orchestration.cli dispatch ...` creates a
+    `runs/orchestration/<run_id>/` ledger with `state.json`, `task_packet.json`,
+    `agent_prompt.md`, `events.jsonl`, and `run_manifest.json` when required.
+-   **Progress Tracking**: `status`, `list`, `prompt`, `checkpoint`, `complete`,
+    and `fail` commands let agents and human operators track ownership,
+    validation, blockers, artifacts, and final outcomes.
+-   **Agent Handoff**: Each run includes a generated prompt that tells the
+    assigned specialist agent its owner role, constraints, expected artifacts,
+    validation plan, and exact commands for checkpointing and closing the run.
+-   **Automated Launch Layer**: `launch` executes one queued run through
+    `codex exec` by default, captures `agent_stdout.log` and `agent_stderr.log`,
+    and records terminal status from the command exit code. `worker` drains queued
+    runs oldest first using the same launch path, with `S_IMPLY_AGENT_CMD` or
+    `--agent-cmd` available for swapping agent runtimes.
+
 ## 7. Current Challenges & Roadmap
 -   **Handling "Don't Cares" (X)**: The current model predicts binary 0/1. Integrating explicit X prediction or X-tolerance in the loss function is an ongoing area of research.
 -   **Complex Reconvergence**: Scaling from pair-wise paths to N-ary reconvergent structures.

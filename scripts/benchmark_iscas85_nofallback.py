@@ -41,7 +41,6 @@ from src.atpg.podem import (
     simple_backtrace,
 )
 from src.util.io import parse_bench_file
-from src.util.struct import LogicValue
 
 
 def benchmark_circuit(bench_path: str, model_path: str, device: str, max_backtracks: int = 5000) -> dict:
@@ -182,7 +181,7 @@ def write_report(results: list[dict], model_path: str, report_path: str) -> None
     lines.append("")
     lines.append(f"**Model:** `{model_path}`  ")
     lines.append(f"**Date:** {datetime.date.today()}  ")
-    lines.append(f"**Mode:** no-fallback (AI-only, no vanilla retry)  ")
+    lines.append("**Mode:** no-fallback (AI-only, no vanilla retry)  ")
     lines.append(f"**Max backtracks per attempt:** {results[0].get('max_backtracks', 500)}  ")
     lines.append("")
     lines.append("## Summary")

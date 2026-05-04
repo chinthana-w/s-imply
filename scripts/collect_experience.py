@@ -1,5 +1,5 @@
-import sys
 import os
+import sys
 
 # Ensure project root is on PYTHONPATH for script-style execution
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
