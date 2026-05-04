@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import psutil
 import torch
 import torch.nn.functional as F
+from torch import GradScaler
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -443,7 +444,7 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     # Create scaler once so its scale history persists across epochs.
-    scaler = torch.amp.GradScaler("cuda", enabled=config.amp)
+    scaler = GradScaler("cuda", enabled=config.amp)
 
     # Training loop
     best_loss = float("inf")

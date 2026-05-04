@@ -29,7 +29,7 @@ from typing import Optional, Tuple
 
 import psutil
 import torch
-from torch import nn
+from torch import GradScaler, nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -58,10 +58,14 @@ def _shuffle_paths_training_batch(
     anchor_p: Optional[torch.Tensor] = None,
     constraint_mask: Optional[torch.Tensor] = None,
     constraint_vals: Optional[torch.Tensor] = None,
+    label_mask: Optional[torch.Tensor] = None,
+    label_vals: Optional[torch.Tensor] = None,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
     Optional[torch.Tensor],
     Optional[torch.Tensor],
     Optional[torch.Tensor],
@@ -87,13 +91,29 @@ def _shuffle_paths_training_batch(
     if constraint_vals is not None:
         constraint_vals = torch.gather(constraint_vals, dim=1, index=gather_pl)
 
+    if label_mask is not None:
+        label_mask = torch.gather(label_mask, dim=1, index=gather_pl)
+
+    if label_vals is not None:
+        label_vals = torch.gather(label_vals, dim=1, index=gather_pl)
+
     if anchor_p is not None:
         inverse_perm = torch.argsort(perm, dim=1)
         valid_anchor = anchor_p >= 0
         mapped_anchor = inverse_perm.gather(1, anchor_p.clamp(min=0).unsqueeze(1)).squeeze(1)
         anchor_p = torch.where(valid_anchor, mapped_anchor, anchor_p)
 
-    return paths, masks, node_ids, gate_types, anchor_p, constraint_mask, constraint_vals
+    return (
+        paths,
+        masks,
+        node_ids,
+        gate_types,
+        anchor_p,
+        constraint_mask,
+        constraint_vals,
+        label_mask,
+        label_vals,
+    )
 
 
 @dataclass
@@ -162,6 +182,7 @@ class TrainConfig:
     # Addresses the failure mode where a shared stem (e.g. a NAND gate on 3
     # paths) gets different predicted values on different paths.
     lambda_shared_node: float = 1.0
+    lambda_supervised_node: float = 2.0
 
     # CUDA OOM recovery: exponential backoff retry settings.
     oom_max_retries: int = 3   # number of retry attempts before skipping a batch
@@ -367,7 +388,7 @@ def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     optim: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,  # type: ignore[name-defined]
+    scaler: GradScaler,
     device: torch.device,
     cfg: TrainConfig,
     epoch: int = 1,
@@ -419,6 +440,16 @@ def train_one_epoch(
             if "constraint_vals" in batch
             else None
         )
+        label_mask = (
+            batch["label_mask"].to(device, non_blocking=True)
+            if "label_mask" in batch
+            else None
+        )
+        label_vals = (
+            batch["label_vals"].to(device, non_blocking=True)
+            if "label_vals" in batch
+            else None
+        )
 
         # Resolve gate types before shuffling so all per-path tensors can be shuffled together.
         if "gate_types" in batch:
@@ -440,6 +471,8 @@ def train_one_epoch(
             batch_anchor_p,
             c_mask,
             c_vals,
+            label_mask,
+            label_vals,
         ) = _shuffle_paths_training_batch(
             paths=paths,
             masks=masks,
@@ -448,6 +481,8 @@ def train_one_epoch(
             anchor_p=batch_anchor_p,
             constraint_mask=c_mask,
             constraint_vals=c_vals,
+            label_mask=label_mask,
+            label_vals=label_vals,
         )
         if gtypes is None:
             raise RuntimeError("Gate types must be available during training.")
@@ -525,6 +560,8 @@ def train_one_epoch(
                         entropy_beta=cfg.entropy_beta,
                         constraint_mask=c_mask,
                         constraint_vals=c_vals,
+                        label_mask=label_mask,
+                        label_vals=label_vals,
                         node_ids=node_ids,
                         lambda_logic=cfg.lambda_logic,
                         lambda_full_logic=cfg.lambda_full_logic,
@@ -533,6 +570,7 @@ def train_one_epoch(
                         anchor_alpha=cfg.anchor_reward_alpha,
                         gumbel_temp=gumbel_t,
                         lambda_shared_node=cfg.lambda_shared_node,
+                        lambda_supervised_node=cfg.lambda_supervised_node,
                         lambda_solvability=cfg.lambda_solvability,
                     )
 
@@ -681,6 +719,8 @@ def evaluate(
 
         c_mask = batch["constraint_mask"].to(device) if "constraint_mask" in batch else None
         c_vals = batch["constraint_vals"].to(device) if "constraint_vals" in batch else None
+        label_mask = batch["label_mask"].to(device) if "label_mask" in batch else None
+        label_vals = batch["label_vals"].to(device) if "label_vals" in batch else None
 
         # Extract anchor early so constraint building can use circuit-consistent values.
         if "anchor_p" in batch:
@@ -733,6 +773,8 @@ def evaluate(
                 entropy_beta=cfg.entropy_beta,
                 constraint_mask=c_mask,
                 constraint_vals=c_vals,
+                label_mask=label_mask,
+                label_vals=label_vals,
                 node_ids=node_ids,
                 lambda_logic=cfg.lambda_logic,
                 lambda_full_logic=cfg.lambda_full_logic,
@@ -741,6 +783,7 @@ def evaluate(
                 anchor_alpha=cfg.anchor_reward_alpha,
                 gumbel_temp=0.1,
                 lambda_shared_node=cfg.lambda_shared_node,
+                lambda_supervised_node=cfg.lambda_supervised_node,
                 lambda_solvability=cfg.lambda_solvability,
             )
 
@@ -795,8 +838,8 @@ def save_checkpoint(
     best: bool = False,
     epoch: int = 0,
     optim: Optional[torch.optim.Optimizer] = None,
-    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-    scaler: Optional[object] = None,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    scaler: Optional[GradScaler] = None,
     best_val: float = float("inf"),
 ) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -859,6 +902,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         pretrained=getattr(args, "pretrained", None),
         lambda_solvability=getattr(args, "lambda_solvability", 1.0),
         lambda_shared_node=getattr(args, "lambda_shared_node", 1.0),
+        lambda_supervised_node=getattr(args, "lambda_supervised_node", 2.0),
         oom_max_retries=getattr(args, "oom_max_retries", 3),
         oom_base_wait=getattr(args, "oom_base_wait", 2.0),
         resume=getattr(args, "resume", False),
@@ -911,6 +955,7 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     elapsed = time.time() - start_time
     print(f"Dimensions probed in {elapsed:.4f}s. Observed dim: {observed_dim}")
+    cfg.embedding_dim = observed_dim
     if cfg.verbose:
         print(f"Observed embedding dimension from batch: {observed_dim}")
         print(f"Number of attention heads: {nhead}")
@@ -982,7 +1027,7 @@ def cmd_train(args: argparse.Namespace) -> None:
             print(f"Warning: Failed to load weights: {e}")
 
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
-    scaler = torch.amp.GradScaler('cuda', enabled=cfg.amp)  # type: ignore[attr-defined]
+    scaler = GradScaler("cuda", enabled=cfg.amp)
 
     # Cosine LR scheduler with linear warmup
     warmup_epochs = min(3, cfg.epochs // 4)
@@ -1342,6 +1387,15 @@ def build_argparser() -> argparse.ArgumentParser:
             "for predicting different values for the same circuit node across paths "
             "(shared stem contradiction). Increase to 2–5 when the solver frequently "
             "rejects model predictions due to cross-path logic violations."
+        ),
+    )
+    t.add_argument(
+        "--lambda-supervised-node",
+        type=float,
+        default=2.0,
+        help=(
+            "Weight for per-node cross-entropy over SAT labels stored in the dataset. "
+            "UNSAT samples are automatically excluded from this term."
         ),
     )
     t.add_argument(

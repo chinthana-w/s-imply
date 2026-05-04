@@ -65,6 +65,9 @@ class AiPodemConfig:
     enable_ai_propagation: bool = True
     verbose: bool = False
     no_fallback: bool = False  # If True, never fall back to classic backtrace/PODEM
+    candidate_count: int = 8
+    candidate_seed_base: int = 20260504
+    candidate_temperature: float = 0.7
 
 
 class AIBacktracer:
@@ -115,10 +118,13 @@ class AIBacktracer:
                 if g.val in (LogicValue.ZERO, LogicValue.ONE):
                     current_constraints[i] = g.val
 
-            # Generate random seed based on timestamp
-            import time
+            import hashlib
 
-            current_seed = int(time.time() * 1000) % 10000000
+            seed_material = (
+                f"{objective.gate_id}:{int(objective.value)}:"
+                f"{sorted((int(k), int(v)) for k, v in current_constraints.items())}"
+            )
+            current_seed = int(hashlib.sha256(seed_material.encode()).hexdigest()[:8], 16)
             if self.verbose:
                 print(f"  [AI-BT] Constraints: {current_constraints}, Seed: {current_seed}")
 
@@ -268,22 +274,28 @@ class ModelPairPredictor(ReconvPairPredictor):
         self.solver = PathConsistencySolver(circuit)
 
     def _load_model(self, model_path: str):
-        # Infer dimensions from embeddings if possible, or use defaults matching
-        # train_reconv.py
-        input_dim = 132  # 128 struct + 4 logic
-        model = MultiPathTransformer(
-            input_dim=input_dim,
-            model_dim=512,
-            nhead=4,
-            num_encoder_layers=3,
-            num_interaction_layers=3,
-            dim_feedforward=512,  # Match training default
-        ).to(self.device)
-
         if os.path.exists(model_path):
             try:
-                # Assuming model checkpoint is full state dict
                 checkpoint = torch.load(model_path, map_location=self.device)
+                cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+                input_dim = int(
+                    cfg.get("input_dim", cfg.get("observed_dim", cfg.get("embedding_dim", 132)))
+                )
+                if input_dim < 132:
+                    input_dim = 132
+                model_dim = int(cfg.get("model_dim", 512))
+                nhead = int(cfg.get("nhead", 4))
+                enc_layers = int(cfg.get("num_encoder_layers", cfg.get("enc_layers", 3)))
+                int_layers = int(cfg.get("num_interaction_layers", cfg.get("int_layers", 3)))
+                ffn_dim = int(cfg.get("dim_feedforward", cfg.get("ffn_dim", 512)))
+                model = MultiPathTransformer(
+                    input_dim=input_dim,
+                    model_dim=model_dim,
+                    nhead=nhead,
+                    num_encoder_layers=enc_layers,
+                    num_interaction_layers=int_layers,
+                    dim_feedforward=ffn_dim,
+                ).to(self.device)
                 if "model_state_dict" in checkpoint:
                     model.load_state_dict(checkpoint["model_state_dict"])
                 elif "state_dict" in checkpoint:
@@ -291,11 +303,21 @@ class ModelPairPredictor(ReconvPairPredictor):
                 else:
                     model.load_state_dict(checkpoint)
                 model.eval()
+                return model
             except Exception as e:
                 print(f"[AI-PODEM] Failed to load model weights: {e}")
         else:
             print(f"[AI-PODEM] Model path not found: {model_path}. Using random weights.")
 
+        model = MultiPathTransformer(
+            input_dim=132,
+            model_dim=512,
+            nhead=4,
+            num_encoder_layers=3,
+            num_interaction_layers=3,
+            dim_feedforward=512,
+        ).to(self.device)
+        model.eval()
         return model
 
     def predict(
@@ -311,7 +333,8 @@ class ModelPairPredictor(ReconvPairPredictor):
         relevant_constraints = frozenset(
             (nid, val) for nid, val in constraints.items() if nid in path_nodes
         )
-        cache_key = (pair_info["start"], pair_info["reconv"], relevant_constraints)
+        cache_seed = int(seed if seed is not None else self.config.candidate_seed_base)
+        cache_key = (pair_info["start"], pair_info["reconv"], relevant_constraints, cache_seed)
 
         if len(self.prediction_cache) > 500:
             self.prediction_cache.clear()
@@ -484,55 +507,69 @@ class ModelPairPredictor(ReconvPairPredictor):
                 perturb_scale=perturb_scale,
             )
 
-        # 3. Decode Logits
-        # Output is strictly binary (0 or 1) logits [B, P, L, 2]
+        # 3. Decode deterministic candidate set.
         probs = torch.softmax(logits, dim=-1)  # [1, P, L, 2]
-        vals = torch.argmax(probs, dim=-1).squeeze(0)  # [P, L] -> 0 or 1
         solv_probs = torch.softmax(solv_logits, dim=-1).squeeze(0)
 
-        # 4. Post-process: enforce NOT/BUFF deterministic gate rules
-        # (This remains valid for 0/1 predictions)
-        vals = post_process_logic_gates(
-            vals,
-            batch_types.squeeze(0),  # [P, L]
-            batch_mask.squeeze(0),  # [P, L]
-            constraints=constraints,
-            node_ids=batch_ids.squeeze(0),  # [P, L]
-        )
+        candidate_vals = []
+        candidate_vals.append(torch.argmax(probs, dim=-1).squeeze(0))
+        n_candidates = max(1, int(self.config.candidate_count))
+        if n_candidates > 1:
+            temp = max(1e-3, float(self.config.candidate_temperature))
+            sample_probs = torch.softmax(logits / temp, dim=-1).squeeze(0).detach().cpu()
+            flat_probs = sample_probs.reshape(-1, 2)
+            for cidx in range(1, n_candidates):
+                gen = torch.Generator(device="cpu")
+                gen.manual_seed(cache_seed + cidx)
+                sampled = torch.multinomial(flat_probs, 1, generator=gen).reshape(
+                    len(paths), max_len
+                )
+                candidate_vals.append(sampled.to(self.device))
 
-        predicted_assignment = {}
-        # Track per-node confidence for conflict resolution
-        node_confidence = {}  # nid -> float (prob of chosen class)
+        candidate_assignments = []
+        seen_assignments = set()
+        for vals in candidate_vals:
+            vals = post_process_logic_gates(
+                vals,
+                batch_types.squeeze(0),
+                batch_mask.squeeze(0),
+                constraints=constraints,
+                node_ids=batch_ids.squeeze(0),
+            )
+            predicted_assignment = {}
+            node_confidence = {}
 
-        for i, p in enumerate(paths):
-            for j, nid in enumerate(p):
-                if j >= len(p):
-                    continue
-                val = int(vals[i, j].item())
-                lv = LogicValue.ZERO if val == 0 else LogicValue.ONE
-                conf = float(probs[0, i, j, val].item())
+            for i, p in enumerate(paths):
+                for j, nid in enumerate(p):
+                    if j >= len(p):
+                        continue
+                    val = int(vals[i, j].item())
+                    lv = LogicValue.ZERO if val == 0 else LogicValue.ONE
+                    conf = float(probs[0, i, j, val].item())
 
-                # Constraints always override model
-                if nid in constraints:
-                    lv = constraints[nid]
-                    conf = 1.0  # Constraints are absolute
+                    if nid in constraints:
+                        lv = constraints[nid]
+                        conf = 1.0
 
-                # Resolve cross-path conflicts: keep highest confidence
-                if nid in predicted_assignment:
-                    if predicted_assignment[nid] != lv:
+                    if nid in predicted_assignment and predicted_assignment[nid] != lv:
                         prev_conf = node_confidence.get(nid, 0.0)
                         if conf <= prev_conf:
-                            continue  # Keep previous (higher confidence)
+                            continue
 
-                predicted_assignment[nid] = lv
-                node_confidence[nid] = conf
+                    predicted_assignment[nid] = lv
+                    node_confidence[nid] = conf
+
+            signature = tuple(sorted((int(k), int(v)) for k, v in predicted_assignment.items()))
+            if signature not in seen_assignments:
+                seen_assignments.add(signature)
+                candidate_assignments.append(predicted_assignment)
 
         res = self._rank_solutions_with_model(
             pair_info,
             constraints,
             probs,
             paths,
-            predicted_assignment,
+            candidate_assignments,
             inputs_snapshot,
             bench_file=self.circuit_path,
         )
@@ -543,7 +580,8 @@ class ModelPairPredictor(ReconvPairPredictor):
                 f"{[round(float(prob), 4) for prob in solv_probs.tolist()]}"
             )
             print(
-                f"[AI-MODEL] Raw prediction: {_format_assignment(predicted_assignment)}"
+                f"[AI-MODEL] Raw candidates: "
+                f"{[_format_assignment(c) for c in candidate_assignments[:3]]}"
             )
             print(
                 f"[AI-MODEL] Ranked candidates: "
@@ -558,33 +596,49 @@ class ModelPairPredictor(ReconvPairPredictor):
         constraints,
         probs,
         paths,
-        predicted_assignment,
+        predicted_assignments,
         inputs_snapshot,
         bench_file="",
     ):
-        violations = self._verify_assignment_logic(predicted_assignment, constraints)
-        if self.config.verbose:
-            print(
-                f"[AI-MODEL] Logic verification for {_format_pair(pair_info)}: "
-                f"violations={violations}"
+        ranked = []
+        rejected = 0
+        for assignment in predicted_assignments:
+            violations = self._verify_assignment_logic(assignment, constraints)
+            if violations > 0:
+                rejected += 1
+                continue
+            # Prefer compact assignments that satisfy more visible constraints and
+            # introduce fewer internal commitments for PODEM to justify.
+            n_internal = sum(
+                1
+                for gid in assignment
+                if gid < len(self.circuit) and self.circuit[gid].type != GateType.INPT
             )
+            ranked.append((n_internal, assignment))
 
-        # Always return model prediction as first candidate.
-        # The HierarchicalReconvSolver._solve_recursive does its own
-        # consistency checks, so let it decide whether to accept.
-        candidates = [predicted_assignment]
+        ranked.sort(key=lambda x: x[0])
+        candidates = [assignment for _, assignment in ranked]
 
-        # If model prediction has violations, also add fallback as backup
-        if violations > 0:
+        if not candidates and not self.config.no_fallback:
             fallback, _ = self._fallback_solve(pair_info, constraints)
             candidates.extend(fallback)
             if self.config.verbose:
                 print(
-                    f"[AI-MODEL] Added {len(fallback)} fallback candidates for "
-                    f"{_format_pair(pair_info)}"
+                    f"[AI-MODEL] Rejected {rejected} model candidate(s); added "
+                    f"{len(fallback)} fallback candidates for {_format_pair(pair_info)}"
                 )
+        elif not candidates and self.config.verbose:
+            print(
+                f"[AI-MODEL] Rejected {rejected} model candidate(s); "
+                f"fallback disabled for {_format_pair(pair_info)}"
+            )
+        elif self.config.verbose:
+            print(
+                f"[AI-MODEL] Accepted {len(candidates)} model candidate(s), "
+                f"rejected {rejected} for {_format_pair(pair_info)}"
+            )
 
-        return candidates[:10], inputs_snapshot
+        return candidates[: max(1, int(self.config.candidate_count))], inputs_snapshot
 
     def _verify_assignment_logic(
         self, assignment: Dict[int, LogicValue], constraints: Dict[int, LogicValue] = None
@@ -727,9 +781,12 @@ def ai_podem(
                     device="cuda" if torch.cuda.is_available() else "cpu",
                     enable_ai_activation=enable_ai_activation,
                     enable_ai_propagation=enable_ai_propagation,
+                    no_fallback=no_fallback,
                 )
                 predictor = ModelPairPredictor(circuit, circuit_path, config)
             solver = HierarchicalReconvSolver(circuit, predictor)
+        if predictor is not None:
+            predictor.config.no_fallback = no_fallback
 
     # --- Step 1 & 2: AI Justification (Activation) + Hybrid PODEM ---
     result = False

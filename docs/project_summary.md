@@ -215,6 +215,27 @@ Initiated comprehensive RL training rerun and stabilized the PODEM core:
 -   **Reconvergent Pair Cache**: Added `reconv_cache.py` to persist pair topology to disk, eliminating repeated BFS traversals on subsequent collection passes.
 -   **Goal**: Improve the model's ability to handle complex reconvergence in sequential-like structures (ISCAS89) and further reduce `✗ Convergence Path Invalid` failures observed in dense combinational logic (`c1908`).
 
+### G. ISCAS Training / ITC99 Gate Split
+**Timestamp: 2026-05-04**
+Updated the training workflow to keep ITC99 fully held out while improving
+fault/pattern trace supervision:
+-   **Training Data**: `build_fault_dataset.py` now records compact fault,
+    pattern, and path-pair provenance for ISCAS85/89 samples, supports capped
+    patterns per fault, and can add corrupted-constraint UNSAT local queries.
+-   **Shard Format**: Processed shards now preserve per-node SAT label masks,
+    constraint tensors, solvability labels using `0=SAT, 1=UNSAT`, and compact
+    fault/pattern/sample IDs without duplicating circuit objects.
+-   **Training Loss**: `src/ml/core/loss.py` adds supervised per-node CE for SAT
+    labels while excluding UNSAT samples from node supervision; physics losses
+    remain auxiliary.
+-   **Held-Out Gate**: `scripts/select_itc99_gate_faults.py` materializes a
+    deterministic 10% subset of ITC99 `b17.bench` (6,445 / 64,458 faults), and
+    `scripts/benchmark_itc99_gate.py` benchmarks checkpoints against that gate
+    before any full ITC99 run.
+-   **Inference Diversity**: `ModelPairPredictor` replaces timestamp randomness
+    with deterministic multi-candidate decoding, so repeated runs are
+    reproducible while still checking multiple candidate patterns per logic cone.
+
 ## 7. Current Challenges & Roadmap
 -   **Handling "Don't Cares" (X)**: The current model predicts binary 0/1. Integrating explicit X prediction or X-tolerance in the loss function is an ongoing area of research.
 -   **Complex Reconvergence**: Scaling from pair-wise paths to N-ary reconvergent structures.

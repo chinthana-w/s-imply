@@ -36,7 +36,12 @@ Output pickle format (list of dicts, one per sample)
         },
         "constraints":  {node_id: 0|1},     # pre-solved nodes visible to this pair
         "labels":       {node_id: 0|1},     # ground-truth for every path node
-        "solvability":  1,                  # always 1 (SAT by construction)
+        "solvability":  0,                  # 0=SAT, 1=UNSAT
+        "solvability_convention": "0_sat_1_unsat",
+        "fault_id":     int,
+        "fault_val":    int,
+        "pattern_id":   int,
+        "sample_id":    int,
     }
 
 The per-circuit embedding file (circuit_emb field) is a .pt file containing:
@@ -160,6 +165,38 @@ def _sim_until_target(
     return None
 
 
+def _sim_patterns_until_target(
+    circuit,
+    total_gates: int,
+    topo_order: List[int],
+    target_gate: int,
+    target_val: int,
+    max_attempts: int,
+    patterns_per_fault: int,
+) -> List[Dict[int, int]]:
+    """Collect up to ``patterns_per_fault`` concrete PI patterns for one fault."""
+    patterns: List[Dict[int, int]] = []
+    seen_pi_signatures: Set[Tuple[Tuple[int, int], ...]] = set()
+    for _ in range(max_attempts):
+        assignment = _random_sim(circuit, total_gates, topo_order)
+        if assignment.get(target_gate) != target_val:
+            continue
+        pi_sig = tuple(
+            sorted(
+                (i, assignment[i])
+                for i in range(1, total_gates + 1)
+                if circuit[i] is not None and circuit[i].type == GateType.INPT and i in assignment
+            )
+        )
+        if pi_sig in seen_pi_signatures:
+            continue
+        seen_pi_signatures.add(pi_sig)
+        patterns.append(assignment)
+        if len(patterns) >= patterns_per_fault:
+            break
+    return patterns
+
+
 # ---------------------------------------------------------------------------
 # Pair ordering (mirrors HierarchicalReconvSolver._collect_and_sort_pairs)
 # ---------------------------------------------------------------------------
@@ -219,6 +256,9 @@ def build_samples_for_circuit(
     max_faults: int,
     sim_attempts: int,
     emb_cache_path: str,
+    patterns_per_fault: int = 1,
+    unsat_ratio: float = 0.0,
+    max_samples_per_circuit: int = 0,
 ) -> List[Dict[str, Any]]:
     """Generate all training samples for one circuit file.
 
@@ -242,6 +282,28 @@ def build_samples_for_circuit(
     samples: List[Dict[str, Any]] = []
     skipped_no_sim = 0
     skipped_no_pairs = 0
+    sample_id = 0
+
+    def make_unsat_sample(sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        labels = sample.get("labels") or {}
+        if not labels:
+            return None
+        constraints = dict(sample.get("constraints") or {})
+        # Prefer corrupting an already-visible constrained node; otherwise add a
+        # contradictory visible constraint on one labeled path node.
+        candidates = [n for n in constraints if n in labels] or list(labels.keys())
+        if not candidates:
+            return None
+        corrupt_node = random.choice(candidates)
+        constraints[corrupt_node] = 1 - int(labels[corrupt_node])
+        unsat = dict(sample)
+        unsat["constraints"] = constraints
+        unsat["labels"] = {}
+        unsat["solvability"] = 1
+        unsat["is_unsat"] = True
+        unsat["sample_id"] = int(sample["sample_id"]) + 1
+        unsat["unsat_reason"] = "flipped_visible_constraint"
+        return unsat
 
     for fault in faults:
         # Fault value: LogicValue.D means stuck-at-1, DB means stuck-at-0.
@@ -250,11 +312,16 @@ def build_samples_for_circuit(
             LogicValue.ONE if fault.value == LogicValue.D else LogicValue.ZERO
         )
 
-        # Get a globally consistent assignment where fault.gate_id = target_val
-        assignment = _sim_until_target(
-            circuit, total_gates, topo_order, fault.gate_id, target_val, sim_attempts
+        assignments = _sim_patterns_until_target(
+            circuit,
+            total_gates,
+            topo_order,
+            fault.gate_id,
+            target_val,
+            sim_attempts,
+            max(1, patterns_per_fault),
         )
-        if assignment is None:
+        if not assignments:
             skipped_no_sim += 1
             continue
 
@@ -264,39 +331,56 @@ def build_samples_for_circuit(
             skipped_no_pairs += 1
             continue
 
-        # Walk pairs, accumulating constraints
-        constraint_accumulator: Dict[int, int] = {fault.gate_id: target_val}
+        for pattern_id, assignment in enumerate(assignments):
+            # Walk pairs, accumulating constraints exactly like inference.
+            constraint_accumulator: Dict[int, int] = {fault.gate_id: target_val}
 
-        for pair in pairs:
-            path_nodes = _path_nodes(pair)
+            for pair in pairs:
+                path_nodes = _path_nodes(pair)
 
-            # Constraints: any node already in accumulator that lies on this pair's paths
-            constraints = {
-                n: constraint_accumulator[n] for n in path_nodes if n in constraint_accumulator
-            }
+                constraints = {
+                    n: constraint_accumulator[n] for n in path_nodes if n in constraint_accumulator
+                }
+                labels = {n: assignment[n] for n in path_nodes if n in assignment}
 
-            # Ground-truth labels: SAT assignment for every path node
-            labels = {n: assignment[n] for n in path_nodes if n in assignment}
+                if not labels:
+                    continue
 
-            if not labels:
-                # Pair nodes not covered by simulation (rare for PI-only paths); skip
-                continue
+                sat_sample = {
+                    "file": bench_path,
+                    "circuit_emb": emb_cache_path,
+                    "info": {
+                        "start": pair["start"],
+                        "reconv": pair["reconv"],
+                        "paths": [list(p) for p in pair["paths"]],
+                    },
+                    "constraints": constraints,
+                    "labels": labels,
+                    "solvability": 0,
+                    "solvability_convention": "0_sat_1_unsat",
+                    "fault_id": int(fault.gate_id),
+                    "fault_val": int(fault.value),
+                    "pattern_id": int(pattern_id),
+                    "sample_id": int(sample_id),
+                }
+                samples.append(sat_sample)
+                sample_id += 1
 
-            samples.append({
-                "file": bench_path,
-                "circuit_emb": emb_cache_path,
-                "info": {
-                    "start": pair["start"],
-                    "reconv": pair["reconv"],
-                    "paths": [list(p) for p in pair["paths"]],
-                },
-                "constraints": constraints,
-                "labels": labels,
-                "solvability": 1,
-            })
+                if unsat_ratio > 0.0 and random.random() < unsat_ratio:
+                    unsat_sample = make_unsat_sample(sat_sample)
+                    if unsat_sample is not None:
+                        unsat_sample["sample_id"] = int(sample_id)
+                        samples.append(unsat_sample)
+                        sample_id += 1
 
-            # Spill this pair's full assignment into the accumulator
-            constraint_accumulator.update(labels)
+                constraint_accumulator.update(labels)
+
+                if max_samples_per_circuit > 0 and len(samples) >= max_samples_per_circuit:
+                    break
+            if max_samples_per_circuit > 0 and len(samples) >= max_samples_per_circuit:
+                break
+        if max_samples_per_circuit > 0 and len(samples) >= max_samples_per_circuit:
+            break
 
     tqdm.write(
         f"  {os.path.basename(bench_path)}: {len(faults)} faults → "
@@ -394,6 +478,30 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--patterns-per-fault",
+        type=int,
+        default=1,
+        help=(
+            "Maximum distinct activating PI patterns to record per fault. "
+            "Keep this small because samples scale as faults × patterns × path-pairs."
+        ),
+    )
+    parser.add_argument(
+        "--unsat-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Probability of adding one corrupted-constraint UNSAT sample next to each SAT "
+            "path-pair sample. Recommended starting range: 0.05-0.20."
+        ),
+    )
+    parser.add_argument(
+        "--max-samples-per-circuit",
+        type=int,
+        default=0,
+        help="Hard cap on generated samples per circuit (0 = no cap).",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -438,6 +546,9 @@ def main() -> None:
                 max_faults=args.max_faults,
                 sim_attempts=args.sim_attempts,
                 emb_cache_path=emb_cache_path,
+                patterns_per_fault=args.patterns_per_fault,
+                unsat_ratio=args.unsat_ratio,
+                max_samples_per_circuit=args.max_samples_per_circuit,
             )
         except Exception as e:
             tqdm.write(f"  [WARN] Sample generation failed for {bench_path}: {e}. Skipping.")

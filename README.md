@@ -13,13 +13,31 @@ A Topology-Aware Justification Oracle for digital circuits using Multi-Path Tran
 ## 🛠️ Usage Guide
 
 ### 1. Data Preparation (Building Shards)
-Before training, convert large pickle datasets into optimized tensor shards for fast I/O.
+Build fault-driven SAT/UNSAT samples from ISCAS85/89 only, then convert the
+chunked output into optimized tensor shards.  Keep `patterns-per-fault` small at
+first because sample count scales with faults × patterns × reconvergent path
+pairs.
 
 ```bash
-python -m src.ml.core.dataset \
-    --input /home/local1/cache-cw/reconv_dataset.pkl \
-    --out /home/local1/cache-cw/processed_reconv/ \
-    --max_len 50
+python scripts/build_fault_dataset.py \
+    --bench_dirs data/bench/ISCAS85 data/bench/iscas89 \
+    --output /home/local1/cache-cw/iscas85_89_fault_chunks \
+    --max_faults 0 \
+    --patterns-per-fault 1 \
+    --sim_attempts 50 \
+    --unsat-ratio 0.10 \
+    --max-samples-per-circuit 0 \
+    --seed 42
+```
+
+```bash
+python -m src.ml.core.dataset preprocess \
+    --input /home/local1/cache-cw/iscas85_89_fault_chunks \
+    --out /home/local1/cache-cw/iscas85_89_shards \
+    --max_len 50 \
+    --shard_size 5000 \
+    --dtype float16 \
+    --resume
 ```
 
 ### 2. Experience Collection
@@ -52,10 +70,34 @@ python -m src.ml.train train \
     --num-workers 4 \
     --amp --verbose \
     --lambda-logic 1.0 \
+    --lambda-supervised-node 2.0 \
+    --lambda-solvability 0.5 \
     --ffn-dim 2048 \
     --model-dim 512 \
     --enc-layers 3 \
     --int-layers 3
+```
+
+### 3.1 ITC99 Held-Out Gate
+ITC99 is not used for training or validation.  Materialize the deterministic
+10% gate subset once, then benchmark checkpoints against that subset before any
+full ITC99 run.
+
+```bash
+python scripts/select_itc99_gate_faults.py \
+    --bench data/bench/ITC99/b17.bench \
+    --output data/bench/ITC99/b17_gate_10pct_faults.json \
+    --fraction 0.10 \
+    --seed 20260504
+```
+
+```bash
+python scripts/benchmark_itc99_gate.py \
+    --model checkpoints/reconv_topology_3val_v1_ssd/best_model.pth \
+    --fault-list data/bench/ITC99/b17_gate_10pct_faults.json \
+    --out docs/itc99_gate_report.json \
+    --candidate-count 8 \
+    --max-backtracks 5000
 ```
 
 ### 4. RL Fine-tuning

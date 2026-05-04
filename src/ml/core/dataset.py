@@ -260,6 +260,26 @@ class ReconvergentPathsDataset(Dataset):
             print(f"[Dataset WARN] Failed to load circuit emb {emb_path}: {e}")
             return None, {}
 
+    @staticmethod
+    def _normalise_solvability_label(entry: Dict[str, Any]) -> int:
+        """Return solvability as 0=SAT, 1=UNSAT.
+
+        Older raw builders used ``1`` to mean SAT.  The current training loss
+        uses the standard classifier convention ``0=SAT`` and ``1=UNSAT``.
+        New samples should set ``solvability_convention=0_sat_1_unsat``; legacy
+        labeled samples are treated as SAT unless explicitly marked UNSAT.
+        """
+        convention = entry.get("solvability_convention")
+        raw = int(entry.get("solvability", 0))
+        if convention == "0_sat_1_unsat":
+            return 1 if raw == 1 else 0
+        if entry.get("is_unsat", False):
+            return 1
+        # Legacy build_fault_dataset.py stored 1 for SAT-only samples.
+        if "labels" in entry and raw == 1:
+            return 0
+        return 1 if raw == 1 else 0
+
     def _load_shard_metadata(self, shard_paths: List[str]):
         """Read metadata from shards without loading tensors."""
         self._shard_files = shard_paths
@@ -452,6 +472,23 @@ class ReconvergentPathsDataset(Dataset):
                 c_mask_tensor = torch.zeros_like(node_ids, dtype=torch.bool)
                 c_vals_tensor = torch.zeros_like(node_ids, dtype=torch.long)
 
+            if "label_mask" in data and "label_vals" in data:
+                label_mask_tensor = data["label_mask"][local_idx].clone().to(self.device)
+                label_vals_tensor = data["label_vals"][local_idx].clone().to(self.device)
+            else:
+                label_mask_tensor = torch.zeros_like(node_ids, dtype=torch.bool)
+                label_vals_tensor = torch.zeros_like(node_ids, dtype=torch.long)
+
+            metadata: Dict[str, Any] = {}
+            if "fault_id" in data:
+                metadata["fault_id"] = int(data["fault_id"][local_idx].item())
+            if "fault_val" in data:
+                metadata["fault_val"] = int(data["fault_val"][local_idx].item())
+            if "pattern_id" in data:
+                metadata["pattern_id"] = int(data["pattern_id"][local_idx].item())
+            if "sample_id" in data:
+                metadata["sample_id"] = int(data["sample_id"][local_idx].item())
+
             # For non-shard features we may still need pickle info
             if not self.anchor_in_dataset:
                 if hasattr(self, "data") and idx < len(self.data):
@@ -528,13 +565,25 @@ class ReconvergentPathsDataset(Dataset):
         # New-format datasets (build_fault_dataset.py) carry pre-computed circuit-consistent
         # constraints in entry["constraints"] and entry["labels"].  Old-format datasets fall
         # back to the legacy on-the-fly random-simulation path (inject_constraints flag).
-        c_mask_tensor = torch.zeros_like(node_ids, dtype=torch.bool, device=self.device)
-        c_vals_tensor = torch.zeros_like(node_ids, dtype=torch.long, device=self.device)
-
         if not getattr(self, "_use_processed", False):
+            c_mask_tensor = torch.zeros_like(node_ids, dtype=torch.bool, device=self.device)
+            c_vals_tensor = torch.zeros_like(node_ids, dtype=torch.long, device=self.device)
+            label_mask_tensor = torch.zeros_like(node_ids, dtype=torch.bool, device=self.device)
+            label_vals_tensor = torch.zeros_like(node_ids, dtype=torch.long, device=self.device)
+            metadata = {}
             entry_constraints: Optional[Dict[str, Any]] = None
+            entry_labels: Optional[Dict[str, Any]] = None
             if hasattr(self, "data") and idx < len(self.data):
-                entry_constraints = self.data[idx].get("constraints")
+                entry = self.data[idx]
+                entry_constraints = entry.get("constraints")
+                entry_labels = entry.get("labels")
+                s_sel = self._normalise_solvability_label(entry)
+                metadata = {
+                    "fault_id": int(entry.get("fault_id", -1)),
+                    "fault_val": int(entry.get("fault_val", -1)),
+                    "pattern_id": int(entry.get("pattern_id", -1)),
+                    "sample_id": int(entry.get("sample_id", idx)),
+                }
 
             if entry_constraints is not None:
                 # New format: circuit-consistent constraints baked by build_fault_dataset.py
@@ -552,6 +601,14 @@ class ReconvergentPathsDataset(Dataset):
                             dtype=paths_emb.dtype,
                         )
                         paths_emb.view(-1, D)[mask.view(-1), D - 3 : D] = vec
+
+            if entry_labels is not None and s_sel == 0:
+                for nid, val in entry_labels.items():
+                    mask = node_ids == int(nid)
+                    if not mask.any():
+                        continue
+                    label_mask_tensor |= mask
+                    label_vals_tensor[mask] = int(val)
             elif self.inject_constraints and self.add_logic_value and final_info:
                 # Legacy fallback: random-simulation constraints (old-format datasets)
                 constraints = self._gen_constraints_for_sample(final_info, file_path)
@@ -585,6 +642,9 @@ class ReconvergentPathsDataset(Dataset):
             "solvability": torch.tensor(s_sel, dtype=torch.long, device=self.device),
             "constraint_mask": c_mask_tensor,
             "constraint_vals": c_vals_tensor,
+            "label_mask": label_mask_tensor,
+            "label_vals": label_vals_tensor,
+            "metadata": metadata,
         }
         return res
 
@@ -650,6 +710,17 @@ class ReconvergentPathsDataset(Dataset):
         else:
             out["constraint_mask"] = torch.zeros_like(node_ids, dtype=torch.bool)
             out["constraint_vals"] = torch.zeros_like(node_ids, dtype=torch.long)
+
+        if "label_mask" in data and "label_vals" in data:
+            out["label_mask"] = data["label_mask"][local_idxs].clone()
+            out["label_vals"] = data["label_vals"][local_idxs].clone()
+        else:
+            out["label_mask"] = torch.zeros_like(node_ids, dtype=torch.bool)
+            out["label_vals"] = torch.zeros_like(node_ids, dtype=torch.long)
+
+        for key in ("fault_id", "fault_val", "pattern_id", "sample_id"):
+            if key in data:
+                out[key] = data[key][local_idxs].clone()
 
         return out
 
@@ -862,11 +933,18 @@ class ReconvergentPathsDataset(Dataset):
         buf_gt: List[torch.Tensor] = []
         buf_cmask: List[torch.Tensor] = []
         buf_cvals: List[torch.Tensor] = []
+        buf_lmask: List[torch.Tensor] = []
+        buf_lvals: List[torch.Tensor] = []
+        buf_fault_id: List[int] = []
+        buf_fault_val: List[int] = []
+        buf_pattern_id: List[int] = []
+        buf_sample_id: List[int] = []
 
         def flush() -> None:
             nonlocal shard_idx, buf_paths, buf_masks, buf_nodes, buf_files
             nonlocal buf_ap, buf_al, buf_av, buf_solv, buf_gt
-            nonlocal buf_cmask, buf_cvals
+            nonlocal buf_cmask, buf_cvals, buf_lmask, buf_lvals
+            nonlocal buf_fault_id, buf_fault_val, buf_pattern_id, buf_sample_id
             if not buf_paths:
                 return
             # Final safety: ensure equal shapes before stacking
@@ -890,6 +968,8 @@ class ReconvergentPathsDataset(Dataset):
             gt_t = torch.stack(buf_gt, dim=0)
             cmask_t = torch.stack(buf_cmask, dim=0)
             cvals_t = torch.stack(buf_cvals, dim=0)
+            lmask_t = torch.stack(buf_lmask, dim=0)
+            lvals_t = torch.stack(buf_lvals, dim=0)
 
             shard = {
                 "paths_emb": paths_t.cpu(),
@@ -903,6 +983,13 @@ class ReconvergentPathsDataset(Dataset):
                 "gate_types": gt_t.cpu(),
                 "constraint_mask": cmask_t.cpu(),
                 "constraint_vals": cvals_t.cpu(),
+                "label_mask": lmask_t.cpu(),
+                "label_vals": lvals_t.cpu(),
+                "fault_id": torch.tensor(buf_fault_id, dtype=torch.long),
+                "fault_val": torch.tensor(buf_fault_val, dtype=torch.long),
+                "pattern_id": torch.tensor(buf_pattern_id, dtype=torch.long),
+                "sample_id": torch.tensor(buf_sample_id, dtype=torch.long),
+                "solvability_convention": "0_sat_1_unsat",
             }
             out_path = os.path.join(output_dir, f"shard_{shard_idx:05d}.pt")
             tmp_path = out_path + ".tmp"
@@ -924,6 +1011,8 @@ class ReconvergentPathsDataset(Dataset):
             buf_ap, buf_al, buf_av, buf_solv = [], [], [], []
             buf_gt = []
             buf_cmask, buf_cvals = [], []
+            buf_lmask, buf_lvals = [], []
+            buf_fault_id, buf_fault_val, buf_pattern_id, buf_sample_id = [], [], [], []
 
         # Iterate over chunks.  For a single-pkl input chunk_paths has one entry
         # and raw_ds is built once.  For a chunk directory, one raw_ds is built
@@ -1074,6 +1163,9 @@ class ReconvergentPathsDataset(Dataset):
                 # BAKE CONSTRAINTS
                 c_mask = torch.zeros_like(ni, dtype=torch.bool)
                 c_vals = torch.zeros_like(ni, dtype=torch.long)
+                label_mask = torch.zeros_like(ni, dtype=torch.bool)
+                label_vals = torch.zeros_like(ni, dtype=torch.long)
+                s_sel = helper._normalise_solvability_label(entry)
                 entry_constraints = entry.get("constraints")
                 constraint_source = (
                     entry_constraints
@@ -1091,6 +1183,13 @@ class ReconvergentPathsDataset(Dataset):
                                 [1.0, 0.0, 0.0] if val == 0 else [0.0, 1.0, 0.0]
                             )
                             pe.view(-1, D_pe)[mask.view(-1), D_pe - 3 : D_pe] = vec
+
+                if entry_labels is not None and s_sel == 0:
+                    for nid, val in entry_labels.items():
+                        mask = ni == int(nid)
+                        if mask.any():
+                            label_mask |= mask
+                            label_vals[mask] = int(val)
 
                 # Inject anchor AFTER constraints
                 if p_sel >= 0 and l_sel >= 0 and pe.shape[-1] >= 3:
@@ -1118,8 +1217,13 @@ class ReconvergentPathsDataset(Dataset):
                     cm_pad[:, :Lcur] = c_mask
                     cv_pad = torch.zeros(Pdim, Lfix, dtype=c_vals.dtype)
                     cv_pad[:, :Lcur] = c_vals
+                    lm_pad = torch.zeros(Pdim, Lfix, dtype=label_mask.dtype)
+                    lm_pad[:, :Lcur] = label_mask
+                    lv_pad = torch.zeros(Pdim, Lfix, dtype=label_vals.dtype)
+                    lv_pad[:, :Lcur] = label_vals
                     pe, am, ni, gt = pe_pad, am_pad, ni_pad, gt_pad
                     c_mask, c_vals = cm_pad, cv_pad
+                    label_mask, label_vals = lm_pad, lv_pad
                 elif Lcur > Lfix:
                     raise RuntimeError(
                         f"Path length {Lcur} exceeds max_path_length "
@@ -1132,12 +1236,18 @@ class ReconvergentPathsDataset(Dataset):
                 buf_gt.append(gt)
                 buf_cmask.append(c_mask)
                 buf_cvals.append(c_vals)
+                buf_lmask.append(label_mask)
+                buf_lvals.append(label_vals)
                 buf_files.append(file_path)
 
                 buf_ap.append(int(p_sel))
                 buf_al.append(int(l_sel))
                 buf_av.append(int(v_sel))
                 buf_solv.append(int(s_sel))
+                buf_fault_id.append(int(entry.get("fault_id", -1)))
+                buf_fault_val.append(int(entry.get("fault_val", -1)))
+                buf_pattern_id.append(int(entry.get("pattern_id", -1)))
+                buf_sample_id.append(int(entry.get("sample_id", total + i)))
 
                 if len(buf_paths) >= shard_size:
                     flush()
@@ -1278,6 +1388,8 @@ class ReconvergentPathsDataset(Dataset):
             for local_i in perm.tolist():
                 # Append one sample to the buffer
                 for k, v in data.items():
+                    if k == "solvability_convention":
+                        continue
                     if k == "files":
                         buf.setdefault(k, []).append(v[local_i])
                     else:
@@ -1347,6 +1459,8 @@ def reconv_collate(batch: List[Dict[str, Any]], max_paths: int = 0) -> Dict[str,
     masks = torch.zeros(B, P, L, dtype=torch.bool, device=device)
     node_ids = torch.zeros(B, P, L, dtype=torch.long, device=device)
     gate_types = torch.full((B, P, L), -1, dtype=torch.long, device=device)
+    label_mask = torch.zeros(B, P, L, dtype=torch.bool, device=device)
+    label_vals = torch.zeros(B, P, L, dtype=torch.long, device=device)
     files: List[str] = []
 
     # Fill in data from each sample
@@ -1360,6 +1474,9 @@ def reconv_collate(batch: List[Dict[str, Any]], max_paths: int = 0) -> Dict[str,
         node_ids[b, :p_curr, :l_i] = item["node_ids"][:p_curr]
         if "gate_types" in item:
             gate_types[b, :p_curr, :l_i] = item["gate_types"][:p_curr]
+        if "label_mask" in item and "label_vals" in item:
+            label_mask[b, :p_curr, :l_i] = item["label_mask"][:p_curr]
+            label_vals[b, :p_curr, :l_i] = item["label_vals"][:p_curr]
         files.append(item["file"])
 
     # Convert to float32 for model computation
@@ -1370,6 +1487,8 @@ def reconv_collate(batch: List[Dict[str, Any]], max_paths: int = 0) -> Dict[str,
         "attn_mask": masks,
         "node_ids": node_ids,
         "gate_types": gate_types,
+        "label_mask": label_mask,
+        "label_vals": label_vals,
         "files": files,
     }
     # Collate optional anchors if present
@@ -1387,6 +1506,9 @@ def reconv_collate(batch: List[Dict[str, Any]], max_paths: int = 0) -> Dict[str,
         out["anchor_l"] = al
         out["anchor_v"] = av
         out["solvability"] = sv
+    for key in ("fault_id", "fault_val", "pattern_id", "sample_id"):
+        if key in batch[0]:
+            out[key] = torch.stack([item[key] for item in batch], dim=0)
     return out
 
 

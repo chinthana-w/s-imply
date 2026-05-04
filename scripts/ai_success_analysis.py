@@ -21,6 +21,7 @@ from src.atpg.podem import (
 )
 from src.util.io import parse_bench_file
 
+
 def main():
     bench_path = "data/bench/ISCAS85/c1908.bench"
     model_path = "checkpoints/supervised_v5/best_model.pth"
@@ -76,7 +77,10 @@ def main():
             })
         
         if (i + 1) % 100 == 0:
-            print(f"  Processed {i+1}/{total_all} faults... Found {len(ai_success_data)} AI successes.")
+            print(
+                f"  Processed {i+1}/{total_all} faults... "
+                f"Found {len(ai_success_data)} AI successes."
+            )
 
     num_success = len(ai_success_data)
     print(f"\nAI Success Subset Size: {num_success} ({ (num_success/total_all*100):.2f}%)")

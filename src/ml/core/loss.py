@@ -404,10 +404,13 @@ def reinforce_loss(
     entropy_beta: float = 0.01,
     constraint_mask: Optional[torch.Tensor] = None,
     constraint_vals: Optional[torch.Tensor] = None,
+    label_mask: Optional[torch.Tensor] = None,
+    label_vals: Optional[torch.Tensor] = None,
     node_ids: Optional[torch.Tensor] = None,
     lambda_logic: float = 0.0,
     lambda_full_logic: float = 0.0,
     lambda_shared_node: float = 1.0,
+    lambda_supervised_node: float = 2.0,
     soft_edge_lambda: float = 1.0,
     normalize_reward: bool = True,
     anchor_alpha: float = 0.1,
@@ -668,6 +671,20 @@ def reinforce_loss(
         c_targets = constraint_vals[constraint_mask].long()
         constraint_loss = F.cross_entropy(c_logits, c_targets)
         loss_terms.append(constraint_loss * 5.0)
+
+    # 4c. Full supervised SAT labels.  UNSAT samples carry solvability_labels=1
+    # and intentionally do not contribute node-label CE because no satisfying
+    # assignment exists under their corrupted constraints.
+    if label_mask is not None and label_vals is not None and label_mask.any():
+        sup_mask = label_mask
+        if solvability_labels is not None:
+            sat_mask = solvability_labels.view(-1, 1, 1) == 0
+            sup_mask = sup_mask & sat_mask
+        if sup_mask.any():
+            sup_logits = logits[sup_mask]
+            sup_targets = label_vals[sup_mask].long().clamp(0, 1)
+            node_sup_loss = F.cross_entropy(sup_logits, sup_targets)
+            loss_terms.append(float(lambda_supervised_node) * node_sup_loss)
 
     # 5. Add accumulated auxiliary losses
     if solvability_loss.requires_grad or solvability_loss.item() > 0:
