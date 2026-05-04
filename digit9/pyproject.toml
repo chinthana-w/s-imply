@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "digit9"
+version = "0.1.0"
+description = "Low-latency thumb-to-finger tap detector prototype"
+requires-python = ">=3.11"
+dependencies = [
+  "mediapipe",
+  "opencv-python",
+  "numpy",
+  "typer",
+  "rich",
+  "pydantic>=2",
+  "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "mypy"]
+
+[project.scripts]
+digit9 = "digit9.app:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true

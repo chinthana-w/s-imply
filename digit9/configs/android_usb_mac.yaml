@@ -1,0 +1,41 @@
+# Android USB webcam may appear as camera index 1, 2 or higher.
+# Run `digit9 cameras` first.
+# Use `digit9 live --camera-index N`.
+camera:
+  source: "camera"
+  index: 1
+  width: 1280
+  height: 720
+  target_fps: 60
+  backend: "avfoundation"
+  mirror: false
+  rotate_degrees: 0
+
+tracker:
+  model_path: "models/hand_landmarker.task"
+  max_num_hands: 1
+  min_hand_detection_confidence: 0.5
+  min_hand_presence_confidence: 0.5
+  min_tracking_confidence: 0.5
+  running_mode: "live_stream"
+
+detector:
+  contact_threshold: 0.105
+  release_threshold: 0.145
+  ambiguous_margin: 0.018
+  min_contact_frames: 2
+  max_tap_duration_ms: 250
+  debounce_ms: 120
+  history_frames: 8
+  smoothing_alpha: 0.45
+  min_candidate_stable_frames: 2
+
+overlay:
+  enabled: true
+  draw_landmarks: true
+  draw_candidate_segment: true
+  draw_metrics: true
+
+recorder:
+  enabled: false
+  output_dir: "data/recordings"
