@@ -188,6 +188,46 @@ class TrainConfig:
     oom_max_retries: int = 3   # number of retry attempts before skipping a batch
     oom_base_wait: float = 2.0  # base wait in seconds; actual wait = base * 2^attempt
     resume: bool = False  # if True, load full training state from output/resume.pth
+    gpu_ids: str = "all"  # CUDA device ordinals for DataParallel, e.g. "0,1" or "all"
+    single_gpu: bool = False  # force one CUDA device even when several are visible
+
+
+def _resolve_cuda_device_ids(gpu_ids: str, single_gpu: bool) -> list[int]:
+    """Return visible CUDA device ordinals selected for training."""
+    if not torch.cuda.is_available():
+        return []
+
+    visible_count = torch.cuda.device_count()
+    if visible_count <= 0:
+        return []
+
+    if single_gpu:
+        return [0]
+
+    requested = (gpu_ids or "all").strip().lower()
+    if requested in {"", "all", "*"}:
+        return list(range(visible_count))
+
+    ids: list[int] = []
+    for raw_part in requested.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        try:
+            device_id = int(part)
+        except ValueError as exc:
+            raise ValueError(f"Invalid --gpu-ids value: {gpu_ids!r}") from exc
+        if device_id < 0 or device_id >= visible_count:
+            raise ValueError(
+                f"CUDA device {device_id} requested by --gpu-ids={gpu_ids!r}, "
+                f"but only {visible_count} visible device(s) exist."
+            )
+        if device_id not in ids:
+            ids.append(device_id)
+
+    if not ids:
+        raise ValueError(f"No CUDA devices selected by --gpu-ids={gpu_ids!r}")
+    return ids
 
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
@@ -906,6 +946,8 @@ def cmd_train(args: argparse.Namespace) -> None:
         oom_max_retries=getattr(args, "oom_max_retries", 3),
         oom_base_wait=getattr(args, "oom_base_wait", 2.0),
         resume=getattr(args, "resume", False),
+        gpu_ids=getattr(args, "gpu_ids", "all"),
+        single_gpu=getattr(args, "single_gpu", False),
     )
 
     # Diagnostic logs for memory
@@ -918,7 +960,12 @@ def cmd_train(args: argparse.Namespace) -> None:
     if getattr(args, "checkpoint_dir", None):
         cfg.output = args.checkpoint_dir
 
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    cuda_device_ids = _resolve_cuda_device_ids(cfg.gpu_ids, cfg.single_gpu)
+    device = (
+        torch.device(f"cuda:{cuda_device_ids[0]}")
+        if cuda_device_ids
+        else torch.device("cpu")
+    )
     if cfg.verbose:
         if device.type == "cuda":
             try:
@@ -926,6 +973,15 @@ def cmd_train(args: argparse.Namespace) -> None:
             except Exception:
                 dev_name = "CUDA device"
             print(f"Using device: {device} ({dev_name})", flush=True)
+            if len(cuda_device_ids) > 1:
+                names = [torch.cuda.get_device_name(i) for i in cuda_device_ids]
+                print(
+                    f"Using CUDA devices for DataParallel: "
+                    f"{list(zip(cuda_device_ids, names))}",
+                    flush=True,
+                )
+            else:
+                print(f"Using single CUDA device: {cuda_device_ids[0]}", flush=True)
         else:
             print("Using device: cpu (CUDA not available)")
 
@@ -985,9 +1041,13 @@ def cmd_train(args: argparse.Namespace) -> None:
     ).to(device)
     print("Model initialized and moved to device.")
 
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
-        model = nn.DataParallel(model)
+    if len(cuda_device_ids) > 1:
+        print(f"Using {len(cuda_device_ids)} GPUs with DataParallel: {cuda_device_ids}")
+        model = nn.DataParallel(
+            model,
+            device_ids=cuda_device_ids,
+            output_device=cuda_device_ids[0],
+        )
 
     # 4. LOAD WEIGHTS (Pretrained or Resume)
     # Priority: 1. --pretrained flag  2. --output/best_model.pth (auto-resume)
@@ -1284,6 +1344,20 @@ def build_argparser() -> argparse.ArgumentParser:
         dest="pin_memory",
         action="store_false",
         help="Disable DataLoader pin_memory",
+    )
+    t.add_argument(
+        "--gpu-ids",
+        type=str,
+        default="all",
+        help=(
+            "Comma-separated visible CUDA device ids to use with DataParallel "
+            '(default: "all", e.g. "0,1").'
+        ),
+    )
+    t.add_argument(
+        "--single-gpu",
+        action="store_true",
+        help="Disable DataParallel and force one CUDA device.",
     )
     t.add_argument(
         "--max-train-batches",

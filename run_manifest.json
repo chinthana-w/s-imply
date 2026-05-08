@@ -1,17 +1,27 @@
 {
-  "job_type": "eval",
+  "job_type": "train",
   "target_script": "src.ml.train",
   "args": [
     "train",
     "--dataset", "data/datasets/reconv_dataset.pkl",
-    "--output", "checkpoints/test_run",
-    "--epochs", "1",
-    "--pretrained", "checkpoints/supervised_v5/best_model.pth",
-    "--lambda-supervised-node", "1.0"
+    "--processed-dir", "data/datasets/reconv_shards_v3",
+    "--output", "checkpoints/iscas_itc_v6",
+    "--epochs", "100",
+    "--batch-size", "1024",
+    "--grad-accum", "8",
+    "--max-paths", "256",
+    "--checkpointing",
+    "--amp",
+    "--lambda-supervised-node", "2.0",
+    "--lambda-shared-node", "1.0",
+    "--lambda-logic", "1.0",
+    "--lambda-full-logic", "0.5",
+    "--lambda-solvability", "0.5"
   ],
   "environment": "deepgate",
   "hardware": {
     "gpus": 1,
-    "vram_gb": 16
-  }
+    "vram_gb": 24
+  },
+  "notes": "Verified on 2026-05-04. Training with updated supervised SAT label loss and shared node consistency."
 }

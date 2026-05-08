@@ -85,7 +85,8 @@ def main() -> None:
     )
 
     model = MultiPathTransformer(
-        embedding_dim=args.embedding_dim,
+        input_dim=args.embedding_dim,
+        model_dim=512,  # Default model_dim used in training
         nhead=args.nhead,
         num_encoder_layers=args.num_encoder_layers,
         num_interaction_layers=args.num_interaction_layers,

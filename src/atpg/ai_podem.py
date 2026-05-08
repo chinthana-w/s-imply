@@ -826,7 +826,11 @@ def ai_podem(
                 # Run PODEM from this starting state
                 backtracer = None
                 if enable_ai_propagation and solver:
-                    backtracer = AIBacktracer(solver, verbose=verbose)
+                    backtracer = AIBacktracer(
+                        solver,
+                        verbose=verbose,
+                        no_fallback=no_fallback,
+                    )
 
                 result = mogu_podem_wrapper(
                     circuit,
@@ -854,13 +858,17 @@ def ai_podem(
         # No AI activation pre-fill, just run PODEM (maybe with AI propagation)
         backtracer = None
         if enable_ai_propagation and solver:
-            backtracer = AIBacktracer(solver, verbose=verbose)
+            backtracer = AIBacktracer(
+                solver,
+                verbose=verbose,
+                no_fallback=no_fallback,
+            )
         result = mogu_podem_wrapper(
             circuit,
             fault,
             total_gates,
             backtrace_func=backtracer,
-            max_backtracks=2000,
+            max_backtracks=max_backtracks,
         )
         if result:
             if verbose:
@@ -878,7 +886,11 @@ def ai_podem(
         reset_gates(circuit, total_gates)
 
         result_retry = mogu_podem_wrapper(
-            circuit, fault, total_gates, backtrace_func=None, max_backtracks=2000
+            circuit,
+            fault,
+            total_gates,
+            backtrace_func=None,
+            max_backtracks=max_backtracks,
         )
         if result_retry:
             if verbose:

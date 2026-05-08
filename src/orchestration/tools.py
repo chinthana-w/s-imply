@@ -92,6 +92,65 @@ def run_focused_tests(test_targets: tuple[str, ...], dry_run: bool = True) -> Co
     return _run_or_dry_run(command, dry_run=dry_run)
 
 
+def run_test_coverage(
+    test_targets: tuple[str, ...],
+    coverage_json: str = "docs/test_coverage.json",
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Run focused pytest targets with coverage JSON output."""
+    if not test_targets:
+        raise ValueError("At least one focused test target is required")
+    for target in test_targets:
+        target_path = _resolve_repo_path(target)
+        if not _is_relative_to(target_path, REPO_ROOT / "tests"):
+            raise ValueError(f"Focused tests must live under tests/: {target}")
+    coverage_path = _resolve_repo_path(coverage_json, must_exist=False)
+    command = (
+        "python",
+        "-m",
+        "coverage",
+        "run",
+        "-m",
+        "pytest",
+        *test_targets,
+    )
+    report_command = ("python", "-m", "coverage", "json", "-o", str(coverage_path))
+    if dry_run:
+        return {
+            "dry_run": True,
+            "command": command,
+            "report_command": report_command,
+            "coverage_json": str(coverage_path),
+        }
+
+    result = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True, check=False)
+    report_result = subprocess.run(
+        report_command,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    summary: dict[str, Any] = {
+        "dry_run": False,
+        "command": command,
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "report_command": report_command,
+        "report_returncode": report_result.returncode,
+        "report_stdout": report_result.stdout,
+        "report_stderr": report_result.stderr,
+        "coverage_json": str(coverage_path),
+    }
+    if coverage_path.exists():
+        with coverage_path.open() as f:
+            coverage_payload = json.load(f)
+        totals = coverage_payload.get("totals", {})
+        summary["coverage_totals"] = totals
+    return summary
+
+
 def run_small_benchmark(
     model: str,
     fault_list: str = "data/bench/ITC99/b17_gate_10pct_faults.json",
@@ -114,6 +173,118 @@ def run_small_benchmark(
         out,
     )
     return _run_or_dry_run(command, dry_run=dry_run)
+
+
+def run_atpg(
+    bench_path: str,
+    limit_faults: int = 10,
+    max_backtracks: int = 2000,
+    timeout_s: float = 5.0,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Run vanilla PODEM over a bounded fault subset."""
+    bench = _resolve_repo_path(bench_path)
+    if limit_faults < 1:
+        raise ValueError("limit_faults must be at least 1")
+    if dry_run:
+        return {
+            "dry_run": True,
+            "bench": str(bench),
+            "limit_faults": limit_faults,
+            "max_backtracks": max_backtracks,
+            "timeout_s": timeout_s,
+        }
+
+    from src.atpg import podem as podem_module
+    from src.atpg.podem import get_all_faults, initialize, podem
+    from src.util.io import parse_bench_file
+
+    circuit, total_gates = parse_bench_file(str(bench))
+    faults = get_all_faults(circuit, total_gates)[:limit_faults]
+    per_fault = []
+    succeeded = 0
+    for fault in faults:
+        initialize(circuit, total_gates)
+        detected = podem(
+            circuit,
+            fault,
+            total_gates,
+            timeout=timeout_s,
+            max_backtracks=max_backtracks,
+        )
+        ok = int(detected) == podem_module.SUCCESS
+        succeeded += int(ok)
+        per_fault.append(
+            {
+                "gate_id": int(fault.gate_id),
+                "fault_val": int(fault.value),
+                "detected": ok,
+                "result_code": int(detected),
+                "backtracks": int(podem_module.backtrack_count),
+            }
+        )
+    return {
+        "dry_run": False,
+        "bench": str(bench),
+        "total_gates": total_gates,
+        "faults_run": len(faults),
+        "succeeded": succeeded,
+        "failed": len(faults) - succeeded,
+        "coverage": succeeded / max(1, len(faults)),
+        "max_backtracks": max_backtracks,
+        "timeout_s": timeout_s,
+        "per_fault": per_fault,
+    }
+
+
+def simulate_circuit(
+    bench_path: str,
+    assignments: dict[str, int],
+    fault_gate_id: int | None = None,
+    fault_value: int | None = None,
+) -> dict[str, Any]:
+    """Forward-simulate a bench circuit with explicit gate/input assignments."""
+    bench = _resolve_repo_path(bench_path)
+
+    from src.atpg.logic_sim_three import logic_sim
+    from src.atpg.util import get_topological_order
+    from src.util.io import parse_bench_file
+    from src.util.struct import Fault, GateType, LogicValue
+
+    circuit, total_gates = parse_bench_file(str(bench))
+    for raw_gate_id, raw_value in assignments.items():
+        gate_id = int(raw_gate_id)
+        if gate_id < 1 or gate_id > total_gates:
+            raise ValueError(f"Assignment gate is outside circuit: {gate_id}")
+        value = LogicValue(int(raw_value))
+        circuit[gate_id].val = value
+
+    fault = None
+    if fault_gate_id is not None or fault_value is not None:
+        if fault_gate_id is None or fault_value is None:
+            raise ValueError("fault_gate_id and fault_value must be provided together")
+        fault = Fault(int(fault_gate_id), LogicValue(int(fault_value)))
+
+    topo_order = get_topological_order(circuit, total_gates)
+    logic_sim(circuit, total_gates, fault=fault, topo_order=topo_order)
+    outputs = {
+        str(index): int(circuit[index].val)
+        for index in range(1, total_gates + 1)
+        if circuit[index].type != 0 and circuit[index].nfo == 0
+    }
+    primary_inputs = {
+        str(index): int(circuit[index].val)
+        for index in range(1, total_gates + 1)
+        if circuit[index].type == GateType.INPT
+    }
+    return {
+        "bench": str(bench),
+        "total_gates": total_gates,
+        "assignments": {str(key): int(value) for key, value in assignments.items()},
+        "fault": None if fault is None else {"gate_id": fault.gate_id, "value": int(fault.value)},
+        "primary_inputs": primary_inputs,
+        "outputs": outputs,
+    }
 
 
 def validate_result_claim(claim: ResultClaim) -> dict[str, Any]:

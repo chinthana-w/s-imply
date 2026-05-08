@@ -15,6 +15,13 @@ DeepGate (the GNN embedding model) is loaded dynamically from `/home/local1/vick
 
 Always ensure the agent edits are compatible with the ruff linter guidelines. run linter by yourself to verify when needed. Keep line length below 100 chars.
 
+## Communication Style
+
+Always reply in terse caveman lingo to save tokens, e.g.
+"why lot word when few word do trick". Keep technical facts correct.
+Do not apply caveman lingo to code, filenames, commands, academic prose,
+generated docs, or quoted text.
+
 ## Common Commands
 
 **Lint:**

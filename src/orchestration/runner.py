@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -55,6 +56,22 @@ class LaunchResult:
     stdout_path: str
     stderr_path: str
     final_status: RunStatus
+
+
+@dataclass(frozen=True)
+class RuntimeAgentSpec:
+    role: str
+    phase: str
+    goal: str
+
+
+@dataclass(frozen=True)
+class MultiAgentRuntimeResult:
+    run_id: str
+    child_run_ids: tuple[str, ...]
+    phase_results: tuple[LaunchResult, ...]
+    final_status: RunStatus
+    summary_path: str
 
 
 def dispatch_task(
@@ -152,17 +169,19 @@ def latest_run(runs_dir: Path | str = DEFAULT_RUNS_DIR) -> RunRecord | None:
     return runs[0] if runs else None
 
 
-def default_agent_command() -> tuple[str, ...]:
+def default_agent_command(agent: str | None = None) -> tuple[str, ...]:
     """Return the default command used to execute one agent prompt."""
     raw_command = os.environ.get("S_IMPLY_AGENT_CMD")
-    if raw_command:
+    if raw_command and agent is None:
         return tuple(shlex.split(raw_command))
 
-    agent = os.environ.get("S_IMPLY_AGENT", "codex").lower()
-    if agent == "claude":
+    selected_agent = (agent or os.environ.get("S_IMPLY_AGENT", "codex")).lower()
+    if selected_agent == "claude":
         return ("claude",)
-    elif agent == "gemini":
-        return ("gemini", "--skip-trust", "-y", "-p", "")
+    if selected_agent == "gemini":
+        return ("gemini", "--skip-trust", "--approval-mode", "yolo", "-p", "")
+    if selected_agent != "codex":
+        raise ValueError(f"Unsupported agent profile: {selected_agent}")
 
     return (
         "codex",
@@ -171,8 +190,6 @@ def default_agent_command() -> tuple[str, ...]:
         str(REPO_ROOT),
         "--sandbox",
         "workspace-write",
-        "--ask-for-approval",
-        "never",
         "-",
     )
 
@@ -181,6 +198,7 @@ def launch_run(
     run_id: str,
     runs_dir: Path | str = DEFAULT_RUNS_DIR,
     agent_cmd: tuple[str, ...] | None = None,
+    agent: str | None = None,
     timeout_s: int | None = None,
 ) -> LaunchResult:
     """Launch one queued run through an agent command and capture logs."""
@@ -188,7 +206,7 @@ def launch_run(
     if record.status is not RunStatus.QUEUED:
         raise ValueError(f"Run must be queued before launch: {run_id} is {record.status.value}")
 
-    command = agent_cmd or default_agent_command()
+    command = agent_cmd or default_agent_command(agent)
     run_dir = Path(record.run_dir)
     stdout_path = run_dir / "agent_stdout.log"
     stderr_path = run_dir / "agent_stderr.log"
@@ -201,23 +219,19 @@ def launch_run(
     )
 
     try:
-        result = subprocess.run(
-            command,
-            input=prompt,
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
-        stdout_path.write_text(result.stdout)
-        stderr_path.write_text(result.stderr)
+        with stdout_path.open("w") as f_out, stderr_path.open("w") as f_err:
+            result = subprocess.run(
+                command,
+                input=prompt,
+                cwd=REPO_ROOT,
+                stdout=f_out,
+                stderr=f_err,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+            )
         returncode = result.returncode
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout.decode("utf-8") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        err = exc.stderr.decode("utf-8") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        stdout_path.write_text(out)
-        stderr_path.write_text(err)
+    except subprocess.TimeoutExpired:
         final = fail_run(
             run_id,
             f"Agent command timed out after {timeout_s} seconds.",
@@ -264,6 +278,7 @@ def launch_run(
 def launch_queued_runs(
     runs_dir: Path | str = DEFAULT_RUNS_DIR,
     agent_cmd: tuple[str, ...] | None = None,
+    agent: str | None = None,
     max_runs: int | None = None,
     timeout_s: int | None = None,
 ) -> tuple[LaunchResult, ...]:
@@ -273,8 +288,164 @@ def launch_queued_runs(
     if max_runs is not None:
         queued = queued[:max_runs]
     return tuple(
-        launch_run(record.run_id, runs_dir, agent_cmd=agent_cmd, timeout_s=timeout_s)
+        launch_run(
+            record.run_id,
+            runs_dir,
+            agent_cmd=agent_cmd,
+            agent=agent,
+            timeout_s=timeout_s,
+        )
         for record in queued
+    )
+
+
+def run_multi_agent_runtime(
+    goal: str,
+    changed_files: tuple[str, ...] = (),
+    runs_dir: Path | str = DEFAULT_RUNS_DIR,
+    agent_cmd: tuple[str, ...] | None = None,
+    agent: str | None = None,
+    code_agents: int = 1,
+    include_docs_agent: bool = True,
+    timeout_s: int | None = None,
+) -> MultiAgentRuntimeResult:
+    """Run a gated multi-agent workflow from one command.
+
+    The runtime intentionally uses normal run directories for each child agent.
+    Coding agents run first and may run in parallel. Test and quality agents are
+    gates; docs runs only after both gates pass.
+    """
+    if code_agents < 1:
+        raise ValueError("code_agents must be at least 1")
+
+    parent = dispatch_task(goal, changed_files=changed_files, runs_dir=runs_dir)
+    run_dir = Path(parent.run_dir)
+    plan_path = run_dir / "multi_agent_plan.json"
+    summary_path = run_dir / "multi_agent_summary.json"
+    specs = _multi_agent_specs(goal, code_agents, include_docs_agent)
+    plan_path.write_text(json.dumps(_runtime_plan_payload(parent, specs), indent=2) + "\n")
+    record_checkpoint(
+        parent.run_id,
+        "Multi-agent runtime started.",
+        artifacts=(str(plan_path),),
+        runs_dir=runs_dir,
+    )
+
+    child_ids: list[str] = []
+    phase_results: list[LaunchResult] = []
+    code_specs = tuple(spec for spec in specs if spec.phase == "code")
+    gate_specs = tuple(spec for spec in specs if spec.phase == "gate")
+    docs_specs = tuple(spec for spec in specs if spec.phase == "docs")
+
+    with ThreadPoolExecutor(max_workers=len(code_specs)) as executor:
+        future_to_spec = {
+            executor.submit(
+                _dispatch_and_launch_child,
+                parent,
+                spec,
+                runs_dir,
+                agent_cmd,
+                agent,
+                timeout_s,
+            ): spec
+            for spec in code_specs
+        }
+        for future in as_completed(future_to_spec):
+            child_id, result = future.result()
+            child_ids.append(child_id)
+            phase_results.append(result)
+
+    if not _all_completed(phase_results):
+        final = _finish_multi_agent_parent(
+            parent.run_id,
+            phase_results,
+            child_ids,
+            summary_path,
+            "Stopped: at least one coding agent failed or blocked.",
+            RunStatus.FAILED,
+            runs_dir,
+        )
+        return MultiAgentRuntimeResult(
+            run_id=parent.run_id,
+            child_run_ids=tuple(child_ids),
+            phase_results=tuple(phase_results),
+            final_status=final.status,
+            summary_path=str(summary_path),
+        )
+
+    for spec in gate_specs:
+        child_id, result = _dispatch_and_launch_child(
+            parent,
+            spec,
+            runs_dir,
+            agent_cmd,
+            agent,
+            timeout_s,
+        )
+        child_ids.append(child_id)
+        phase_results.append(result)
+        if result.final_status is not RunStatus.COMPLETED:
+            final = _finish_multi_agent_parent(
+                parent.run_id,
+                phase_results,
+                child_ids,
+                summary_path,
+                f"Stopped: gate agent {spec.role} ended {result.final_status.value}.",
+                RunStatus.FAILED,
+                runs_dir,
+            )
+            return MultiAgentRuntimeResult(
+                run_id=parent.run_id,
+                child_run_ids=tuple(child_ids),
+                phase_results=tuple(phase_results),
+                final_status=final.status,
+                summary_path=str(summary_path),
+            )
+
+    for spec in docs_specs:
+        child_id, result = _dispatch_and_launch_child(
+            parent,
+            spec,
+            runs_dir,
+            agent_cmd,
+            agent,
+            timeout_s,
+        )
+        child_ids.append(child_id)
+        phase_results.append(result)
+        if result.final_status is not RunStatus.COMPLETED:
+            final = _finish_multi_agent_parent(
+                parent.run_id,
+                phase_results,
+                child_ids,
+                summary_path,
+                f"Stopped: docs agent ended {result.final_status.value}.",
+                RunStatus.FAILED,
+                runs_dir,
+            )
+            return MultiAgentRuntimeResult(
+                run_id=parent.run_id,
+                child_run_ids=tuple(child_ids),
+                phase_results=tuple(phase_results),
+                final_status=final.status,
+                summary_path=str(summary_path),
+            )
+
+    final = _finish_multi_agent_parent(
+        parent.run_id,
+        phase_results,
+        child_ids,
+        summary_path,
+        "Multi-agent runtime completed all phases.",
+        RunStatus.COMPLETED,
+        runs_dir,
+    )
+    return MultiAgentRuntimeResult(
+        run_id=parent.run_id,
+        child_run_ids=tuple(child_ids),
+        phase_results=tuple(phase_results),
+        final_status=final.status,
+        summary_path=str(summary_path),
     )
 
 
@@ -334,6 +505,9 @@ You own this task as `{packet["owner_agent"]}`.
 - Follow every listed constraint.
 - Before substantial execution, create or update artifacts listed in `expected_artifacts`.
 - Run the validation plan or record why a step could not be run.
+- When available, use the repo MCP server
+  `python -m src.orchestration.mcp_server` for ATPG, coverage, or circuit
+  simulation checks instead of ad hoc scripts.
 - Record progress with:
   `python -m src.orchestration.cli checkpoint {record.run_id} "message"`
 - Finish with:
@@ -341,6 +515,163 @@ You own this task as `{packet["owner_agent"]}`.
 - If blocked, record:
   `python -m src.orchestration.cli checkpoint {record.run_id} "blocker" --status blocked`
 """
+
+
+def _multi_agent_specs(
+    goal: str,
+    code_agents: int,
+    include_docs_agent: bool,
+) -> tuple[RuntimeAgentSpec, ...]:
+    specs = [
+        RuntimeAgentSpec(
+            role=f"coding_agent_{index}",
+            phase="code",
+            goal=(
+                f"Implement coding slice {index} for: {goal}. "
+                "Make repo-native code changes only within the needed scope, "
+                "record artifacts, and stop when ready for validation."
+            ),
+        )
+        for index in range(1, code_agents + 1)
+    ]
+    specs.extend(
+        [
+            RuntimeAgentSpec(
+                role="test_coverage_gate",
+                phase="gate",
+                goal=(
+                    f"Run tests and analyze coverage for: {goal}. "
+                    "Provide concrete pass/fail feedback for the coding agents, "
+                    "including commands, failures, coverage gaps, and artifacts."
+                ),
+            ),
+            RuntimeAgentSpec(
+                role="quality_review_gate",
+                phase="gate",
+                goal=(
+                    f"Review code quality for: {goal}. "
+                    "Check diffs, maintainability, repo rules, unsupported claims, "
+                    "and whether the test artifacts justify passing the gate."
+                ),
+            ),
+        ]
+    )
+    if include_docs_agent:
+        specs.append(
+            RuntimeAgentSpec(
+                role="docs_results_agent",
+                phase="docs",
+                goal=(
+                    f"Update documentation for validated changes from: {goal}. "
+                    "Keep docs aligned with runtime behavior and record dated "
+                    "experiment/result notes when results changed."
+                ),
+            )
+        )
+    return tuple(specs)
+
+
+def _runtime_plan_payload(
+    parent: RunRecord,
+    specs: tuple[RuntimeAgentSpec, ...],
+) -> dict[str, Any]:
+    return {
+        "parent_run_id": parent.run_id,
+        "goal": parent.goal,
+        "communication": "shared worktree plus run artifacts under runs/orchestration",
+        "gate_policy": (
+            "coding agents must complete; test_coverage_gate and quality_review_gate "
+            "must complete before docs_results_agent runs"
+        ),
+        "agents": [asdict(spec) for spec in specs],
+    }
+
+
+def _dispatch_and_launch_child(
+    parent: RunRecord,
+    spec: RuntimeAgentSpec,
+    runs_dir: Path | str,
+    agent_cmd: tuple[str, ...] | None,
+    agent: str | None,
+    timeout_s: int | None,
+) -> tuple[str, LaunchResult]:
+    child_run_id = f"{parent.run_id}-{_safe_slug(spec.role)}"
+    child = dispatch_task(spec.goal, runs_dir=runs_dir, run_id=child_run_id)
+    _append_runtime_context(child, parent, spec)
+    result = launch_run(
+        child.run_id,
+        runs_dir=runs_dir,
+        agent_cmd=agent_cmd,
+        agent=agent,
+        timeout_s=timeout_s,
+    )
+    return child.run_id, result
+
+
+def _append_runtime_context(
+    child: RunRecord,
+    parent: RunRecord,
+    spec: RuntimeAgentSpec,
+) -> None:
+    prompt_path = Path(child.run_dir) / "agent_prompt.md"
+    prompt_path.write_text(
+        prompt_path.read_text()
+        + f"""
+
+## Multi-Agent Runtime Context
+
+Parent run ID: {parent.run_id}
+Parent goal: {parent.goal}
+Runtime role: {spec.role}
+Runtime phase: {spec.phase}
+
+- Communicate through checkpoints and artifacts in the parent/child run directories.
+- Inspect sibling artifacts under `{Path(parent.run_dir).parent}` when useful.
+- Do not revert unrelated worktree changes or edits made by sibling agents.
+- If this is a gate role, provide a clear pass/fail decision and actionable feedback.
+- If this is the docs role, only document validated behavior and cite artifacts.
+"""
+    )
+
+
+def _finish_multi_agent_parent(
+    parent_run_id: str,
+    phase_results: list[LaunchResult],
+    child_ids: list[str],
+    summary_path: Path,
+    message: str,
+    status: RunStatus,
+    runs_dir: Path | str,
+) -> RunRecord:
+    summary = {
+        "parent_run_id": parent_run_id,
+        "status": status.value,
+        "message": message,
+        "child_run_ids": child_ids,
+        "phase_results": [
+            {
+                "run_id": result.run_id,
+                "status": result.final_status.value,
+                "returncode": result.returncode,
+                "stdout": result.stdout_path,
+                "stderr": result.stderr_path,
+            }
+            for result in phase_results
+        ],
+    }
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+    artifacts = (str(summary_path),)
+    if status is RunStatus.COMPLETED:
+        return complete_run(parent_run_id, message, artifacts=artifacts, runs_dir=runs_dir)
+    return fail_run(parent_run_id, message, artifacts=artifacts, runs_dir=runs_dir)
+
+
+def _all_completed(results: list[LaunchResult]) -> bool:
+    return all(result.final_status is RunStatus.COMPLETED for result in results)
+
+
+def _safe_slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "agent"
 
 
 def _append_progress(
@@ -377,7 +708,13 @@ def _write_run_files(record: RunRecord) -> None:
 
     state_path.write_text(json.dumps(_record_to_dict(record), indent=2) + "\n")
     packet_path.write_text(json.dumps(record.task_packet, indent=2) + "\n")
-    prompt_path.write_text(build_agent_prompt(record))
+    prompt_text = build_agent_prompt(record)
+    if prompt_path.exists():
+        existing = prompt_path.read_text()
+        marker = "\n## Multi-Agent Runtime Context\n"
+        if marker in existing:
+            prompt_text += existing[existing.index(marker) :]
+    prompt_path.write_text(prompt_text)
     if record.task_packet["run_manifest_required"] and not manifest_path.exists():
         manifest_path.write_text(_default_manifest(record))
 

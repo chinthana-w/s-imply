@@ -53,8 +53,8 @@ class TestAIPodem(unittest.TestCase):
         )
 
         self.assertTrue(result)
-        mock_solver_instance.solve.assert_called_once()
-        # Should call mogu_podem_wrapper
+        self.assertEqual(mock_solver_instance.solve.call_count, 5)
+        # Should call mogu_podem_wrapper for the clean retry
         mock_podem.assert_called_once()
 
     @patch("src.atpg.ai_podem.ModelPairPredictor")
@@ -86,6 +86,83 @@ class TestAIPodem(unittest.TestCase):
         self.assertIsNotNone(kwargs.get("backtrace_func"))
         self.assertIsInstance(kwargs.get("backtrace_func"), AIBacktracer)
         print("\nTest AI Prop Only: OK")
+
+    @patch("src.atpg.ai_podem.ModelPairPredictor")
+    @patch("src.atpg.ai_podem.HierarchicalReconvSolver")
+    @patch("src.atpg.ai_podem.mogu_podem_wrapper")
+    def test_ai_propagation_only_respects_max_backtracks(
+        self, mock_podem, mock_solver_cls, mock_predictor_cls
+    ):
+        """Propagation-only PODEM must honor the caller's backtrack budget."""
+        circuit, total_gates = create_mock_circuit()
+        fault = Fault(3, LogicValue.D)
+
+        mock_podem.return_value = True
+
+        ai_podem(
+            circuit,
+            fault,
+            total_gates,
+            circuit_path="dummy.bench",
+            enable_ai_activation=False,
+            enable_ai_propagation=True,
+            max_backtracks=12345,
+        )
+
+        _, kwargs = mock_podem.call_args
+        self.assertEqual(kwargs.get("max_backtracks"), 12345)
+
+    @patch("src.atpg.ai_podem.ModelPairPredictor")
+    @patch("src.atpg.ai_podem.HierarchicalReconvSolver")
+    @patch("src.atpg.ai_podem.mogu_podem_wrapper")
+    def test_ai_activation_clean_retry_respects_max_backtracks(
+        self, mock_podem, mock_solver_cls, mock_predictor_cls
+    ):
+        """Clean fallback retry must honor the caller's backtrack budget."""
+        circuit, total_gates = create_mock_circuit()
+        fault = Fault(3, LogicValue.D)
+        mock_solver_cls.return_value.solve.return_value = {1: LogicValue.ONE}
+        mock_podem.side_effect = [False, True]
+
+        result = ai_podem(
+            circuit,
+            fault,
+            total_gates,
+            circuit_path="dummy.bench",
+            enable_ai_activation=True,
+            enable_ai_propagation=False,
+            max_backtracks=12345,
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(mock_podem.call_count, 2)
+        for call in mock_podem.call_args_list:
+            self.assertEqual(call.kwargs.get("max_backtracks"), 12345)
+
+    @patch("src.atpg.ai_podem.ModelPairPredictor")
+    @patch("src.atpg.ai_podem.HierarchicalReconvSolver")
+    @patch("src.atpg.ai_podem.mogu_podem_wrapper")
+    def test_ai_backtracer_receives_no_fallback(
+        self, mock_podem, mock_solver_cls, mock_predictor_cls
+    ):
+        """No-fallback mode must propagate into AI backtrace during PODEM."""
+        circuit, total_gates = create_mock_circuit()
+        fault = Fault(3, LogicValue.D)
+
+        mock_podem.return_value = False
+
+        ai_podem(
+            circuit,
+            fault,
+            total_gates,
+            circuit_path="dummy.bench",
+            enable_ai_activation=False,
+            enable_ai_propagation=True,
+            no_fallback=True,
+        )
+
+        _, kwargs = mock_podem.call_args
+        self.assertTrue(kwargs["backtrace_func"].no_fallback)
 
     def test_ai_backtracer_logic(self):
         """Test the AIBacktracer __call__ logic."""

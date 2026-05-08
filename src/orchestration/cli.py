@@ -21,6 +21,7 @@ from src.orchestration.runner import (
     list_runs,
     load_run,
     record_checkpoint,
+    run_multi_agent_runtime,
     task_packet_to_dict,
 )
 from src.orchestration.tools import (
@@ -47,6 +48,24 @@ def main() -> None:
     dispatch.add_argument("goal")
     dispatch.add_argument("--changed-file", action="append", default=[])
     dispatch.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR))
+
+    run = sub.add_parser("run", help="Create and launch one orchestration run")
+    run.add_argument("goal")
+    run.add_argument("--changed-file", action="append", default=[])
+    run.add_argument("--agent", choices=["codex", "gemini", "claude"])
+    run.add_argument("--agent-cmd", default="")
+    run.add_argument("--timeout-s", type=int)
+    run.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR))
+
+    multi_run = sub.add_parser("multi-run", help="Create and run a gated multi-agent workflow")
+    multi_run.add_argument("goal")
+    multi_run.add_argument("--changed-file", action="append", default=[])
+    multi_run.add_argument("--code-agents", type=int, default=1)
+    multi_run.add_argument("--no-docs-agent", action="store_true")
+    multi_run.add_argument("--agent", choices=["codex", "gemini", "claude"])
+    multi_run.add_argument("--agent-cmd", default="")
+    multi_run.add_argument("--timeout-s", type=int)
+    multi_run.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR))
 
     status = sub.add_parser("status", help="Show run status, or the latest run when omitted")
     status.add_argument("run_id", nargs="?")
@@ -84,11 +103,13 @@ def main() -> None:
 
     launch = sub.add_parser("launch", help="Launch one queued run through an agent command")
     launch.add_argument("run_id")
+    launch.add_argument("--agent", choices=["codex", "gemini", "claude"])
     launch.add_argument("--agent-cmd", default="")
     launch.add_argument("--timeout-s", type=int)
     launch.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR))
 
     worker = sub.add_parser("worker", help="Launch queued runs oldest first")
+    worker.add_argument("--agent", choices=["codex", "gemini", "claude"])
     worker.add_argument("--agent-cmd", default="")
     worker.add_argument("--max-runs", type=int)
     worker.add_argument("--timeout-s", type=int)
@@ -123,6 +144,33 @@ def main() -> None:
         )
         print(format_run_status(record))
         print(f"\nAgent prompt: {Path(record.run_dir) / 'agent_prompt.md'}")
+    elif args.command == "run":
+        record = dispatch_task(
+            args.goal,
+            changed_files=tuple(args.changed_file),
+            runs_dir=Path(args.runs_dir),
+        )
+        print(f"Created run: {record.run_id}")
+        result = launch_run(
+            record.run_id,
+            runs_dir=Path(args.runs_dir),
+            agent_cmd=_parse_agent_cmd(args.agent_cmd),
+            agent=args.agent,
+            timeout_s=args.timeout_s,
+        )
+        print(_format_launch_result(result))
+    elif args.command == "multi-run":
+        result = run_multi_agent_runtime(
+            args.goal,
+            changed_files=tuple(args.changed_file),
+            runs_dir=Path(args.runs_dir),
+            agent_cmd=_parse_agent_cmd(args.agent_cmd),
+            agent=args.agent,
+            code_agents=args.code_agents,
+            include_docs_agent=not args.no_docs_agent,
+            timeout_s=args.timeout_s,
+        )
+        print(_format_multi_agent_result(result))
     elif args.command == "status":
         record = _load_selected_run(args.run_id, args.runs_dir)
         print(format_run_status(record))
@@ -164,10 +212,14 @@ def main() -> None:
         )
         print(format_run_status(record))
     elif args.command == "launch":
+        run = load_run(args.run_id, Path(args.runs_dir))
+        if run.status is not RunStatus.QUEUED:
+            raise SystemExit(_format_launch_blocked(run))
         result = launch_run(
             args.run_id,
             runs_dir=Path(args.runs_dir),
             agent_cmd=_parse_agent_cmd(args.agent_cmd),
+            agent=args.agent,
             timeout_s=args.timeout_s,
         )
         print(_format_launch_result(result))
@@ -175,6 +227,7 @@ def main() -> None:
         results = launch_queued_runs(
             runs_dir=Path(args.runs_dir),
             agent_cmd=_parse_agent_cmd(args.agent_cmd),
+            agent=args.agent,
             max_runs=args.max_runs,
             timeout_s=args.timeout_s,
         )
@@ -219,6 +272,42 @@ def _format_launch_result(result) -> str:
         f"Command: {shlex.join(result.command)}\n"
         f"Stdout: {result.stdout_path}\n"
         f"Stderr: {result.stderr_path}"
+    )
+
+
+def _format_multi_agent_result(result) -> str:
+    lines = [
+        f"Run: {result.run_id}",
+        f"Status: {result.final_status.value}",
+        f"Summary: {result.summary_path}",
+        "Child runs:",
+    ]
+    lines.extend(f"- {run_id}" for run_id in result.child_run_ids)
+    lines.append("Phase results:")
+    lines.extend(
+        f"- {phase.run_id}: {phase.final_status.value} "
+        f"(return code {phase.returncode}, stdout {phase.stdout_path}, stderr {phase.stderr_path})"
+        for phase in result.phase_results
+    )
+    return "\n".join(lines)
+
+
+def _format_launch_blocked(record) -> str:
+    run_dir = Path(record.run_dir)
+    status_cmd = f"python -m src.orchestration.cli status {record.run_id}"
+    prompt_cmd = f"python -m src.orchestration.cli prompt {record.run_id}"
+    fail_cmd = f"python -m src.orchestration.cli fail {record.run_id} \"reason\""
+    complete_cmd = f"python -m src.orchestration.cli complete {record.run_id} \"summary\""
+    return (
+        f"Run {record.run_id} is {record.status.value}; launch only starts queued runs.\n\n"
+        f"{format_run_status(record)}\n\n"
+        "Next steps:\n"
+        f"- Inspect status: {status_cmd}\n"
+        f"- Read the handoff prompt: {prompt_cmd}\n"
+        f"- Review logs if this was already launched: {run_dir / 'agent_stdout.log'} "
+        f"and {run_dir / 'agent_stderr.log'}\n"
+        f"- Close it when done: {complete_cmd}\n"
+        f"- Mark it failed if the launch was abandoned: {fail_cmd}"
     )
 
 

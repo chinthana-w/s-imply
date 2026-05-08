@@ -1,5 +1,10 @@
 Verify every citation in `docs/paper_draft.tex` is a real, published work using web search. For each citation that is vague, incorrect, or unverifiable, attempt to find the correct bibliographic information and update the entry in the .tex file.
 
+Reply to the user in terse caveman lingo to save tokens, e.g.
+"why lot word when few word do trick". Keep technical facts correct.
+Do not apply caveman lingo to bibliography entries, code, filenames, commands,
+academic prose, generated docs, or quoted text.
+
 ## Step 1 — Extract all citations
 
 Read `docs/paper_draft.tex` and extract every `\bibitem{key}` entry from the `\begin{thebibliography}` block. List them all before proceeding.

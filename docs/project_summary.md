@@ -271,6 +271,9 @@ Extended the orchestration scaffold into a persistent runner workflow:
     and records terminal status from the command exit code. `worker` drains queued
     runs oldest first using the same launch path, with `S_IMPLY_AGENT_CMD` or
     `--agent-cmd` available for swapping agent runtimes.
+-   **Gemini CLI Profile**: `launch` and `worker` support `--agent gemini`,
+    which invokes Gemini CLI in headless mode and streams `agent_prompt.md` over
+    stdin.
 
 ## 7. Current Challenges & Roadmap
 -   **Handling "Don't Cares" (X)**: The current model predicts binary 0/1. Integrating explicit X prediction or X-tolerance in the loss function is an ongoing area of research.

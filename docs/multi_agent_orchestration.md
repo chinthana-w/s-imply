@@ -43,6 +43,55 @@ This creates `runs/orchestration/<run_id>/` with:
 - `events.jsonl`: append-only progress events.
 - `run_manifest.json`: created when the packet requires a manifest.
 
+Create and launch a run in one command:
+
+```bash
+python -m src.orchestration.cli run "Fix GradScaler checkpoint compatibility"
+```
+
+Use this as the default path when you want the local agent runner to create the
+ledger, generate `agent_prompt.md`, launch the selected agent, and write
+`agent_stdout.log` / `agent_stderr.log` without manually copying a run id.
+
+Create and launch a gated multi-agent runtime in one command:
+
+```bash
+python -m src.orchestration.cli multi-run "Improve the train/test pipeline" --code-agents 2
+```
+
+`multi-run` creates a parent run plus child runs for:
+
+- one or more coding agents, launched first and in parallel when
+  `--code-agents` is greater than `1`;
+- a `test_coverage_gate` agent that runs tests, analyzes coverage, and records
+  pass/fail feedback;
+- a `quality_review_gate` agent that reviews code quality, repo rules, and
+  artifact-backed claims;
+- a `docs_results_agent`, unless `--no-docs-agent` is passed, which runs only
+  after the gate agents complete successfully.
+
+The runtime writes `multi_agent_plan.json` and `multi_agent_summary.json` in the
+parent run directory. Child agents communicate through checkpoints, logs,
+artifacts, and the shared worktree; there is no hidden in-memory chat bus.
+
+## MCP Tools
+
+Local agents can connect to the repo MCP server over stdio:
+
+```bash
+python -m src.orchestration.mcp_server
+```
+
+The server exposes allowlisted tools for validation and circuit inspection:
+
+- `run_atpg`: bounded vanilla PODEM over a bench circuit and fault subset.
+- `run_test_coverage`: focused pytest targets with coverage JSON output.
+- `simulate_circuit`: forward simulation for a bench file and explicit gate/input
+  assignments.
+
+The execution tools default to `dry_run: true`; agents must explicitly request
+execution when they need to run ATPG or coverage.
+
 Show the latest run, or a specific run:
 
 ```bash
@@ -100,23 +149,39 @@ Launch one queued run through the default agent command:
 python -m src.orchestration.cli launch <run_id>
 ```
 
-By default this uses:
+By default this uses the Codex profile:
 
 ```bash
-codex exec --cd <repo> --sandbox workspace-write --ask-for-approval never -
+codex exec --cd <repo> --sandbox workspace-write -
 ```
+
+Use Gemini CLI instead:
+
+```bash
+python -m src.orchestration.cli launch <run_id> --agent gemini
+python -m src.orchestration.cli worker --agent gemini --max-runs 3
+```
+
+The Gemini profile uses:
+
+```bash
+gemini --skip-trust --approval-mode yolo -p ""
+```
+
+Gemini CLI appends stdin to the `-p/--prompt` value, so the runner still sends
+`agent_prompt.md` over stdin.
 
 Override the command for one launch:
 
 ```bash
 python -m src.orchestration.cli launch <run_id> \
-    --agent-cmd "codex exec --cd /home/local1/chinthana/s-imply --sandbox workspace-write --ask-for-approval never -"
+    --agent-cmd "codex exec --cd /home/local1/chinthana/s-imply --sandbox workspace-write -"
 ```
 
 Or configure it once in the shell:
 
 ```bash
-export S_IMPLY_AGENT_CMD="codex exec --cd /home/local1/chinthana/s-imply --sandbox workspace-write --ask-for-approval never -"
+export S_IMPLY_AGENT_CMD="codex exec --cd /home/local1/chinthana/s-imply --sandbox workspace-write -"
 python -m src.orchestration.cli launch <run_id>
 ```
 
@@ -130,6 +195,10 @@ Each launch writes:
 
 - `agent_stdout.log`
 - `agent_stderr.log`
+
+`launch` only starts runs whose status is `queued`. If a run is already
+`running`, `blocked`, `completed`, or `failed`, the command prints the current
+status and concrete follow-up commands instead of starting a second agent.
 
 The runner marks the run `running` before launch. If the agent command exits
 with code `0`, the run is marked `completed` unless the agent already marked it

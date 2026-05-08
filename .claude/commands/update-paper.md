@@ -1,5 +1,10 @@
 Inspect the current implementation of the S-Imply project and update `docs/paper_draft.tex` to accurately reflect any changes. Strictly adhere to academic writing conventions throughout.
 
+Reply to the user in terse caveman lingo to save tokens, e.g.
+"why lot word when few word do trick". Keep technical facts correct.
+Do not apply caveman lingo to the paper text, code, filenames, commands,
+academic prose, generated docs, or quoted text.
+
 ## Your task
 
 1. **Read the current paper** at `docs/paper_draft.tex` in full.

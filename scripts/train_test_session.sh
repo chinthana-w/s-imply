@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Bash reads long scripts incrementally. Re-exec a stable snapshot so edits to
+# this file while a run is active cannot corrupt later stages.
+if [[ -z "${TRAIN_TEST_SESSION_SNAPSHOT:-}" ]]; then
+  export TRAIN_TEST_SESSION_ROOT="$(
+    cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd
+  )"
+  snapshot_path="$(mktemp "${TMPDIR:-/tmp}/train_test_session.XXXXXX.sh")"
+  cp "${BASH_SOURCE[0]}" "$snapshot_path"
+  chmod +x "$snapshot_path"
+  export TRAIN_TEST_SESSION_SNAPSHOT=1
+  exec bash "$snapshot_path" "$@"
+fi
+
 # Unified ISCAS85/89 train + ITC99-gate test session.
 #
 # Quick default:
@@ -12,8 +25,12 @@ set -Eeuo pipefail
 # Useful overrides:
 #   RUN_ID=my_run EPOCHS=10 MAX_FAULTS=250 BATCH_SIZE=512 bash scripts/train_test_session.sh
 #   STAGES="select_gate train test" CHECKPOINT_DIR=checkpoints/existing bash scripts/train_test_session.sh
+#
+# Resource guards:
+#   CLEAN_PREVIOUS_RUNS=1 KEEP_LATEST_RUNS=1 bash scripts/train_test_session.sh
+#   MIN_CACHE_FREE_GB=50 MIN_REPO_FREE_GB=10 MIN_RAM_AVAILABLE_GB=16 bash scripts/train_test_session.sh
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="${TRAIN_TEST_SESSION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$ROOT_DIR"
 
 timestamp() {
@@ -25,8 +42,10 @@ log() {
 }
 
 run_step() {
+  check_resources "before $*"
   log "Running: $*"
   "$@"
+  check_resources "after $*"
 }
 
 contains_stage() {
@@ -79,6 +98,8 @@ FFN_DIM="${FFN_DIM:-2048}"
 ENC_LAYERS="${ENC_LAYERS:-3}"
 INT_LAYERS="${INT_LAYERS:-3}"
 NHEAD="${NHEAD:-4}"
+TRAIN_GPU_IDS="${TRAIN_GPU_IDS:-0,1}"
+SINGLE_GPU="${SINGLE_GPU:-0}"
 
 LAMBDA_SUPERVISED_NODE="${LAMBDA_SUPERVISED_NODE:-2.0}"
 LAMBDA_SOLVABILITY="${LAMBDA_SOLVABILITY:-0.5}"
@@ -90,12 +111,116 @@ CANDIDATE_COUNT="${CANDIDATE_COUNT:-8}"
 MAX_BACKTRACKS="${MAX_BACKTRACKS:-5000}"
 AMP_FLAG="${AMP_FLAG:---amp}"
 
+MIN_CACHE_FREE_GB="${MIN_CACHE_FREE_GB:-20}"
+MIN_REPO_FREE_GB="${MIN_REPO_FREE_GB:-5}"
+MIN_RAM_AVAILABLE_GB="${MIN_RAM_AVAILABLE_GB:-8}"
+CLEAN_PREVIOUS_RUNS="${CLEAN_PREVIOUS_RUNS:-0}"
+KEEP_LATEST_RUNS="${KEEP_LATEST_RUNS:-1}"
+
+existing_path_for_df() {
+  local path="$1"
+  while [[ ! -e "$path" && "$path" != "/" ]]; do
+    path="$(dirname "$path")"
+  done
+  printf '%s\n' "$path"
+}
+
+available_disk_gb() {
+  local path
+  path="$(existing_path_for_df "$1")"
+  df -Pk "$path" | awk 'NR == 2 { printf "%.0f", $4 / 1024 / 1024 }'
+}
+
+available_ram_gb() {
+  awk '/MemAvailable:/ { printf "%.0f", $2 / 1024 / 1024 }' /proc/meminfo
+}
+
+assert_disk_available() {
+  local label="$1"
+  local path="$2"
+  local min_gb="$3"
+  local available_gb
+  available_gb="$(available_disk_gb "$path")"
+  if (( available_gb < min_gb )); then
+    log "ERROR: ${label} has ${available_gb} GiB free; need at least ${min_gb} GiB."
+    log "Set CLEAN_PREVIOUS_RUNS=1 or move CACHE_ROOT/CHECKPOINT_DIR to a larger filesystem."
+    exit 1
+  fi
+}
+
+assert_ram_available() {
+  local min_gb="$1"
+  local available_gb
+  available_gb="$(available_ram_gb)"
+  if (( available_gb < min_gb )); then
+    log "ERROR: RAM has ${available_gb} GiB available; need at least ${min_gb} GiB."
+    log "Reduce BATCH_SIZE, NUM_WORKERS, SHARD_CACHE_SIZE, MODEL_DIM, FFN_DIM, or MAX_PATHS."
+    exit 1
+  fi
+}
+
+resource_snapshot() {
+  log "Resource snapshot: cache_free=$(available_disk_gb "$CACHE_ROOT")GiB repo_free=$(available_disk_gb "$ROOT_DIR")GiB ram_available=$(available_ram_gb)GiB"
+}
+
+check_resources() {
+  local context="$1"
+  log "Checking resources (${context})"
+  assert_disk_available "CACHE_ROOT filesystem" "$CACHE_ROOT" "$MIN_CACHE_FREE_GB"
+  assert_disk_available "CHECKPOINT_DIR filesystem" "$CHECKPOINT_DIR" "$MIN_REPO_FREE_GB"
+  assert_disk_available "REPORT_DIR filesystem" "$REPORT_DIR" "$MIN_REPO_FREE_GB"
+  assert_ram_available "$MIN_RAM_AVAILABLE_GB"
+  resource_snapshot
+}
+
+cleanup_glob_except_current() {
+  local current_path="$1"
+  local keep_latest="$2"
+  shift 2
+  local candidates=()
+  local path
+  for path in "$@"; do
+    [[ -e "$path" ]] || continue
+    [[ "$(realpath -m "$path")" == "$(realpath -m "$current_path")" ]] && continue
+    candidates+=("$path")
+  done
+  if (( ${#candidates[@]} == 0 )); then
+    return
+  fi
+  mapfile -t candidates < <(ls -dt "${candidates[@]}")
+  if (( keep_latest > 0 && ${#candidates[@]} > keep_latest )); then
+    candidates=("${candidates[@]:$keep_latest}")
+  elif (( keep_latest > 0 )); then
+    return
+  fi
+  for path in "${candidates[@]}"; do
+    log "Removing previous train/test session artifact: ${path}"
+    rm -rf -- "$path"
+  done
+}
+
+cleanup_previous_runs() {
+  log "Cleaning previous train_test_session.sh outputs"
+  cleanup_glob_except_current "$CACHE_ROOT" "$KEEP_LATEST_RUNS" \
+    "$(dirname "$CACHE_ROOT")"/*
+  cleanup_glob_except_current "$CHECKPOINT_DIR" "$KEEP_LATEST_RUNS" \
+    checkpoints/iscas85_89_*
+  cleanup_glob_except_current "$REPORT_DIR" "$KEEP_LATEST_RUNS" \
+    docs/session_reports/*
+}
+
+if [[ "$CLEAN_PREVIOUS_RUNS" == "1" ]]; then
+  cleanup_previous_runs
+fi
+
 mkdir -p "$CACHE_ROOT" "$REPORT_DIR"
 
 log "Session ID: ${RUN_ID}"
 log "Stages: ${STAGES}"
 log "Cache root: ${CACHE_ROOT}"
 log "Checkpoint dir: ${CHECKPOINT_DIR}"
+log "Resource minimums: cache=${MIN_CACHE_FREE_GB}GiB repo=${MIN_REPO_FREE_GB}GiB ram=${MIN_RAM_AVAILABLE_GB}GiB"
+check_resources "startup"
 
 if contains_stage build_data; then
   build_args=(
@@ -139,7 +264,8 @@ else
 fi
 
 if contains_stage train; then
-  run_step python -m src.ml.train train \
+  train_args=(
+    python -m src.ml.train train
     --dataset "$CHUNK_DIR" \
     --processed-dir "$SHARD_DIR" \
     --output "$CHECKPOINT_DIR" \
@@ -161,7 +287,13 @@ if contains_stage train; then
     --lambda-solvability "$LAMBDA_SOLVABILITY" \
     --lambda-shared-node "$LAMBDA_SHARED_NODE" \
     --lambda-logic "$LAMBDA_LOGIC" \
-    --lambda-full-logic "$LAMBDA_FULL_LOGIC"
+    --lambda-full-logic "$LAMBDA_FULL_LOGIC" \
+    --gpu-ids "$TRAIN_GPU_IDS"
+  )
+  if [[ "$SINGLE_GPU" == "1" ]]; then
+    train_args+=(--single-gpu)
+  fi
+  run_step "${train_args[@]}"
 else
   log "Skipping train"
 fi
