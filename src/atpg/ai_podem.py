@@ -6,6 +6,7 @@ import torch
 
 from src.atpg.logic_sim_three import print_pi, reset_gates
 from src.atpg.podem import (
+    SUCCESS,
     get_all_faults,
     initialize,
     podem,
@@ -183,6 +184,11 @@ class AIBacktracer:
         if self.verbose:
             print("  [AI-BT] Fallback to simple_backtrace")
         return simple_backtrace(objective, circuit)
+
+
+def _podem_succeeded(result: int | bool) -> bool:
+    """Return True only for an explicit PODEM success status."""
+    return result == SUCCESS
 
 
 def post_process_logic_gates(
@@ -839,7 +845,7 @@ def ai_podem(
                     backtrace_func=backtracer,
                     max_backtracks=max_backtracks,
                 )
-                if result:
+                if _podem_succeeded(result):
                     if verbose:
                         print(f"[AI-PODEM] Success on attempt {attempt+1}!")
                         print("Test Pattern:", print_pi(circuit, total_gates))
@@ -870,7 +876,7 @@ def ai_podem(
             backtrace_func=backtracer,
             max_backtracks=max_backtracks,
         )
-        if result:
+        if _podem_succeeded(result):
             if verbose:
                 print("[AI-PODEM] Success (No Activation pre-fill)!")
                 print("Test Pattern:", print_pi(circuit, total_gates))
@@ -878,7 +884,7 @@ def ai_podem(
 
     # --- Step 3: Global Fallback ---
     # If we used AI Activation and failed, retry Clean (unless no_fallback is set)
-    if enable_ai_activation and not result:
+    if enable_ai_activation and not _podem_succeeded(result):
         if no_fallback:
             return False
         if verbose:
@@ -892,7 +898,7 @@ def ai_podem(
             backtrace_func=None,
             max_backtracks=max_backtracks,
         )
-        if result_retry:
+        if _podem_succeeded(result_retry):
             if verbose:
                 print("[AI-PODEM] Clean retry Success!")
                 print("Test Pattern:", print_pi(circuit, total_gates))

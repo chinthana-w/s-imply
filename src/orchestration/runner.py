@@ -6,7 +6,9 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -23,6 +25,7 @@ DEFAULT_RUNS_DIR = REPO_ROOT / "runs" / "orchestration"
 class RunStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
+    SLEEPING = "sleeping"
     BLOCKED = "blocked"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -74,27 +77,57 @@ class MultiAgentRuntimeResult:
     summary_path: str
 
 
+@dataclass(frozen=True)
+class TmuxMonitorResult:
+    session_name: str
+    run_ids: tuple[str, ...]
+    commands: tuple[tuple[str, ...], ...]
+    attach_command: tuple[str, ...]
+    dry_run: bool = False
+
+
+TOKEN_LIMIT_PATTERNS = (
+    "token limit",
+    "tokens limit",
+    "usage limit",
+    "rate limit",
+    "limit reached",
+    "quota exceeded",
+    "context length",
+    "context window",
+    "maximum context",
+    "too many tokens",
+)
+
+
 def dispatch_task(
     goal: str,
     changed_files: tuple[str, ...] = (),
     runs_dir: Path | str = DEFAULT_RUNS_DIR,
     run_id: str | None = None,
+    phase_override: str | None = None,
 ) -> RunRecord:
     """Create a persistent run directory and specialist handoff packet."""
-    packet = create_task_packet(goal, changed_files=changed_files)
+    packet = create_task_packet(
+        goal,
+        changed_files=changed_files,
+        phase_override=phase_override,
+    )
     root = Path(runs_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
     resolved_run_id = run_id or _make_run_id(goal)
     run_dir = root / resolved_run_id
     if run_dir.exists():
-        raise FileExistsError(f"Run already exists: {resolved_run_id}")
+        raise FileExistsError(
+            f"Run already exists: {resolved_run_id}"
+        )
     run_dir.mkdir(parents=True)
 
     now = _now()
     event = RunEvent(
         timestamp=now,
         status=RunStatus.QUEUED,
-        message="Run dispatched. Assign the generated prompt to the owner agent.",
+        message="Run dispatched.",
     )
     record = RunRecord(
         run_id=resolved_run_id,
@@ -119,8 +152,8 @@ def record_checkpoint(
     runs_dir: Path | str = DEFAULT_RUNS_DIR,
 ) -> RunRecord:
     """Append a progress event and update the run status."""
-    if status not in {RunStatus.RUNNING, RunStatus.BLOCKED}:
-        raise ValueError("Checkpoints may only set running or blocked status")
+    if status not in {RunStatus.RUNNING, RunStatus.SLEEPING, RunStatus.BLOCKED}:
+        raise ValueError("Checkpoints may only set running, sleeping, or blocked status")
     return _append_progress(run_id, message, artifacts, status, runs_dir)
 
 
@@ -200,6 +233,9 @@ def launch_run(
     agent_cmd: tuple[str, ...] | None = None,
     agent: str | None = None,
     timeout_s: int | None = None,
+    codex_auto_resume: bool = False,
+    codex_resume_delay_s: int = 18_000,
+    codex_max_resumes: int = 1,
 ) -> LaunchResult:
     """Launch one queued run through an agent command and capture logs."""
     record = load_run(run_id, runs_dir)
@@ -218,20 +254,38 @@ def launch_run(
         runs_dir=runs_dir,
     )
 
-    try:
-        with stdout_path.open("w") as f_out, stderr_path.open("w") as f_err:
-            result = subprocess.run(
-                command,
-                input=prompt,
-                cwd=REPO_ROOT,
-                stdout=f_out,
-                stderr=f_err,
-                text=True,
-                timeout=timeout_s,
-                check=False,
-            )
-        returncode = result.returncode
-    except subprocess.TimeoutExpired:
+    returncode = _run_agent_command(command, prompt, stdout_path, stderr_path, timeout_s, "w")
+    resume_attempts = 0
+    while (
+        codex_auto_resume
+        and _is_codex_command(command)
+        and returncode != 0
+        and resume_attempts < codex_max_resumes
+        and _logs_indicate_token_limit(stdout_path, stderr_path)
+    ):
+        resume_attempts += 1
+        record_checkpoint(
+            run_id,
+            (
+                "Codex token or usage limit reached; sleeping for "
+                f"{codex_resume_delay_s} seconds before automatic resume "
+                f"({resume_attempts}/{codex_max_resumes})."
+            ),
+            artifacts=(str(stdout_path), str(stderr_path)),
+            status=RunStatus.SLEEPING,
+            runs_dir=runs_dir,
+        )
+        time.sleep(codex_resume_delay_s)
+        record_checkpoint(
+            run_id,
+            f"Resuming Codex after token-limit sleep ({resume_attempts}/{codex_max_resumes}).",
+            artifacts=(str(stdout_path), str(stderr_path)),
+            status=RunStatus.RUNNING,
+            runs_dir=runs_dir,
+        )
+        returncode = _run_agent_command(command, prompt, stdout_path, stderr_path, timeout_s, "a")
+
+    if returncode == 124:
         final = fail_run(
             run_id,
             f"Agent command timed out after {timeout_s} seconds.",
@@ -281,6 +335,9 @@ def launch_queued_runs(
     agent: str | None = None,
     max_runs: int | None = None,
     timeout_s: int | None = None,
+    codex_auto_resume: bool = False,
+    codex_resume_delay_s: int = 18_000,
+    codex_max_resumes: int = 1,
 ) -> tuple[LaunchResult, ...]:
     """Launch queued runs oldest first."""
     queued = [record for record in list_runs(runs_dir) if record.status is RunStatus.QUEUED]
@@ -294,6 +351,9 @@ def launch_queued_runs(
             agent_cmd=agent_cmd,
             agent=agent,
             timeout_s=timeout_s,
+            codex_auto_resume=codex_auto_resume,
+            codex_resume_delay_s=codex_resume_delay_s,
+            codex_max_resumes=codex_max_resumes,
         )
         for record in queued
     )
@@ -308,6 +368,9 @@ def run_multi_agent_runtime(
     code_agents: int = 1,
     include_docs_agent: bool = True,
     timeout_s: int | None = None,
+    codex_auto_resume: bool = False,
+    codex_resume_delay_s: int = 18_000,
+    codex_max_resumes: int = 1,
 ) -> MultiAgentRuntimeResult:
     """Run a gated multi-agent workflow from one command.
 
@@ -347,6 +410,9 @@ def run_multi_agent_runtime(
                 agent_cmd,
                 agent,
                 timeout_s,
+                codex_auto_resume,
+                codex_resume_delay_s,
+                codex_max_resumes,
             ): spec
             for spec in code_specs
         }
@@ -373,35 +439,66 @@ def run_multi_agent_runtime(
             summary_path=str(summary_path),
         )
 
-    for spec in gate_specs:
-        child_id, result = _dispatch_and_launch_child(
-            parent,
-            spec,
-            runs_dir,
-            agent_cmd,
-            agent,
-            timeout_s,
-        )
-        child_ids.append(child_id)
-        phase_results.append(result)
-        if result.final_status is not RunStatus.COMPLETED:
-            final = _finish_multi_agent_parent(
-                parent.run_id,
-                phase_results,
-                child_ids,
-                summary_path,
-                f"Stopped: gate agent {spec.role} ended {result.final_status.value}.",
-                RunStatus.FAILED,
-                runs_dir,
-            )
-            return MultiAgentRuntimeResult(
-                run_id=parent.run_id,
-                child_run_ids=tuple(child_ids),
-                phase_results=tuple(phase_results),
-                final_status=final.status,
-                summary_path=str(summary_path),
-            )
+    # -- Collect summaries from coding phase for downstream --
+    code_summaries = _collect_sibling_summaries(
+        child_ids, phase_results, runs_dir
+    )
 
+    # -- Gate phase: run test + quality gates in PARALLEL --
+    if gate_specs:
+        workers = max(1, len(gate_specs))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            gate_futures = {
+                ex.submit(
+                    _dispatch_and_launch_child,
+                    parent,
+                    spec,
+                    runs_dir,
+                    agent_cmd,
+                    agent,
+                    timeout_s,
+                    codex_auto_resume,
+                    codex_resume_delay_s,
+                    codex_max_resumes,
+                    code_summaries,
+                ): spec
+                for spec in gate_specs
+            }
+            for future in as_completed(gate_futures):
+                child_id, result = future.result()
+                child_ids.append(child_id)
+                phase_results.append(result)
+
+    gate_results = phase_results[len(code_specs):]
+    if gate_results and not _all_completed(gate_results):
+        failed_gates = [
+            r for r in gate_results
+            if r.final_status is not RunStatus.COMPLETED
+        ]
+        gate_msg = ", ".join(r.run_id for r in failed_gates)
+        final = _finish_multi_agent_parent(
+            parent.run_id,
+            phase_results,
+            child_ids,
+            summary_path,
+            f"Stopped: gate(s) failed: {gate_msg}.",
+            RunStatus.FAILED,
+            runs_dir,
+        )
+        return MultiAgentRuntimeResult(
+            run_id=parent.run_id,
+            child_run_ids=tuple(child_ids),
+            phase_results=tuple(phase_results),
+            final_status=final.status,
+            summary_path=str(summary_path),
+        )
+
+    # -- Docs phase: forward all prior summaries --
+    all_summaries = code_summaries + _collect_sibling_summaries(
+        child_ids[len(code_specs):],
+        gate_results,
+        runs_dir,
+    )
     for spec in docs_specs:
         child_id, result = _dispatch_and_launch_child(
             parent,
@@ -410,6 +507,10 @@ def run_multi_agent_runtime(
             agent_cmd,
             agent,
             timeout_s,
+            codex_auto_resume,
+            codex_resume_delay_s,
+            codex_max_resumes,
+            all_summaries,
         )
         child_ids.append(child_id)
         phase_results.append(result)
@@ -419,7 +520,8 @@ def run_multi_agent_runtime(
                 phase_results,
                 child_ids,
                 summary_path,
-                f"Stopped: docs agent ended {result.final_status.value}.",
+                f"Stopped: docs agent ended "
+                f"{result.final_status.value}.",
                 RunStatus.FAILED,
                 runs_dir,
             )
@@ -446,6 +548,49 @@ def run_multi_agent_runtime(
         phase_results=tuple(phase_results),
         final_status=final.status,
         summary_path=str(summary_path),
+    )
+
+
+def launch_tmux_monitor(
+    run_id: str,
+    runs_dir: Path | str = DEFAULT_RUNS_DIR,
+    session_name: str | None = None,
+    attach: bool = False,
+    dry_run: bool = False,
+) -> TmuxMonitorResult:
+    """Create a tmux session tailing events for a parent run and its child runs."""
+    resolved_run_id = _resolve_monitor_run_id(run_id, runs_dir)
+    run_ids = _monitor_run_ids(resolved_run_id, runs_dir)
+    if not run_ids:
+        raise ValueError(f"No run event files found for monitor target: {run_id}")
+
+    resolved_session = session_name or f"s-imply-{_safe_slug(resolved_run_id)[:64]}"
+    commands = _tmux_monitor_commands(resolved_session, run_ids, runs_dir)
+    attach_command = ("tmux", "attach-session", "-t", resolved_session)
+
+    if not dry_run:
+        if shutil.which("tmux") is None:
+            raise RuntimeError("tmux is not installed or not available on PATH")
+        for command in commands:
+            if command[:3] == ("tmux", "kill-session", "-t"):
+                subprocess.run(
+                    command,
+                    cwd=REPO_ROOT,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                continue
+            subprocess.run(command, cwd=REPO_ROOT, check=True)
+        if attach:
+            subprocess.run(attach_command, cwd=REPO_ROOT, check=True)
+
+    return TmuxMonitorResult(
+        session_name=resolved_session,
+        run_ids=run_ids,
+        commands=commands,
+        attach_command=attach_command,
+        dry_run=dry_run,
     )
 
 
@@ -482,38 +627,33 @@ def format_run_status(record: RunRecord) -> str:
 
 
 def build_agent_prompt(record: RunRecord) -> str:
-    """Build the handoff prompt that should be pasted into the assigned agent."""
-    packet = record.task_packet
-    packet_json = json.dumps(packet, indent=2)
-    return f"""# S-Imply Orchestration Assignment
+    """Build a compact handoff prompt for the assigned agent."""
+    p = record.task_packet
+    rid = record.run_id
+    files = ", ".join(p["files_owned"])
+    constraints = "\n".join(f"- {c}" for c in p["constraints"])
+    validation = "\n".join(f"- {s}" for s in p["validation_plan"])
+    artifacts = ", ".join(p["expected_artifacts"])
+    cli = "python -m src.orchestration.cli"
+    return f"""# Assignment: {p["owner_agent"]}
 
-Run ID: {record.run_id}
-Status: {record.status.value}
+Run: {rid}
 Goal: {record.goal}
+Files: {files}
 
-You own this task as `{packet["owner_agent"]}`.
+## Constraints
+{constraints}
 
-## Task Packet
+## Validation
+{validation}
 
-```json
-{packet_json}
-```
+## Artifacts
+{artifacts}
 
-## Operating Rules
-
-- Work primarily within `files_owned`; explain any necessary expansion.
-- Follow every listed constraint.
-- Before substantial execution, create or update artifacts listed in `expected_artifacts`.
-- Run the validation plan or record why a step could not be run.
-- When available, use the repo MCP server
-  `python -m src.orchestration.mcp_server` for ATPG, coverage, or circuit
-  simulation checks instead of ad hoc scripts.
-- Record progress with:
-  `python -m src.orchestration.cli checkpoint {record.run_id} "message"`
-- Finish with:
-  `python -m src.orchestration.cli complete {record.run_id} "summary"`
-- If blocked, record:
-  `python -m src.orchestration.cli checkpoint {record.run_id} "blocker" --status blocked`
+## Commands
+- Progress: `{cli} checkpoint {rid} "msg"`
+- Done: `{cli} complete {rid} "summary"`
+- Blocked: `{cli} checkpoint {rid} "blocker" --status blocked`
 """
 
 
@@ -527,9 +667,8 @@ def _multi_agent_specs(
             role=f"coding_agent_{index}",
             phase="code",
             goal=(
-                f"Implement coding slice {index} for: {goal}. "
-                "Make repo-native code changes only within the needed scope, "
-                "record artifacts, and stop when ready for validation."
+                f"Do code slice {index}: {goal}. "
+                "Change repo code in scope. Make artifact. Stop when ready to validate."
             ),
         )
         for index in range(1, code_agents + 1)
@@ -540,18 +679,16 @@ def _multi_agent_specs(
                 role="test_coverage_gate",
                 phase="gate",
                 goal=(
-                    f"Run tests and analyze coverage for: {goal}. "
-                    "Provide concrete pass/fail feedback for the coding agents, "
-                    "including commands, failures, coverage gaps, and artifacts."
+                    f"Test and check coverage: {goal}. "
+                    "Give pass/fail to code agent. Include command, failure, gap, artifact."
                 ),
             ),
             RuntimeAgentSpec(
                 role="quality_review_gate",
                 phase="gate",
                 goal=(
-                    f"Review code quality for: {goal}. "
-                    "Check diffs, maintainability, repo rules, unsupported claims, "
-                    "and whether the test artifacts justify passing the gate."
+                    f"Review code: {goal}. "
+                    "Check diff, repo rule, unsupported claim. Do tests justify passing?"
                 ),
             ),
         ]
@@ -562,9 +699,8 @@ def _multi_agent_specs(
                 role="docs_results_agent",
                 phase="docs",
                 goal=(
-                    f"Update documentation for validated changes from: {goal}. "
-                    "Keep docs aligned with runtime behavior and record dated "
-                    "experiment/result notes when results changed."
+                    f"Update doc for validated change: {goal}. "
+                    "Keep doc in sync with runtime. Note dated experiment result if changed."
                 ),
             )
         )
@@ -578,10 +714,10 @@ def _runtime_plan_payload(
     return {
         "parent_run_id": parent.run_id,
         "goal": parent.goal,
-        "communication": "shared worktree plus run artifacts under runs/orchestration",
+        "communication": "share worktree, run artifact in runs/orchestration",
         "gate_policy": (
-            "coding agents must complete; test_coverage_gate and quality_review_gate "
-            "must complete before docs_results_agent runs"
+            "code agent must finish; test/quality gate "
+            "must pass before doc agent run"
         ),
         "agents": [asdict(spec) for spec in specs],
     }
@@ -594,44 +730,155 @@ def _dispatch_and_launch_child(
     agent_cmd: tuple[str, ...] | None,
     agent: str | None,
     timeout_s: int | None,
+    codex_auto_resume: bool = False,
+    codex_resume_delay_s: int = 18_000,
+    codex_max_resumes: int = 1,
+    sibling_summaries: tuple[tuple[str, str], ...] = (),
 ) -> tuple[str, LaunchResult]:
-    child_run_id = f"{parent.run_id}-{_safe_slug(spec.role)}"
-    child = dispatch_task(spec.goal, runs_dir=runs_dir, run_id=child_run_id)
-    _append_runtime_context(child, parent, spec)
+    child_run_id = (
+        f"{parent.run_id}-{_safe_slug(spec.role)}"
+    )
+    child = dispatch_task(
+        spec.goal,
+        runs_dir=runs_dir,
+        run_id=child_run_id,
+        phase_override=spec.phase,
+    )
+    _append_runtime_context(
+        child, parent, spec, sibling_summaries
+    )
     result = launch_run(
         child.run_id,
         runs_dir=runs_dir,
         agent_cmd=agent_cmd,
         agent=agent,
         timeout_s=timeout_s,
+        codex_auto_resume=codex_auto_resume,
+        codex_resume_delay_s=codex_resume_delay_s,
+        codex_max_resumes=codex_max_resumes,
     )
     return child.run_id, result
+
+
+def _run_agent_command(
+    command: tuple[str, ...],
+    prompt: str,
+    stdout_path: Path,
+    stderr_path: Path,
+    timeout_s: int | None,
+    mode: str,
+) -> int:
+    try:
+        with stdout_path.open(mode) as f_out, stderr_path.open(mode) as f_err:
+            if mode == "a":
+                f_out.write("\n\n=== automatic resume attempt ===\n")
+                f_err.write("\n\n=== automatic resume attempt ===\n")
+            result = subprocess.run(
+                command,
+                input=prompt,
+                cwd=REPO_ROOT,
+                stdout=f_out,
+                stderr=f_err,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+            )
+        return result.returncode
+    except subprocess.TimeoutExpired:
+        return 124
+
+
+def _is_codex_command(command: tuple[str, ...]) -> bool:
+    return bool(command) and Path(command[0]).name == "codex"
+
+
+def _logs_indicate_token_limit(stdout_path: Path, stderr_path: Path) -> bool:
+    text = "\n".join(_read_tail(path).lower() for path in (stdout_path, stderr_path))
+    return any(pattern in text for pattern in TOKEN_LIMIT_PATTERNS)
+
+
+def _read_tail(path: Path, limit: int = 16_384) -> str:
+    if not path.exists():
+        return ""
+    data = path.read_bytes()
+    return data[-limit:].decode("utf-8", errors="replace")
 
 
 def _append_runtime_context(
     child: RunRecord,
     parent: RunRecord,
     spec: RuntimeAgentSpec,
+    sibling_summaries: tuple[tuple[str, str], ...] = (),
 ) -> None:
     prompt_path = Path(child.run_dir) / "agent_prompt.md"
+    sibling_block = ""
+    if sibling_summaries:
+        lines = ["\n## Sibling Results\n"]
+        for sib_id, sib_detail in sibling_summaries:
+            lines.append(f"### {sib_id}")
+            lines.append(sib_detail)
+            lines.append("")
+        sibling_block = "\n".join(lines)
     prompt_path.write_text(
         prompt_path.read_text()
         + f"""
+## Runtime Context
 
-## Multi-Agent Runtime Context
+Parent: {parent.run_id}
+Role: {spec.role} | Phase: {spec.phase}
+Goal: {parent.goal}
 
-Parent run ID: {parent.run_id}
-Parent goal: {parent.goal}
-Runtime role: {spec.role}
-Runtime phase: {spec.phase}
-
-- Communicate through checkpoints and artifacts in the parent/child run directories.
-- Inspect sibling artifacts under `{Path(parent.run_dir).parent}` when useful.
-- Do not revert unrelated worktree changes or edits made by sibling agents.
-- If this is a gate role, provide a clear pass/fail decision and actionable feedback.
-- If this is the docs role, only document validated behavior and cite artifacts.
-"""
+- Talk via checkpoint/artifact in run dir.
+- No undo sibling work.
+- Gate role: give clear pass/fail + feedback.
+- Docs role: only validated facts. Cite artifacts.
+{sibling_block}"""
     )
+
+
+def _collect_sibling_summaries(
+    child_ids: list[str],
+    results: list[LaunchResult],
+    runs_dir: Path | str,
+) -> tuple[tuple[str, str], ...]:
+    """Build rich summaries from finished siblings.
+
+    Each summary includes status, all checkpoint messages,
+    artifact paths, and stdout tail so downstream agents
+    have full context.
+    """
+    summaries: list[tuple[str, str]] = []
+    for cid, res in zip(child_ids, results):
+        parts: list[str] = []
+        status = res.final_status.value
+        parts.append(f"**{status}**")
+        try:
+            rec = load_run(cid, runs_dir)
+            # Include all checkpoint messages (skip queued/launch)
+            for ev in rec.events:
+                if ev.status in (
+                    RunStatus.QUEUED,
+                ):
+                    continue
+                parts.append(
+                    f"  - [{ev.status.value}] {ev.message}"
+                )
+                if ev.artifacts:
+                    for art in ev.artifacts:
+                        parts.append(f"    artifact: {art}")
+        except Exception:
+            pass
+        # Append stdout tail for concrete output
+        stdout = Path(res.stdout_path)
+        tail = _read_tail(stdout, limit=2048).strip()
+        if tail:
+            # Keep only last 20 lines max
+            tail_lines = tail.splitlines()[-20:]
+            parts.append("  stdout (tail):")
+            for line in tail_lines:
+                parts.append(f"    {line}")
+        summaries.append((cid, "\n".join(parts)))
+    return tuple(summaries)
 
 
 def _finish_multi_agent_parent(
@@ -674,6 +921,115 @@ def _safe_slug(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "agent"
 
 
+def _resolve_monitor_run_id(run_id: str, runs_dir: Path | str) -> str:
+    root = Path(runs_dir).resolve()
+    if (root / run_id / "state.json").exists():
+        return run_id
+
+    matches = sorted(
+        record.run_id for record in list_runs(runs_dir) if record.run_id.startswith(run_id)
+    )
+    if not matches:
+        raise ValueError(f"No orchestration run matches: {run_id}")
+    if len(matches) == 1:
+        return matches[0]
+
+    shortest = min(matches, key=len)
+    if all(match == shortest or match.startswith(f"{shortest}-") for match in matches):
+        return shortest
+
+    preview = ", ".join(matches[:8])
+    if len(matches) > 8:
+        preview += f", ... +{len(matches) - 8} more"
+    raise ValueError(f"Run id prefix is ambiguous: {run_id}. Matches: {preview}")
+
+
+def _monitor_run_ids(run_id: str, runs_dir: Path | str) -> tuple[str, ...]:
+    parent = load_run(run_id, runs_dir)
+    run_ids = [parent.run_id]
+    summary_path = Path(parent.run_dir) / "multi_agent_summary.json"
+    if summary_path.exists():
+        with summary_path.open() as f:
+            summary = json.load(f)
+        run_ids.extend(str(child_id) for child_id in summary.get("child_run_ids", []))
+    else:
+        prefix = f"{parent.run_id}-"
+        child_ids = [
+            record.run_id
+            for record in list_runs(runs_dir)
+            if record.run_id.startswith(prefix)
+        ]
+        child_ids.sort()
+        run_ids.extend(child_ids)
+
+    seen: set[str] = set()
+    existing = []
+    for candidate in run_ids:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        event_path = Path(runs_dir).resolve() / candidate / "events.jsonl"
+        if event_path.exists():
+            existing.append(candidate)
+    return tuple(existing)
+
+
+def _tmux_monitor_commands(
+    session_name: str,
+    run_ids: tuple[str, ...],
+    runs_dir: Path | str,
+) -> tuple[tuple[str, ...], ...]:
+    root = Path(runs_dir).resolve()
+    first_run_id, *rest = run_ids
+    commands: list[tuple[str, ...]] = [
+        ("tmux", "kill-session", "-t", session_name),
+        (
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            session_name,
+            "-n",
+            "events",
+            _tail_events_command(first_run_id, root / first_run_id / "events.jsonl"),
+        ),
+        ("tmux", "select-pane", "-t", f"{session_name}:events.0", "-T", first_run_id),
+    ]
+    for index, child_run_id in enumerate(rest, start=1):
+        commands.extend(
+            [
+                (
+                    "tmux",
+                    "split-window",
+                    "-t",
+                    f"{session_name}:events",
+                    _tail_events_command(child_run_id, root / child_run_id / "events.jsonl"),
+                ),
+                (
+                    "tmux",
+                    "select-pane",
+                    "-t",
+                    f"{session_name}:events.{index}",
+                    "-T",
+                    child_run_id,
+                ),
+                ("tmux", "select-layout", "-t", f"{session_name}:events", "tiled"),
+            ]
+        )
+    return tuple(commands)
+
+
+def _tail_events_command(run_id: str, path: Path) -> str:
+    return (
+        "bash -lc "
+        + shlex.quote(
+            f"printf '== {run_id} ==\\n'; "
+            f"touch {shlex.quote(str(path))}; "
+            f"tail -n 80 -F {shlex.quote(str(path))}"
+        )
+    )
+
+
 def _append_progress(
     run_id: str,
     message: str,
@@ -711,7 +1067,7 @@ def _write_run_files(record: RunRecord) -> None:
     prompt_text = build_agent_prompt(record)
     if prompt_path.exists():
         existing = prompt_path.read_text()
-        marker = "\n## Multi-Agent Runtime Context\n"
+        marker = "\n## Runtime Context\n"
         if marker in existing:
             prompt_text += existing[existing.index(marker) :]
     prompt_path.write_text(prompt_text)

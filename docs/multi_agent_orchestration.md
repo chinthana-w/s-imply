@@ -74,6 +74,32 @@ The runtime writes `multi_agent_plan.json` and `multi_agent_summary.json` in the
 parent run directory. Child agents communicate through checkpoints, logs,
 artifacts, and the shared worktree; there is no hidden in-memory chat bus.
 
+For Codex-backed runs, enable automatic sleep/resume after token or usage limits:
+
+```bash
+python -m src.orchestration.cli multi-run "Improve the train/test pipeline" \
+    --agent codex \
+    --codex-auto-resume \
+    --codex-resume-delay-s 18000
+```
+
+The default resume delay is `18000` seconds, or five hours. When Codex exits
+with token-limit, context-window, quota, or rate-limit text in its logs, the
+runner records a `sleeping` checkpoint, waits, then relaunches the same
+`codex exec` prompt. Use `--codex-max-resumes` to control how many automatic
+resume attempts are allowed.
+
+Monitor a parent run and all child agent event logs in tmux:
+
+```bash
+python -m src.orchestration.cli monitor <parent_run_id>
+tmux attach-session -t s-imply-<parent_run_id-prefix>
+```
+
+Use `--attach` to attach immediately, `--session-name` to choose a stable tmux
+session name, or `--dry-run` to preview the tmux commands. The monitor command
+accepts a full run id or a unique run-id prefix such as the timestamp segment.
+
 ## MCP Tools
 
 Local agents can connect to the repo MCP server over stdio:

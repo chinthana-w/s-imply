@@ -19,7 +19,7 @@ first because sample count scales with faults × patterns × reconvergent path
 pairs.
 
 ```bash
-python scripts/build_fault_dataset.py \
+python -m scripts.build_fault_dataset \
     --bench_dirs data/bench/ISCAS85 data/bench/iscas89 \
     --output /home/local1/cache-cw/iscas85_89_fault_chunks \
     --max_faults 0 \
@@ -84,7 +84,7 @@ ITC99 is not used for training or validation.  Materialize the deterministic
 full ITC99 run.
 
 ```bash
-python scripts/select_itc99_gate_faults.py \
+python -m scripts.select_itc99_gate_faults \
     --bench data/bench/ITC99/b17.bench \
     --output data/bench/ITC99/b17_gate_10pct_faults.json \
     --fraction 0.10 \
@@ -92,13 +92,31 @@ python scripts/select_itc99_gate_faults.py \
 ```
 
 ```bash
-python scripts/benchmark_itc99_gate.py \
+python -m scripts.benchmark_itc99_gate \
     --model checkpoints/reconv_topology_3val_v1_ssd/best_model.pth \
     --fault-list data/bench/ITC99/b17_gate_10pct_faults.json \
     --out docs/itc99_gate_report.json \
+    --csv-out docs/itc99_gate_per_fault.csv \
+    --manifest-out docs/itc99_gate_run_manifest.json \
+    --notion-summary-out docs/notion_result_summary.md \
     --candidate-count 8 \
     --max-backtracks 5000
 ```
+
+The benchmark report records per-fault outcomes, baseline metadata, command
+provenance, and optional Notion-ready markdown.  Bounded smoke runs using
+`--limit-faults` validate the benchmark/reporting path only; do not treat them
+as a promotion decision for the full 6,445-fault 10% gate.
+
+For a repo-local quick session, use the guarded wrapper:
+
+```bash
+bash scripts/train_test_session.sh
+```
+
+It builds ISCAS85/89 data, trains, and writes ITC99 gate artifacts under
+`docs/session_reports/$RUN_ID/` by default.  The wrapper checks disk/RAM
+minimums before each stage and can resume selected stages with `STAGES=...`.
 
 ### 4. RL Fine-tuning
 After collecting experience, fine-tune the transformer using policy gradient (REINFORCE)
@@ -117,7 +135,7 @@ python -m scripts.train_rl \
 
 #### Full pipeline (collect → train → benchmark)
 ```bash
-python scripts/run_rl_pipeline.py --all \
+python -m scripts.run_rl_pipeline --all \
     --bench_dirs data/bench/ISCAS85 data/bench/iscas89 \
     --max_faults 100 \
     --exploration 5 \

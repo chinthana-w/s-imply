@@ -110,6 +110,11 @@ LAMBDA_FULL_LOGIC="${LAMBDA_FULL_LOGIC:-0.5}"
 CANDIDATE_COUNT="${CANDIDATE_COUNT:-8}"
 MAX_BACKTRACKS="${MAX_BACKTRACKS:-5000}"
 AMP_FLAG="${AMP_FLAG:---amp}"
+ITC99_BENCHMARK_LIMIT_FAULTS="${ITC99_BENCHMARK_LIMIT_FAULTS:-0}"
+BASELINE_COVERAGE="${BASELINE_COVERAGE:-0.1817}"
+BASELINE_LABEL="${BASELINE_LABEL:-unlinked_candidate 1% ITC99 gate}"
+BASELINE_SOURCE="${BASELINE_SOURCE:-docs/checkpoint_compatibility_summary.md}"
+COVERAGE_TARGET="${COVERAGE_TARGET:-1.0}"
 
 MIN_CACHE_FREE_GB="${MIN_CACHE_FREE_GB:-20}"
 MIN_REPO_FREE_GB="${MIN_REPO_FREE_GB:-5}"
@@ -224,7 +229,7 @@ check_resources "startup"
 
 if contains_stage build_data; then
   build_args=(
-    scripts/build_fault_dataset.py
+    -m scripts.build_fault_dataset
     --bench_dirs "$ISCAS85_DIR" "$ISCAS89_DIR"
     --output "$CHUNK_DIR"
     --max_faults "$MAX_FAULTS"
@@ -254,7 +259,7 @@ else
 fi
 
 if contains_stage select_gate; then
-  run_step python scripts/select_itc99_gate_faults.py \
+  run_step python -m scripts.select_itc99_gate_faults \
     --bench "$ITC99_BENCH" \
     --output "$ITC99_FAULT_LIST" \
     --fraction 0.10 \
@@ -300,20 +305,56 @@ fi
 
 if contains_stage test; then
   MODEL_PATH="${MODEL_PATH:-${CHECKPOINT_DIR}/best_model.pth}"
-  run_step python scripts/benchmark_itc99_gate.py \
-    --model "$MODEL_PATH" \
-    --fault-list "$ITC99_FAULT_LIST" \
-    --out "${REPORT_DIR}/itc99_gate_report.json" \
-    --candidate-count "$CANDIDATE_COUNT" \
-    --candidate-seed-base "$ITC99_SEED" \
+  benchmark_args=(
+    -m scripts.benchmark_itc99_gate
+    --model "$MODEL_PATH"
+    --fault-list "$ITC99_FAULT_LIST"
+    --out "${REPORT_DIR}/itc99_gate_report.json"
+    --csv-out "${REPORT_DIR}/itc99_gate_per_fault.csv"
+    --manifest-out "${REPORT_DIR}/itc99_gate_run_manifest.json"
+    --notion-summary-out "${REPORT_DIR}/notion_result_summary.md"
+    --candidate-count "$CANDIDATE_COUNT"
+    --candidate-seed-base "$ITC99_SEED"
     --max-backtracks "$MAX_BACKTRACKS"
+    --baseline-coverage "$BASELINE_COVERAGE"
+    --baseline-label "$BASELINE_LABEL"
+    --baseline-source "$BASELINE_SOURCE"
+    --coverage-target "$COVERAGE_TARGET"
+    --run-id "$RUN_ID"
+  )
+  if [[ "$ITC99_BENCHMARK_LIMIT_FAULTS" != "0" ]]; then
+    benchmark_args+=(--limit-faults "$ITC99_BENCHMARK_LIMIT_FAULTS")
+  fi
+  run_step python "${benchmark_args[@]}"
 else
   log "Skipping test"
 fi
 
+if contains_stage full_itc99_test; then
+  MODEL_PATH="${MODEL_PATH:-${CHECKPOINT_DIR}/best_model.pth}"
+  run_step python -m scripts.benchmark_itc99_gate \
+    --model "$MODEL_PATH" \
+    --fault-list "$ITC99_FAULT_LIST" \
+    --out "${REPORT_DIR}/itc99_full_report.json" \
+    --csv-out "${REPORT_DIR}/itc99_full_per_fault.csv" \
+    --manifest-out "${REPORT_DIR}/itc99_full_run_manifest.json" \
+    --notion-summary-out "${REPORT_DIR}/notion_full_result_summary.md" \
+    --candidate-count "$CANDIDATE_COUNT" \
+    --candidate-seed-base "$ITC99_SEED" \
+    --max-backtracks "$MAX_BACKTRACKS" \
+    --baseline-coverage "$BASELINE_COVERAGE" \
+    --baseline-label "$BASELINE_LABEL" \
+    --baseline-source "$BASELINE_SOURCE" \
+    --coverage-target "$COVERAGE_TARGET" \
+    --run-id "$RUN_ID" \
+    --full
+else
+  log "Skipping full_itc99_test"
+fi
+
 if contains_stage iscas85_test; then
   MODEL_PATH="${MODEL_PATH:-${CHECKPOINT_DIR}/best_model.pth}"
-  run_step python scripts/benchmark_iscas85_nofallback.py \
+  run_step python -m scripts.benchmark_iscas85_nofallback \
     --model "$MODEL_PATH" \
     --bench_dir "$ISCAS85_DIR" \
     --out_dir "${CACHE_ROOT}/iscas85_bench" \

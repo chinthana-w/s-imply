@@ -142,6 +142,15 @@ An offline RL pipeline supplements supervised training with experience collected
     -   `train_rl.py`: REINFORCE-based RL fine-tuning from collected experience.
     -   `run_rl_pipeline.py`: Unified pipeline orchestrator (collect → train → benchmark).
     -   `benchmark_c432_compare.py`: Vanilla vs AI-PODEM performance comparison.
+    -   `train_test_session.sh`: Guarded ISCAS85/89 training and held-out ITC99
+        gate wrapper with disk/RAM checks, stage selection, and report outputs.
+    -   `select_itc99_gate_faults.py`: Deterministically materializes the
+        10% held-out ITC99 `b17.bench` gate list.
+    -   `benchmark_itc99_gate.py`: Runs no-fallback AI-PODEM on the ITC99 gate
+        and writes JSON, per-fault CSV, run manifest, and Notion-ready summary
+        artifacts.
+    -   `verify_train_test_reporting.py`: Lightweight `unittest` verifier for
+        benchmark reporting helpers when `pytest` is unavailable.
 -   **`data/`**:
     -   `bench/ISCAS85/`, `bench/iscas89/`, `bench/ITC99/`: Benchmark circuit netlists.
     -   `datasets/reconv_dataset.pkl`: Serialized raw dataset.
@@ -275,9 +284,63 @@ Extended the orchestration scaffold into a persistent runner workflow:
     which invokes Gemini CLI in headless mode and streams `agent_prompt.md` over
     stdin.
 
+### J. Orchestration Architecture Overhaul
+**Timestamp: 2026-05-08**
+Fixed critical design flaws and reduced token waste in the multi-agent
+orchestration workflow:
+-   **Score-Based Task Classifier**: `classify_task()` now counts keyword hits
+    and picks the highest-scoring task type instead of returning the first
+    substring match. Prevents misrouting when goal text contains ambiguous
+    keywords (e.g. "test" matching ATPG instead of ML).
+-   **Role-Specific Child Routing**: `create_task_packet()` accepts a
+    `phase_override` parameter. Gate agents always route to `TaskType.REVIEW`,
+    docs agents to `TaskType.DOCS`, regardless of the parent goal keywords.
+    Previously all children inherited the parent's (often wrong) classification.
+-   **Compact Prompts**: `build_agent_prompt()` replaced the verbose JSON task
+    packet blob with a terse bullet-list format (~60% smaller per agent).
+-   **Parallel Gate Agents**: `test_coverage_gate` and `quality_review_gate`
+    now execute in parallel via `ThreadPoolExecutor` (were sequential).
+-   **Sibling Result Forwarding**: Downstream agents (gates, docs) receive a
+    `## Sibling Results` section listing what predecessor agents accomplished,
+    closing the information vacuum between pipeline phases.
+-   **Dead Code Removal**: Deleted unused `langgraph_app.py` LangGraph stub.
+-   **MCP Server Defaults**: `dry_run` defaults changed from `True` to `False`
+    so automated agents get real execution results.
+
+### K. Train/Test Benchmark Reporting Artifacts
+**Timestamp: 2026-05-09**
+Improved the train/test pipeline's result provenance without making a new
+coverage-improvement claim:
+-   **Benchmark Artifacts**: `scripts/benchmark_itc99_gate.py` can now emit the
+    aggregate JSON report, per-fault CSV, run manifest, and local Notion-ready
+    experiment summary in one run.
+-   **Wrapper Integration**: `scripts/train_test_session.sh` calls the ITC99
+    benchmark through `python -m scripts.benchmark_itc99_gate` and writes the
+    report set under `docs/session_reports/$RUN_ID/` for `test` and
+    `full_itc99_test` stages.
+-   **Small Verification**: `scripts/verify_train_test_reporting.py` exercises
+    the reporting helpers with `unittest`, avoiding a hard dependency on
+    `pytest` in the `deepgate` environment.
+-   **Validated Scope**: Scoped validation passed for `py_compile`, Ruff,
+    `bash -n scripts/train_test_session.sh`, the reporting verifier, a no-stage
+    wrapper smoke run, and one- or two-fault bounded ITC99 smoke artifacts.
+-   **Review Status**: Coverage promotion did not pass review.  Bounded smoke
+    artifacts are not decision-comparable to the configured 6,445-fault ITC99
+    10% gate, and the current report schema can still show
+    `passed_coverage_target=true` for a limited smoke run.  Treat those artifacts
+    as reporting-path validation only until the schema records benchmark scope,
+    baseline scope, and decision status explicitly.
+-   **Notion Sync**: The local Notion-ready summary artifact was generated, but
+    direct append to the canonical Notion page was cancelled during the coding
+    agent runs.  The canonical page should receive a dated log entry with this
+    caveat before any result narrative is considered synchronized.
+
 ## 7. Current Challenges & Roadmap
 -   **Handling "Don't Cares" (X)**: The current model predicts binary 0/1. Integrating explicit X prediction or X-tolerance in the loss function is an ongoing area of research.
 -   **Complex Reconvergence**: Scaling from pair-wise paths to N-ary reconvergent structures.
 -   **Integration with Commercial ATPG**: Using the model's predictions as high-quality initial heuristics for industry-standard ATPG tools.
 -   **Remaining Edge Errors (~3.2%)**: Post-processing fixes NOT/BUFF but AND/OR/NAND/NOR inequality violations remain. Consider iterative refinement or autoregressive decoding for further improvement.
 -   **XOR/XNOR Handling**: Low fault coverage on c432 due to XOR logic in the D-frontier. Under active investigation.
+-   **Benchmark Claim Discipline**: Tighten ITC99 report schema so limited
+    smoke, 10% gate, full ITC99, and baseline scopes cannot be confused in
+    generated docs or Notion summaries.

@@ -213,6 +213,7 @@ __marimo__/
 data/
 checkpoints/
 *.pth
+temp_bench/
 
 # claude
 .claude/.nfs*

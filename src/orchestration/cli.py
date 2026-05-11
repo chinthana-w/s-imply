@@ -18,6 +18,7 @@ from src.orchestration.runner import (
     latest_run,
     launch_queued_runs,
     launch_run,
+    launch_tmux_monitor,
     list_runs,
     load_run,
     record_checkpoint,
@@ -55,6 +56,7 @@ def main() -> None:
     run.add_argument("--agent", choices=["codex", "gemini", "claude"])
     run.add_argument("--agent-cmd", default="")
     run.add_argument("--timeout-s", type=int)
+    _add_codex_resume_args(run)
     run.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR))
 
     multi_run = sub.add_parser("multi-run", help="Create and run a gated multi-agent workflow")
@@ -65,6 +67,7 @@ def main() -> None:
     multi_run.add_argument("--agent", choices=["codex", "gemini", "claude"])
     multi_run.add_argument("--agent-cmd", default="")
     multi_run.add_argument("--timeout-s", type=int)
+    _add_codex_resume_args(multi_run)
     multi_run.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR))
 
     status = sub.add_parser("status", help="Show run status, or the latest run when omitted")
@@ -106,6 +109,7 @@ def main() -> None:
     launch.add_argument("--agent", choices=["codex", "gemini", "claude"])
     launch.add_argument("--agent-cmd", default="")
     launch.add_argument("--timeout-s", type=int)
+    _add_codex_resume_args(launch)
     launch.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR))
 
     worker = sub.add_parser("worker", help="Launch queued runs oldest first")
@@ -113,7 +117,18 @@ def main() -> None:
     worker.add_argument("--agent-cmd", default="")
     worker.add_argument("--max-runs", type=int)
     worker.add_argument("--timeout-s", type=int)
+    _add_codex_resume_args(worker)
     worker.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR))
+
+    monitor = sub.add_parser(
+        "monitor",
+        help="Launch a tmux session tailing event logs for a run and its child agents",
+    )
+    monitor.add_argument("run_id")
+    monitor.add_argument("--session-name", default="")
+    monitor.add_argument("--attach", action="store_true")
+    monitor.add_argument("--dry-run", action="store_true")
+    monitor.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR))
 
     bench = sub.add_parser("summarize-benchmark", help="Summarize a benchmark CSV/JSON artifact")
     bench.add_argument("path")
@@ -157,6 +172,9 @@ def main() -> None:
             agent_cmd=_parse_agent_cmd(args.agent_cmd),
             agent=args.agent,
             timeout_s=args.timeout_s,
+            codex_auto_resume=args.codex_auto_resume,
+            codex_resume_delay_s=args.codex_resume_delay_s,
+            codex_max_resumes=args.codex_max_resumes,
         )
         print(_format_launch_result(result))
     elif args.command == "multi-run":
@@ -169,6 +187,9 @@ def main() -> None:
             code_agents=args.code_agents,
             include_docs_agent=not args.no_docs_agent,
             timeout_s=args.timeout_s,
+            codex_auto_resume=args.codex_auto_resume,
+            codex_resume_delay_s=args.codex_resume_delay_s,
+            codex_max_resumes=args.codex_max_resumes,
         )
         print(_format_multi_agent_result(result))
     elif args.command == "status":
@@ -221,6 +242,9 @@ def main() -> None:
             agent_cmd=_parse_agent_cmd(args.agent_cmd),
             agent=args.agent,
             timeout_s=args.timeout_s,
+            codex_auto_resume=args.codex_auto_resume,
+            codex_resume_delay_s=args.codex_resume_delay_s,
+            codex_max_resumes=args.codex_max_resumes,
         )
         print(_format_launch_result(result))
     elif args.command == "worker":
@@ -230,11 +254,26 @@ def main() -> None:
             agent=args.agent,
             max_runs=args.max_runs,
             timeout_s=args.timeout_s,
+            codex_auto_resume=args.codex_auto_resume,
+            codex_resume_delay_s=args.codex_resume_delay_s,
+            codex_max_resumes=args.codex_max_resumes,
         )
         if not results:
             print("No queued orchestration runs found.")
         for result in results:
             print(_format_launch_result(result))
+    elif args.command == "monitor":
+        try:
+            result = launch_tmux_monitor(
+                args.run_id,
+                runs_dir=Path(args.runs_dir),
+                session_name=args.session_name or None,
+                attach=args.attach,
+                dry_run=args.dry_run,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(_format_tmux_monitor_result(result))
     elif args.command == "summarize-benchmark":
         print(json.dumps(summarize_benchmark_artifact(args.path), indent=2, default=str))
     elif args.command == "check-theory-doc-sync":
@@ -264,6 +303,26 @@ def _parse_agent_cmd(raw_command: str):
     return tuple(shlex.split(raw_command)) if raw_command else None
 
 
+def _add_codex_resume_args(parser) -> None:
+    parser.add_argument(
+        "--codex-auto-resume",
+        action="store_true",
+        help="When codex exec hits a token/usage limit, sleep and retry automatically.",
+    )
+    parser.add_argument(
+        "--codex-resume-delay-s",
+        type=int,
+        default=18_000,
+        help="Sleep seconds before auto-resuming Codex after a token/usage limit.",
+    )
+    parser.add_argument(
+        "--codex-max-resumes",
+        type=int,
+        default=1,
+        help="Maximum automatic Codex resumes after token/usage-limit exits.",
+    )
+
+
 def _format_launch_result(result) -> str:
     return (
         f"Run: {result.run_id}\n"
@@ -289,6 +348,20 @@ def _format_multi_agent_result(result) -> str:
         f"(return code {phase.returncode}, stdout {phase.stdout_path}, stderr {phase.stderr_path})"
         for phase in result.phase_results
     )
+    return "\n".join(lines)
+
+
+def _format_tmux_monitor_result(result) -> str:
+    lines = [
+        f"Session: {result.session_name}",
+        f"Runs: {len(result.run_ids)}",
+        f"Attach: {shlex.join(result.attach_command)}",
+    ]
+    if result.dry_run:
+        lines.append("Dry run commands:")
+        lines.extend(f"- {shlex.join(command)}" for command in result.commands)
+    else:
+        lines.append("tmux monitor session is ready.")
     return "\n".join(lines)
 
 

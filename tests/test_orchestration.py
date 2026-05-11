@@ -4,6 +4,7 @@ import subprocess
 import sys
 
 from src.orchestration.coordinator import AgentRole, TaskType, classify_task, create_task_packet
+from src.orchestration.mcp_server import handle_request
 from src.orchestration.runner import (
     RunStatus,
     complete_run,
@@ -11,12 +12,12 @@ from src.orchestration.runner import (
     dispatch_task,
     launch_queued_runs,
     launch_run,
+    launch_tmux_monitor,
     list_runs,
     load_run,
     record_checkpoint,
     run_multi_agent_runtime,
 )
-from src.orchestration.mcp_server import handle_request
 from src.orchestration.tools import (
     NotionDocumentationTarget,
     check_theory_doc_sync,
@@ -202,7 +203,7 @@ def test_launch_run_executes_agent_command_and_captures_logs(tmp_path):
     command = (
         sys.executable,
         "-c",
-        "import sys; data=sys.stdin.read(); print('received', 'Run ID:' in data)",
+        "import sys; data=sys.stdin.read(); print('received', 'Run:' in data)",
     )
 
     result = launch_run("run-003", runs_dir=tmp_path, agent_cmd=command)
@@ -212,6 +213,44 @@ def test_launch_run_executes_agent_command_and_captures_logs(tmp_path):
     assert result.final_status == RunStatus.COMPLETED
     assert loaded.status == RunStatus.COMPLETED
     assert "received True" in (tmp_path / "run-003" / "agent_stdout.log").read_text()
+
+
+def test_launch_run_auto_resumes_codex_after_token_limit(tmp_path):
+    dispatch_task("Review ATPG regression risk", runs_dir=tmp_path, run_id="run-token")
+    marker = tmp_path / "attempts.txt"
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"marker = pathlib.Path({str(marker)!r})\n"
+        "count = int(marker.read_text()) if marker.exists() else 0\n"
+        "marker.write_text(str(count + 1))\n"
+        "sys.stdin.read()\n"
+        "if count == 0:\n"
+        "    print('token limit reached; try later', file=sys.stderr)\n"
+        "    sys.exit(2)\n"
+        "print('resumed ok')\n"
+    )
+    fake_codex.chmod(0o755)
+
+    result = launch_run(
+        "run-token",
+        runs_dir=tmp_path,
+        agent_cmd=(str(fake_codex), "exec", "-"),
+        codex_auto_resume=True,
+        codex_resume_delay_s=0,
+        codex_max_resumes=1,
+    )
+    loaded = load_run("run-token", runs_dir=tmp_path)
+    stderr = (tmp_path / "run-token" / "agent_stderr.log").read_text()
+    stdout = (tmp_path / "run-token" / "agent_stdout.log").read_text()
+
+    assert result.final_status == RunStatus.COMPLETED
+    assert loaded.status == RunStatus.COMPLETED
+    assert marker.read_text() == "2"
+    assert "token limit reached" in stderr
+    assert "automatic resume attempt" in stdout
+    assert any(event.status == RunStatus.SLEEPING for event in loaded.events)
 
 
 def test_launch_queued_runs_skips_non_queued_runs(tmp_path):
@@ -264,7 +303,7 @@ def test_run_cli_dispatches_and_launches_with_one_command(tmp_path):
             str(tmp_path),
             "--agent-cmd",
             f"{sys.executable} -c \"import sys; data=sys.stdin.read(); "
-            "print('received', 'Run ID:' in data)\"",
+            "print('received', 'Run:' in data)\"",
         ],
         text=True,
         capture_output=True,
@@ -287,7 +326,7 @@ def test_multi_agent_runtime_runs_code_gates_and_docs(tmp_path):
         sys.executable,
         "-c",
         "import sys; data=sys.stdin.read(); print('role_context', "
-        "'Multi-Agent Runtime Context' in data)",
+        "'Runtime Context' in data)",
     )
 
     result = run_multi_agent_runtime(
@@ -307,7 +346,7 @@ def test_multi_agent_runtime_runs_code_gates_and_docs(tmp_path):
     for child_run_id in result.child_run_ids:
         prompt = (tmp_path / child_run_id / "agent_prompt.md").read_text()
         stdout = (tmp_path / child_run_id / "agent_stdout.log").read_text()
-        assert "Multi-Agent Runtime Context" in prompt
+        assert "Runtime Context" in prompt
         assert "role_context True" in stdout
 
 
@@ -327,9 +366,140 @@ def test_multi_agent_runtime_stops_when_gate_fails(tmp_path):
     )
 
     assert result.final_status == RunStatus.FAILED
-    assert len(result.child_run_ids) == 2
+    # Gates now run in parallel, so both launch even if one fails
+    assert len(result.child_run_ids) == 3
     assert any("test-coverage-gate" in run_id for run_id in result.child_run_ids)
     assert not any("docs-results-agent" in run_id for run_id in result.child_run_ids)
+
+
+def test_tmux_monitor_dry_run_includes_parent_and_child_events(tmp_path):
+    command = (
+        sys.executable,
+        "-c",
+        "import sys; sys.stdin.read(); print('done')",
+    )
+    runtime = run_multi_agent_runtime(
+        "Improve training coverage",
+        runs_dir=tmp_path,
+        agent_cmd=command,
+        code_agents=1,
+        include_docs_agent=False,
+    )
+
+    monitor = launch_tmux_monitor(
+        runtime.run_id,
+        runs_dir=tmp_path,
+        session_name="s-imply-test",
+        dry_run=True,
+    )
+
+    assert monitor.session_name == "s-imply-test"
+    assert monitor.run_ids[0] == runtime.run_id
+    assert set(monitor.run_ids[1:]) == set(runtime.child_run_ids)
+    assert monitor.attach_command == ("tmux", "attach-session", "-t", "s-imply-test")
+    assert monitor.commands[0] == ("tmux", "kill-session", "-t", "s-imply-test")
+    assert any("events.jsonl" in " ".join(command) for command in monitor.commands)
+
+
+def test_tmux_monitor_accepts_parent_run_prefix(tmp_path):
+    command = (
+        sys.executable,
+        "-c",
+        "import sys; sys.stdin.read(); print('done')",
+    )
+    runtime = run_multi_agent_runtime(
+        "Improve training coverage",
+        runs_dir=tmp_path,
+        agent_cmd=command,
+        code_agents=1,
+        include_docs_agent=False,
+    )
+
+    # Timestamp-only prefix matches the parent and all child runs.
+    prefix = runtime.run_id.split("-", 1)[0]
+    monitor = launch_tmux_monitor(prefix, runs_dir=tmp_path, dry_run=True)
+
+    assert monitor.run_ids[0] == runtime.run_id
+    assert set(monitor.run_ids[1:]) == set(runtime.child_run_ids)
+
+
+def test_monitor_cli_dry_run_prints_attach_command(tmp_path):
+    dispatch_task("Review ATPG regression risk", runs_dir=tmp_path, run_id="run-007")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "src.orchestration.cli",
+            "monitor",
+            "run-007",
+            "--runs-dir",
+            str(tmp_path),
+            "--session-name",
+            "s-imply-test",
+            "--dry-run",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "Attach: tmux attach-session -t s-imply-test" in result.stdout
+    assert "Dry run commands:" in result.stdout
+
+
+def test_monitor_cli_reports_missing_prefix_without_traceback(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "src.orchestration.cli",
+            "monitor",
+            "missing-run",
+            "--runs-dir",
+            str(tmp_path),
+            "--dry-run",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "No orchestration run matches: missing-run" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_run_cli_accepts_codex_resume_flags(tmp_path):
+    fake_codex = tmp_path / "codex"
+    fake_codex.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdin.read()\nprint('ok')\n")
+    fake_codex.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "src.orchestration.cli",
+            "run",
+            "Review ATPG regression risk",
+            "--runs-dir",
+            str(tmp_path / "runs"),
+            "--agent-cmd",
+            f"{fake_codex} exec -",
+            "--codex-auto-resume",
+            "--codex-resume-delay-s",
+            "0",
+            "--codex-max-resumes",
+            "1",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "Status: completed" in result.stdout
 
 
 def test_default_agent_command_supports_gemini_profile():

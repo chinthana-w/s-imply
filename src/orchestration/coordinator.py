@@ -144,49 +144,96 @@ _ROLE_BY_TASK: dict[TaskType, AgentRole] = {
 
 
 _FILES_BY_TASK: dict[TaskType, tuple[str, ...]] = {
-    TaskType.ATPG: ("src/atpg/", "tests/test_*podem*.py", "tests/test_reconv_solver.py"),
+    TaskType.ATPG: (
+        "src/atpg/",
+        "tests/test_*podem*.py",
+        "tests/test_reconv_solver.py",
+    ),
     TaskType.ML: ("src/ml/", "tests/test_model_pe.py"),
     TaskType.BENCHMARK: ("scripts/", "docs/*report*", "data/bench/"),
     TaskType.DOCS: ("docs/project_summary.md", "README.md"),
-    TaskType.THEORY: ("docs/paper_draft.tex", "docs/project_summary.md", "src/atpg/"),
+    TaskType.THEORY: (
+        "docs/paper_draft.tex",
+        "docs/project_summary.md",
+        "src/atpg/",
+    ),
     TaskType.REVIEW: ("<diff>", "<validation artifacts>"),
 }
 
 
-def classify_task(goal: str, changed_files: tuple[str, ...] = ()) -> TaskType:
-    """Classify work into the first specialist lane that should own it."""
+# Maps runtime phase roles to their appropriate task type overrides.
+_PHASE_TASK_TYPE: dict[str, TaskType] = {
+    "gate": TaskType.REVIEW,
+    "docs": TaskType.DOCS,
+}
+
+
+def classify_task(
+    goal: str, changed_files: tuple[str, ...] = ()
+) -> TaskType:
+    """Classify work by highest keyword-hit score, not first match."""
     text = " ".join((goal, *changed_files)).lower()
+    best_type = TaskType.REVIEW
+    best_score = 0
     for task_type, keywords in _KEYWORDS:
-        if any(keyword in text for keyword in keywords):
-            return task_type
-    return TaskType.REVIEW
+        score = sum(1 for kw in keywords if kw in text)
+        if score > best_score:
+            best_score = score
+            best_type = task_type
+    return best_type
 
 
 def create_task_packet(
     goal: str,
     changed_files: tuple[str, ...] = (),
     autonomy: AutonomyLevel = AutonomyLevel.MEDIUM,
+    phase_override: str | None = None,
 ) -> TaskPacket:
-    """Create a decision-complete handoff packet for one specialist agent."""
-    task_type = classify_task(goal, changed_files)
+    """Create a decision-complete handoff packet for one specialist agent.
+
+    When *phase_override* is provided (e.g. ``"gate"`` or ``"docs"``),
+    the task type is overridden to the canonical type for that phase
+    so that child agents are routed correctly regardless of the
+    parent goal's keyword content.
+    """
+    if phase_override and phase_override in _PHASE_TASK_TYPE:
+        task_type = _PHASE_TASK_TYPE[phase_override]
+    else:
+        task_type = classify_task(goal, changed_files)
     owner = _ROLE_BY_TASK[task_type]
-    run_manifest_required = task_type in {TaskType.BENCHMARK, TaskType.ML}
+    run_manifest_required = task_type in {
+        TaskType.BENCHMARK,
+        TaskType.ML,
+    }
     if autonomy is AutonomyLevel.LARGE:
         run_manifest_required = True
 
     constraints = [
         "Use the deepgate conda environment.",
         "Prefer python -m entrypoints for repo modules.",
-        "Keep edits compatible with Ruff line length 100 and rules E/F/I.",
-        "Do not make unsupported result claims without artifact provenance.",
+        "Keep edits compatible with Ruff line length 100 "
+        "and rules E/F/I.",
+        "Do not make unsupported result claims without "
+        "artifact provenance.",
     ]
-    notion_publication = NotionPublicationTarget(enabled=False, status="not_applicable")
+    notion_publication = NotionPublicationTarget(
+        enabled=False, status="not_applicable"
+    )
     if task_type in {TaskType.DOCS, TaskType.THEORY, TaskType.BENCHMARK}:
-        constraints.append("Treat Notion as canonical for method/results documentation.")
-        constraints.append("Update experiment steps in Notion using dated log entries.")
+        constraints.append(
+            "Treat Notion as canonical for method/results "
+            "documentation."
+        )
+        constraints.append(
+            "Update experiment steps in Notion using dated "
+            "log entries."
+        )
         notion_publication = NotionPublicationTarget()
     if task_type is TaskType.THEORY:
-        constraints.append("Synchronize theoretical-framework changes with docs/paper_draft.tex.")
+        constraints.append(
+            "Synchronize theoretical-framework changes "
+            "with docs/paper_draft.tex."
+        )
 
     return TaskPacket(
         owner_agent=owner,

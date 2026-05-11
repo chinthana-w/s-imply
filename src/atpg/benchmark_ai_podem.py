@@ -10,6 +10,7 @@ sys.path.append(os.getcwd())
 from src.atpg.ai_podem import AiPodemConfig, HierarchicalReconvSolver, ModelPairPredictor, ai_podem
 from src.atpg.logic_sim_three import reset_gates
 from src.atpg.podem import (
+    SUCCESS,
     get_all_faults,
     get_statistics,
     initialize,
@@ -52,6 +53,8 @@ def run_benchmark(bench_path: str, model_path: str, mode: str = "vanilla", limit
     start_time = time.time()
 
     succ = 0
+    total_backtracks = 0
+    total_backtraces = 0
 
     for i, fault in enumerate(faults):
         # ALWAYS reset gates and PODEM structures before each fault
@@ -59,7 +62,9 @@ def run_benchmark(bench_path: str, model_path: str, mode: str = "vanilla", limit
         initialize(circuit, total_gates)
 
         if mode == "vanilla":
-            detected = podem(circuit, fault, total_gates, backtrace_func=simple_backtrace)
+            detected = (
+                podem(circuit, fault, total_gates, backtrace_func=simple_backtrace) == SUCCESS
+            )
         elif mode == "ai_activation":
             detected = ai_podem(
                 circuit,
@@ -90,12 +95,15 @@ def run_benchmark(bench_path: str, model_path: str, mode: str = "vanilla", limit
         if detected:
             succ += 1
 
+        fault_stats = get_statistics()
+        total_backtracks += fault_stats["backtrack_count"]
+        total_backtraces += fault_stats["backtrace_count"]
+
         # More frequent status reporting
         if (i + 1) % 10 == 0 or total < 10:
             print(f"  [{mode}] {i+1}/{total} faults processed... " f"FC={(succ/(i+1)*100):.1f}%")
 
     elapsed = time.time() - start_time
-    stats = get_statistics()
 
     return {
         "bench": os.path.basename(bench_path),
@@ -104,8 +112,8 @@ def run_benchmark(bench_path: str, model_path: str, mode: str = "vanilla", limit
         "detected": succ,
         "coverage": (succ / total * 100) if total > 0 else 0,
         "time": elapsed,
-        "backtracks": stats["backtrack_count"],
-        "backtraces": stats["backtrace_count"],
+        "backtracks": total_backtracks,
+        "backtraces": total_backtraces,
         "avg_time_ms": (elapsed * 1000) / total if total > 0 else 0,
     }
 
