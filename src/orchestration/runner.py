@@ -16,7 +16,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from src.orchestration.coordinator import TaskPacket, create_task_packet
+from src.orchestration.coordinator import (
+    TaskPacket,
+    classify_task,
+    create_task_packet,
+    get_coding_focus,
+)
 from src.orchestration.tools import REPO_ROOT
 
 DEFAULT_RUNS_DIR = REPO_ROOT / "runs" / "orchestration"
@@ -99,6 +104,10 @@ TOKEN_LIMIT_PATTERNS = (
     "too many tokens",
 )
 
+# Hard caps to prevent prompt bloat across recovery cycles.
+_SIBLING_PER_CAP = 350  # chars per sibling entry
+_SIBLING_BLOCK_CAP = 1_500  # total sibling block in runtime context
+
 
 def dispatch_task(
     goal: str,
@@ -118,9 +127,7 @@ def dispatch_task(
     resolved_run_id = run_id or _make_run_id(goal)
     run_dir = root / resolved_run_id
     if run_dir.exists():
-        raise FileExistsError(
-            f"Run already exists: {resolved_run_id}"
-        )
+        raise FileExistsError(f"Run already exists: {resolved_run_id}")
     run_dir.mkdir(parents=True)
 
     now = _now()
@@ -258,16 +265,17 @@ def launch_run(
     resume_attempts = 0
     while (
         codex_auto_resume
-        and _is_codex_command(command)
+        and _supports_auto_resume(command)
         and returncode != 0
         and resume_attempts < codex_max_resumes
         and _logs_indicate_token_limit(stdout_path, stderr_path)
     ):
         resume_attempts += 1
+        agent_name = Path(command[0]).name.title()
         record_checkpoint(
             run_id,
             (
-                "Codex token or usage limit reached; sleeping for "
+                f"{agent_name} token or usage limit reached; sleeping for "
                 f"{codex_resume_delay_s} seconds before automatic resume "
                 f"({resume_attempts}/{codex_max_resumes})."
             ),
@@ -278,7 +286,10 @@ def launch_run(
         time.sleep(codex_resume_delay_s)
         record_checkpoint(
             run_id,
-            f"Resuming Codex after token-limit sleep ({resume_attempts}/{codex_max_resumes}).",
+            (
+                f"Resuming {agent_name} after token-limit sleep "
+                f"({resume_attempts}/{codex_max_resumes})."
+            ),
             artifacts=(str(stdout_path), str(stderr_path)),
             status=RunStatus.RUNNING,
             runs_dir=runs_dir,
@@ -371,6 +382,7 @@ def run_multi_agent_runtime(
     codex_auto_resume: bool = False,
     codex_resume_delay_s: int = 18_000,
     codex_max_resumes: int = 1,
+    max_recovery_attempts: int = 2,
 ) -> MultiAgentRuntimeResult:
     """Run a gated multi-agent workflow from one command.
 
@@ -380,13 +392,21 @@ def run_multi_agent_runtime(
     """
     if code_agents < 1:
         raise ValueError("code_agents must be at least 1")
+    if max_recovery_attempts < 0:
+        raise ValueError("max_recovery_attempts must be non-negative")
 
     parent = dispatch_task(goal, changed_files=changed_files, runs_dir=runs_dir)
     run_dir = Path(parent.run_dir)
     plan_path = run_dir / "multi_agent_plan.json"
     summary_path = run_dir / "multi_agent_summary.json"
     specs = _multi_agent_specs(goal, code_agents, include_docs_agent)
-    plan_path.write_text(json.dumps(_runtime_plan_payload(parent, specs), indent=2) + "\n")
+    plan_path.write_text(
+        json.dumps(
+            _runtime_plan_payload(parent, specs, max_recovery_attempts),
+            indent=2,
+        )
+        + "\n"
+    )
     record_checkpoint(
         parent.run_id,
         "Multi-agent runtime started.",
@@ -422,83 +442,162 @@ def run_multi_agent_runtime(
             phase_results.append(result)
 
     if not _all_completed(phase_results):
-        final = _finish_multi_agent_parent(
-            parent.run_id,
-            phase_results,
-            child_ids,
-            summary_path,
-            "Stopped: at least one coding agent failed or blocked.",
-            RunStatus.FAILED,
-            runs_dir,
-        )
-        return MultiAgentRuntimeResult(
-            run_id=parent.run_id,
-            child_run_ids=tuple(child_ids),
-            phase_results=tuple(phase_results),
-            final_status=final.status,
-            summary_path=str(summary_path),
-        )
+        recovered = False
+        for attempt in range(1, max_recovery_attempts + 1):
+            record_checkpoint(
+                parent.run_id,
+                (
+                    "Coding phase encountered a problem; launching coordinated "
+                    f"recovery attempt {attempt}/{max_recovery_attempts}."
+                ),
+                runs_dir=runs_dir,
+            )
+            recovery_summaries = _collect_sibling_summaries(child_ids, phase_results, runs_dir)
+            recovery_specs = _recovery_specs(
+                parent.goal,
+                failed_phase="code",
+                attempt=attempt,
+                failed_results=tuple(
+                    result
+                    for result in phase_results
+                    if result.final_status is not RunStatus.COMPLETED
+                ),
+            )
+            recovery_ids, recovery_results = _launch_specs_parallel(
+                parent,
+                recovery_specs,
+                runs_dir,
+                agent_cmd,
+                agent,
+                timeout_s,
+                codex_auto_resume,
+                codex_resume_delay_s,
+                codex_max_resumes,
+                recovery_summaries,
+            )
+            child_ids.extend(recovery_ids)
+            phase_results.extend(recovery_results)
+            if _all_completed(list(recovery_results)):
+                recovered = True
+                break
+        if not recovered:
+            final = _finish_multi_agent_parent(
+                parent.run_id,
+                phase_results,
+                child_ids,
+                summary_path,
+                "Stopped: coding phase failed after coordinated recovery attempts.",
+                RunStatus.FAILED,
+                runs_dir,
+            )
+            return MultiAgentRuntimeResult(
+                run_id=parent.run_id,
+                child_run_ids=tuple(child_ids),
+                phase_results=tuple(phase_results),
+                final_status=final.status,
+                summary_path=str(summary_path),
+            )
 
     # -- Collect summaries from coding phase for downstream --
-    code_summaries = _collect_sibling_summaries(
-        child_ids, phase_results, runs_dir
-    )
+    code_summaries = _collect_sibling_summaries(child_ids, phase_results, runs_dir)
 
     # -- Gate phase: run test + quality gates in PARALLEL --
+    gate_results: list[LaunchResult] = []
     if gate_specs:
-        workers = max(1, len(gate_specs))
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            gate_futures = {
-                ex.submit(
-                    _dispatch_and_launch_child,
-                    parent,
-                    spec,
-                    runs_dir,
-                    agent_cmd,
-                    agent,
-                    timeout_s,
-                    codex_auto_resume,
-                    codex_resume_delay_s,
-                    codex_max_resumes,
-                    code_summaries,
-                ): spec
-                for spec in gate_specs
-            }
-            for future in as_completed(gate_futures):
-                child_id, result = future.result()
-                child_ids.append(child_id)
-                phase_results.append(result)
-
-    gate_results = phase_results[len(code_specs):]
-    if gate_results and not _all_completed(gate_results):
-        failed_gates = [
-            r for r in gate_results
-            if r.final_status is not RunStatus.COMPLETED
-        ]
-        gate_msg = ", ".join(r.run_id for r in failed_gates)
-        final = _finish_multi_agent_parent(
-            parent.run_id,
-            phase_results,
-            child_ids,
-            summary_path,
-            f"Stopped: gate(s) failed: {gate_msg}.",
-            RunStatus.FAILED,
+        gate_ids, launched_gate_results = _launch_specs_parallel(
+            parent,
+            gate_specs,
             runs_dir,
+            agent_cmd,
+            agent,
+            timeout_s,
+            codex_auto_resume,
+            codex_resume_delay_s,
+            codex_max_resumes,
+            code_summaries,
         )
-        return MultiAgentRuntimeResult(
-            run_id=parent.run_id,
-            child_run_ids=tuple(child_ids),
-            phase_results=tuple(phase_results),
-            final_status=final.status,
-            summary_path=str(summary_path),
-        )
+        child_ids.extend(gate_ids)
+        gate_results.extend(launched_gate_results)
+        phase_results.extend(launched_gate_results)
+
+    if gate_results and not _all_completed(gate_results):
+        recovered = False
+        for attempt in range(1, max_recovery_attempts + 1):
+            failed_gates = [r for r in gate_results if r.final_status is not RunStatus.COMPLETED]
+            gate_msg = ", ".join(r.run_id for r in failed_gates)
+            record_checkpoint(
+                parent.run_id,
+                (
+                    f"Gate problem detected in {gate_msg}; launching coordinated "
+                    f"workaround attempt {attempt}/{max_recovery_attempts}."
+                ),
+                runs_dir=runs_dir,
+            )
+            recovery_summaries = _collect_sibling_summaries(child_ids, phase_results, runs_dir)
+            recovery_specs = _recovery_specs(
+                parent.goal,
+                failed_phase="gate",
+                attempt=attempt,
+                failed_results=tuple(failed_gates),
+            )
+            recovery_ids, recovery_results = _launch_specs_parallel(
+                parent,
+                recovery_specs,
+                runs_dir,
+                agent_cmd,
+                agent,
+                timeout_s,
+                codex_auto_resume,
+                codex_resume_delay_s,
+                codex_max_resumes,
+                recovery_summaries,
+            )
+            child_ids.extend(recovery_ids)
+            phase_results.extend(recovery_results)
+            if not _all_completed(list(recovery_results)):
+                continue
+
+            rerun_specs = _retry_gate_specs(parent.goal, attempt)
+            rerun_summaries = _collect_sibling_summaries(child_ids, phase_results, runs_dir)
+            gate_ids, gate_results = _launch_specs_parallel(
+                parent,
+                rerun_specs,
+                runs_dir,
+                agent_cmd,
+                agent,
+                timeout_s,
+                codex_auto_resume,
+                codex_resume_delay_s,
+                codex_max_resumes,
+                rerun_summaries,
+            )
+            child_ids.extend(gate_ids)
+            phase_results.extend(gate_results)
+            if _all_completed(gate_results):
+                recovered = True
+                break
+        if not recovered:
+            failed_gates = [r for r in gate_results if r.final_status is not RunStatus.COMPLETED]
+            gate_msg = ", ".join(r.run_id for r in failed_gates)
+            final = _finish_multi_agent_parent(
+                parent.run_id,
+                phase_results,
+                child_ids,
+                summary_path,
+                f"Stopped: gate(s) failed after coordinated recovery: {gate_msg}.",
+                RunStatus.FAILED,
+                runs_dir,
+            )
+            return MultiAgentRuntimeResult(
+                run_id=parent.run_id,
+                child_run_ids=tuple(child_ids),
+                phase_results=tuple(phase_results),
+                final_status=final.status,
+                summary_path=str(summary_path),
+            )
 
     # -- Docs phase: forward all prior summaries --
-    all_summaries = code_summaries + _collect_sibling_summaries(
-        child_ids[len(code_specs):],
-        gate_results,
-        runs_dir,
-    )
+    all_summaries = _collect_sibling_summaries(child_ids, phase_results, runs_dir)
     for spec in docs_specs:
         child_id, result = _dispatch_and_launch_child(
             parent,
@@ -520,8 +619,7 @@ def run_multi_agent_runtime(
                 phase_results,
                 child_ids,
                 summary_path,
-                f"Stopped: docs agent ended "
-                f"{result.final_status.value}.",
+                f"Stopped: docs agent ended {result.final_status.value}.",
                 RunStatus.FAILED,
                 runs_dir,
             )
@@ -635,11 +733,21 @@ def build_agent_prompt(record: RunRecord) -> str:
     validation = "\n".join(f"- {s}" for s in p["validation_plan"])
     artifacts = ", ".join(p["expected_artifacts"])
     cli = "python -m src.orchestration.cli"
+    bh = p.get("budget_hint") or {}
+    max_edits = bh.get("max_edits", 3) if isinstance(bh, dict) else 3
+    stop_cond = (
+        bh.get("stop_condition", "one passing focused test")
+        if isinstance(bh, dict)
+        else "one passing focused test"
+    )
     return f"""# Assignment: {p["owner_agent"]}
 
 Run: {rid}
 Goal: {record.goal}
 Files: {files}
+
+## Budget
+Max file edits: {max_edits}. Stop when: {stop_cond}. Do not rewrite unrelated code.
 
 ## Constraints
 {constraints}
@@ -662,33 +770,43 @@ def _multi_agent_specs(
     code_agents: int,
     include_docs_agent: bool,
 ) -> tuple[RuntimeAgentSpec, ...]:
+    task_type = classify_task(goal)
+    file_scope, quick_test = get_coding_focus(task_type)
     specs = [
         RuntimeAgentSpec(
             role=f"coding_agent_{index}",
             phase="code",
             goal=(
-                f"Do code slice {index}: {goal}. "
-                "Change repo code in scope. Make artifact. Stop when ready to validate."
+                f"Code slice {index} of {code_agents}: {goal}. "
+                f"Scope: {file_scope}. "
+                f"Quick verify: {quick_test}. "
+                "Stop after first passing verify. Do not rewrite out-of-scope files."
             ),
         )
         for index in range(1, code_agents + 1)
     ]
+    # Two lean gates: test gate runs the suite; quality gate checks only diff+rules.
     specs.extend(
         [
             RuntimeAgentSpec(
                 role="test_coverage_gate",
                 phase="gate",
                 goal=(
-                    f"Test and check coverage: {goal}. "
-                    "Give pass/fail to code agent. Include command, failure, gap, artifact."
+                    f"Coverage gate: {goal}. "
+                    f"Run: {quick_test}. "
+                    "Report: PASS or FAIL, one failing test name, first traceback line only. "
+                    "Do not rewrite code."
                 ),
             ),
             RuntimeAgentSpec(
                 role="quality_review_gate",
                 phase="gate",
                 goal=(
-                    f"Review code: {goal}. "
-                    "Check diff, repo rule, unsupported claim. Do tests justify passing?"
+                    f"Quality gate: {goal}. "
+                    "Check only: (1) ruff violations, (2) unsupported result claims, "
+                    "(3) out-of-scope file edits. "
+                    "Report: PASS or FAIL with specific violation. "
+                    "Do not run tests or rewrite code."
                 ),
             ),
         ]
@@ -710,17 +828,110 @@ def _multi_agent_specs(
 def _runtime_plan_payload(
     parent: RunRecord,
     specs: tuple[RuntimeAgentSpec, ...],
+    max_recovery_attempts: int,
 ) -> dict[str, Any]:
     return {
         "parent_run_id": parent.run_id,
         "goal": parent.goal,
         "communication": "share worktree, run artifact in runs/orchestration",
-        "gate_policy": (
-            "code agent must finish; test/quality gate "
-            "must pass before doc agent run"
+        "gate_policy": ("code agent must finish; test/quality gate must pass before doc agent run"),
+        "recovery_policy": (
+            "failed code or gate phases launch coordinated workaround agents "
+            f"and retry up to {max_recovery_attempts} time(s) before failing"
         ),
         "agents": [asdict(spec) for spec in specs],
     }
+
+
+def _recovery_specs(
+    goal: str,
+    failed_phase: str,
+    attempt: int,
+    failed_results: tuple[LaunchResult, ...],
+) -> tuple[RuntimeAgentSpec, ...]:
+    failed_ids = ", ".join(result.run_id for result in failed_results) or "unknown"
+    stderr_cmds = " | ".join(f"head -20 {result.stderr_path}" for result in failed_results)
+    return (
+        RuntimeAgentSpec(
+            role=f"{failed_phase}_workaround_agent_attempt_{attempt}",
+            phase="code",
+            goal=(
+                f"Recovery {attempt} for failed {failed_phase}: {goal}. "
+                f"Failed runs: {failed_ids}. "
+                f"Read traceback: {stderr_cmds}. "
+                "Edit ONE file and ONE function identified by the traceback. "
+                "Verify with: python -m pytest tests/ -x -q. Stop after first passing run."
+            ),
+        ),
+    )
+
+
+def _retry_gate_specs(goal: str, attempt: int) -> tuple[RuntimeAgentSpec, ...]:
+    task_type = classify_task(goal)
+    _, quick_test = get_coding_focus(task_type)
+    return (
+        RuntimeAgentSpec(
+            role=f"test_coverage_gate_retry_{attempt}",
+            phase="gate",
+            goal=(
+                f"Coverage gate retry {attempt}: {goal}. "
+                f"Run: {quick_test}. "
+                "Report: PASS or FAIL, one failing test name, first traceback line only. "
+                "Do not rewrite code."
+            ),
+        ),
+        RuntimeAgentSpec(
+            role=f"quality_review_gate_retry_{attempt}",
+            phase="gate",
+            goal=(
+                f"Quality gate retry {attempt}: {goal}. "
+                "Check only: (1) ruff violations, (2) unsupported result claims, "
+                "(3) out-of-scope file edits. "
+                "Report: PASS or FAIL with specific violation. "
+                "Do not run tests or rewrite code."
+            ),
+        ),
+    )
+
+
+def _launch_specs_parallel(
+    parent: RunRecord,
+    specs: tuple[RuntimeAgentSpec, ...],
+    runs_dir: Path | str,
+    agent_cmd: tuple[str, ...] | None,
+    agent: str | None,
+    timeout_s: int | None,
+    codex_auto_resume: bool,
+    codex_resume_delay_s: int,
+    codex_max_resumes: int,
+    sibling_summaries: tuple[tuple[str, str], ...] = (),
+) -> tuple[list[str], list[LaunchResult]]:
+    child_ids: list[str] = []
+    results: list[LaunchResult] = []
+    if not specs:
+        return child_ids, results
+    with ThreadPoolExecutor(max_workers=max(1, len(specs))) as executor:
+        futures = {
+            executor.submit(
+                _dispatch_and_launch_child,
+                parent,
+                spec,
+                runs_dir,
+                agent_cmd,
+                agent,
+                timeout_s,
+                codex_auto_resume,
+                codex_resume_delay_s,
+                codex_max_resumes,
+                sibling_summaries,
+            ): spec
+            for spec in specs
+        }
+        for future in as_completed(futures):
+            child_id, result = future.result()
+            child_ids.append(child_id)
+            results.append(result)
+    return child_ids, results
 
 
 def _dispatch_and_launch_child(
@@ -735,18 +946,14 @@ def _dispatch_and_launch_child(
     codex_max_resumes: int = 1,
     sibling_summaries: tuple[tuple[str, str], ...] = (),
 ) -> tuple[str, LaunchResult]:
-    child_run_id = (
-        f"{parent.run_id}-{_safe_slug(spec.role)}"
-    )
+    child_run_id = f"{parent.run_id}-{_safe_slug(spec.role)}"
     child = dispatch_task(
         spec.goal,
         runs_dir=runs_dir,
         run_id=child_run_id,
         phase_override=spec.phase,
     )
-    _append_runtime_context(
-        child, parent, spec, sibling_summaries
-    )
+    _append_runtime_context(child, parent, spec, sibling_summaries)
     result = launch_run(
         child.run_id,
         runs_dir=runs_dir,
@@ -768,14 +975,26 @@ def _run_agent_command(
     timeout_s: int | None,
     mode: str,
 ) -> int:
+    """Execute one agent invocation, routing prompt delivery by backend type.
+
+    Codex / Claude / generic: prompt delivered via stdin.
+    Gemini CLI: prompt spliced into the -p argument slot.
+    """
+    if _is_gemini_command(command):
+        effective_command = _inject_gemini_prompt(command, prompt)
+        effective_input: str | None = None
+    else:
+        effective_command = command
+        effective_input = prompt
+
     try:
         with stdout_path.open(mode) as f_out, stderr_path.open(mode) as f_err:
             if mode == "a":
                 f_out.write("\n\n=== automatic resume attempt ===\n")
                 f_err.write("\n\n=== automatic resume attempt ===\n")
             result = subprocess.run(
-                command,
-                input=prompt,
+                effective_command,
+                input=effective_input,
                 cwd=REPO_ROOT,
                 stdout=f_out,
                 stderr=f_err,
@@ -790,6 +1009,32 @@ def _run_agent_command(
 
 def _is_codex_command(command: tuple[str, ...]) -> bool:
     return bool(command) and Path(command[0]).name == "codex"
+
+
+def _is_gemini_command(command: tuple[str, ...]) -> bool:
+    return bool(command) and Path(command[0]).name == "gemini"
+
+
+def _supports_auto_resume(command: tuple[str, ...]) -> bool:
+    """True for agent backends that support token-limit auto-resume."""
+    return _is_codex_command(command) or _is_gemini_command(command)
+
+
+def _inject_gemini_prompt(command: tuple[str, ...], prompt: str) -> tuple[str, ...]:
+    """Replace the sentinel empty string after -p with the actual prompt text.
+
+    default_agent_command returns ('gemini', ..., '-p', '') where the trailing
+    empty string is a placeholder.  At launch time we splice in the real prompt
+    so Gemini receives it as a positional argument rather than via stdin.
+    """
+    cmd = list(command)
+    try:
+        idx = cmd.index("-p")
+        cmd[idx + 1] = prompt
+    except (ValueError, IndexError):
+        # -p not present or malformed — append as fallback.
+        cmd.extend(["-p", prompt])
+    return tuple(cmd)
 
 
 def _logs_indicate_token_limit(stdout_path: Path, stderr_path: Path) -> bool:
@@ -814,10 +1059,14 @@ def _append_runtime_context(
     sibling_block = ""
     if sibling_summaries:
         lines = ["\n## Sibling Results\n"]
+        total = 0
         for sib_id, sib_detail in sibling_summaries:
-            lines.append(f"### {sib_id}")
-            lines.append(sib_detail)
-            lines.append("")
+            entry = f"### {sib_id}\n{sib_detail}\n"
+            if total + len(entry) > _SIBLING_BLOCK_CAP:
+                lines.append("[sibling summaries truncated for token budget]")
+                break
+            lines.append(entry)
+            total += len(entry)
         sibling_block = "\n".join(lines)
     prompt_path.write_text(
         prompt_path.read_text()
@@ -841,11 +1090,10 @@ def _collect_sibling_summaries(
     results: list[LaunchResult],
     runs_dir: Path | str,
 ) -> tuple[tuple[str, str], ...]:
-    """Build rich summaries from finished siblings.
+    """Build compact summaries from finished siblings.
 
-    Each summary includes status, all checkpoint messages,
-    artifact paths, and stdout tail so downstream agents
-    have full context.
+    Each entry is hard-capped at _SIBLING_PER_CAP chars to prevent
+    prompt bloat across recovery cycles.
     """
     summaries: list[tuple[str, str]] = []
     for cid, res in zip(child_ids, results):
@@ -854,30 +1102,23 @@ def _collect_sibling_summaries(
         parts.append(f"**{status}**")
         try:
             rec = load_run(cid, runs_dir)
-            # Include all checkpoint messages (skip queued/launch)
             for ev in rec.events:
-                if ev.status in (
-                    RunStatus.QUEUED,
-                ):
+                if ev.status is RunStatus.QUEUED:
                     continue
-                parts.append(
-                    f"  - [{ev.status.value}] {ev.message}"
-                )
-                if ev.artifacts:
-                    for art in ev.artifacts:
-                        parts.append(f"    artifact: {art}")
+                parts.append(f"  - [{ev.status.value}] {ev.message[:120]}")
         except Exception:
             pass
-        # Append stdout tail for concrete output
+        # Compact stdout tail — 10 lines is enough for pytest output.
         stdout = Path(res.stdout_path)
-        tail = _read_tail(stdout, limit=2048).strip()
+        tail = _read_tail(stdout, limit=1_024).strip()
         if tail:
-            # Keep only last 20 lines max
-            tail_lines = tail.splitlines()[-20:]
-            parts.append("  stdout (tail):")
-            for line in tail_lines:
-                parts.append(f"    {line}")
-        summaries.append((cid, "\n".join(parts)))
+            tail_lines = tail.splitlines()[-10:]
+            parts.append("  stdout:")
+            parts.extend(f"    {ln}" for ln in tail_lines)
+        detail = "\n".join(parts)
+        if len(detail) > _SIBLING_PER_CAP:
+            detail = detail[:_SIBLING_PER_CAP] + " [truncated]"
+        summaries.append((cid, detail))
     return tuple(summaries)
 
 
@@ -955,9 +1196,7 @@ def _monitor_run_ids(run_id: str, runs_dir: Path | str) -> tuple[str, ...]:
     else:
         prefix = f"{parent.run_id}-"
         child_ids = [
-            record.run_id
-            for record in list_runs(runs_dir)
-            if record.run_id.startswith(prefix)
+            record.run_id for record in list_runs(runs_dir) if record.run_id.startswith(prefix)
         ]
         child_ids.sort()
         run_ids.extend(child_ids)
@@ -1020,13 +1259,10 @@ def _tmux_monitor_commands(
 
 
 def _tail_events_command(run_id: str, path: Path) -> str:
-    return (
-        "bash -lc "
-        + shlex.quote(
-            f"printf '== {run_id} ==\\n'; "
-            f"touch {shlex.quote(str(path))}; "
-            f"tail -n 80 -F {shlex.quote(str(path))}"
-        )
+    return "bash -lc " + shlex.quote(
+        f"printf '== {run_id} ==\\n'; "
+        f"touch {shlex.quote(str(path))}; "
+        f"tail -n 80 -F {shlex.quote(str(path))}"
     )
 
 

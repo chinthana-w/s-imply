@@ -7,6 +7,7 @@ A Topology-Aware Justification Oracle for digital circuits using Multi-Path Tran
 - **Topology-Aware Embeddings**: Maps physical gate identities across reconvergent paths for global consistency.
 - **Physics-Informed Training**: Incorporates differentiable logic consistency loss to enforce Boolean truth tables.
 - **Hybrid AI-PODEM**: Integrates AI-based justification directly into the PODEM backtrace loop.
+- **Hierarchical Reconvergence**: Specialized `HierarchicalReconvSolver` for nested logic structures.
 
 ---
 
@@ -100,23 +101,34 @@ python -m scripts.benchmark_itc99_gate \
     --manifest-out docs/itc99_gate_run_manifest.json \
     --notion-summary-out docs/notion_result_summary.md \
     --candidate-count 8 \
-    --max-backtracks 5000
+    --ai-attempts 2 \
+    --max-backtracks 5000 \
+    --coverage-target 0.8 \
+    --compare-classic \
+    --backtrack-target
 ```
 
 The benchmark report records per-fault outcomes, baseline metadata, command
-provenance, and optional Notion-ready markdown.  Bounded smoke runs using
-`--limit-faults` validate the benchmark/reporting path only; do not treat them
-as a promotion decision for the full 6,445-fault 10% gate.
+provenance, AI/classic backtrack comparison, target pass/fail fields, and
+optional Notion-ready markdown.  Bounded smoke runs using `--limit-faults`
+validate the benchmark/reporting path only; do not treat them as a promotion
+decision for the full 6,445-fault 10% gate.  Promote to full ITC99 only after a
+comparable 10% gate artifact reaches at least 80% no-fallback coverage and uses
+fewer AI backtracks than classic PODEM on the same faults.
 
 For a repo-local quick session, use the guarded wrapper:
 
 ```bash
-bash scripts/train_test_session.sh
+COVERAGE_TARGET=0.8 COMPARE_CLASSIC=1 BACKTRACK_TARGET=1 \
+    AI_ATTEMPTS=2 bash scripts/train_test_session.sh
 ```
 
 It builds ISCAS85/89 data, trains, and writes ITC99 gate artifacts under
 `docs/session_reports/$RUN_ID/` by default.  The wrapper checks disk/RAM
 minimums before each stage and can resume selected stages with `STAGES=...`.
+The wrapper exposes the backtrack gate as environment controls; without the
+`COMPARE_CLASSIC=1` and `BACKTRACK_TARGET=1` overrides, a wrapper test run does
+not prove the fewer-backtracks target.
 
 ### 4. RL Fine-tuning
 After collecting experience, fine-tune the transformer using policy gradient (REINFORCE)

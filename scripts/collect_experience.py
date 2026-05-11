@@ -271,11 +271,15 @@ if __name__ == "__main__":
         "--exploration", type=int, default=5, help="Random exploration attempts per fault"
     )
     parser.add_argument("--gpu", type=int, default=0, help="GPU ID to use")
+    parser.add_argument(
+        "--output", default="data/rl_experience", help="Directory to save RL experience"
+    )
     args = parser.parse_args()
 
     collect_experience(
         bench_dirs=args.bench_dirs,
         model_path=args.model,
+        output_dir=args.output,
         max_faults_per_circuit=args.max_faults,
         exploration_attempts=args.exploration,
         gpu_id=args.gpu,

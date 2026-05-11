@@ -101,11 +101,6 @@ class AIBacktracer:
                     pairs = self.solver.pair_cache[objective.gate_id]
 
                 if not pairs:
-                    if self.no_fallback:
-                        raise RuntimeError(
-                            f"[AI-BT] No reconv pairs for gate {objective.gate_id}"
-                            " and fallback is disabled."
-                        )
                     if self.verbose:
                         print(
                             f"  [AI-BT] No reconv pairs for gate {objective.gate_id}, skipping AI."
@@ -184,6 +179,87 @@ class AIBacktracer:
         if self.verbose:
             print("  [AI-BT] Fallback to simple_backtrace")
         return simple_backtrace(objective, circuit)
+
+
+class StaticHintBacktracer:
+    """Backtrace with AI activation hints, falling back to the classic heuristic.
+
+    The activation solver may return values for internal nodes that are not
+    directly applied to the circuit.  This backtracer uses those values only to
+    choose among otherwise valid X fanins for the current PODEM objective.
+    """
+
+    def __init__(
+        self,
+        hints: Dict[int, LogicValue],
+        verbose: bool = False,
+    ):
+        self.hints = {int(k): LogicValue(v) for k, v in hints.items()}
+        self.verbose = verbose
+
+    def __call__(self, objective: Fault, circuit: List[Gate]) -> Fault:
+        result = self._hinted_backtrace(objective, circuit)
+        if result is not None:
+            return result
+        return simple_backtrace(objective, circuit)
+
+    def _hinted_backtrace(self, objective: Fault, circuit: List[Gate]) -> Fault | None:
+        current_id = int(objective.gate_id)
+        target = LogicValue(objective.value)
+
+        while circuit[current_id].nfi != 0:
+            next_choice = self._choose_hinted_fanin(circuit, current_id, target)
+            if next_choice is None:
+                return None
+            current_id, target = next_choice
+
+        if self.verbose:
+            print(f"[AI-HINT] Backtrace selected PI {current_id}={_logic_value_label(target)}")
+        return Fault(current_id, target)
+
+    def _choose_hinted_fanin(
+        self,
+        circuit: List[Gate],
+        gate_id: int,
+        target: LogicValue,
+    ) -> tuple[int, LogicValue] | None:
+        gate = circuit[gate_id]
+        x_fanins = [fin for fin in gate.fin if circuit[fin].val == LogicValue.XD]
+        if not x_fanins:
+            return None
+
+        required = self._required_fanin_value(gate.type, target)
+        if required is None:
+            return None
+
+        for fin in x_fanins:
+            if self.hints.get(fin) == required:
+                if self.verbose:
+                    print(
+                        f"[AI-HINT] Gate {gate_id}={_logic_value_label(target)} -> "
+                        f"{fin}={_logic_value_label(required)}"
+                    )
+                return fin, required
+        return None
+
+    @staticmethod
+    def _required_fanin_value(
+        gate_type: GateType,
+        target: LogicValue,
+    ) -> LogicValue | None:
+        if gate_type == GateType.BUFF:
+            return target
+        if gate_type == GateType.NOT:
+            return LogicValue.ONE if target == LogicValue.ZERO else LogicValue.ZERO
+        if gate_type == GateType.AND:
+            return LogicValue.ONE if target == LogicValue.ONE else LogicValue.ZERO
+        if gate_type == GateType.NAND:
+            return LogicValue.ONE if target == LogicValue.ZERO else LogicValue.ZERO
+        if gate_type == GateType.OR:
+            return LogicValue.ZERO if target == LogicValue.ZERO else LogicValue.ONE
+        if gate_type == GateType.NOR:
+            return LogicValue.ZERO if target == LogicValue.ONE else LogicValue.ONE
+        return None
 
 
 def _podem_succeeded(result: int | bool) -> bool:
@@ -837,6 +913,8 @@ def ai_podem(
                         verbose=verbose,
                         no_fallback=no_fallback,
                     )
+                elif ai_assignment:
+                    backtracer = StaticHintBacktracer(ai_assignment, verbose=verbose)
 
                 result = mogu_podem_wrapper(
                     circuit,

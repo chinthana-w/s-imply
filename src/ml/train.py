@@ -192,8 +192,12 @@ class TrainConfig:
     single_gpu: bool = False  # force one CUDA device even when several are visible
 
 
+
+
+
 def _resolve_cuda_device_ids(gpu_ids: str, single_gpu: bool) -> list[int]:
-    """Return visible CUDA device ordinals selected for training."""
+    """Return visible CUDA device ordinals selected for training (deprecated, kept for 
+    compatibility)."""
     if not torch.cuda.is_available():
         return []
 
@@ -381,6 +385,7 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
             f"Initializing DataLoaders (workers={cfg.num_workers}, batch_size={cfg.batch_size})...",
             flush=True,
         )
+        
         train_loader = DataLoader(
             train_set,
             batch_size=cfg.batch_size,
@@ -961,11 +966,8 @@ def cmd_train(args: argparse.Namespace) -> None:
         cfg.output = args.checkpoint_dir
 
     cuda_device_ids = _resolve_cuda_device_ids(cfg.gpu_ids, cfg.single_gpu)
-    device = (
-        torch.device(f"cuda:{cuda_device_ids[0]}")
-        if cuda_device_ids
-        else torch.device("cpu")
-    )
+    device = torch.device(f"cuda:{cuda_device_ids[0]}" if cuda_device_ids else "cpu")
+    
     if cfg.verbose:
         if device.type == "cuda":
             try:
@@ -974,14 +976,7 @@ def cmd_train(args: argparse.Namespace) -> None:
                 dev_name = "CUDA device"
             print(f"Using device: {device} ({dev_name})", flush=True)
             if len(cuda_device_ids) > 1:
-                names = [torch.cuda.get_device_name(i) for i in cuda_device_ids]
-                print(
-                    f"Using CUDA devices for DataParallel: "
-                    f"{list(zip(cuda_device_ids, names))}",
-                    flush=True,
-                )
-            else:
-                print(f"Using single CUDA device: {cuda_device_ids[0]}", flush=True)
+                print(f"Using DataParallel on {len(cuda_device_ids)} GPUs: {cuda_device_ids}")
         else:
             print("Using device: cpu (CUDA not available)")
 
@@ -1041,13 +1036,9 @@ def cmd_train(args: argparse.Namespace) -> None:
     ).to(device)
     print("Model initialized and moved to device.")
 
-    if len(cuda_device_ids) > 1:
-        print(f"Using {len(cuda_device_ids)} GPUs with DataParallel: {cuda_device_ids}")
-        model = nn.DataParallel(
-            model,
-            device_ids=cuda_device_ids,
-            output_device=cuda_device_ids[0],
-        )
+    if device.type == "cuda" and len(cuda_device_ids) > 1:
+        print(f"Wrapping model with DataParallel (devices={cuda_device_ids})")
+        model = nn.DataParallel(model, device_ids=cuda_device_ids)
 
     # 4. LOAD WEIGHTS (Pretrained or Resume)
     # Priority: 1. --pretrained flag  2. --output/best_model.pth (auto-resume)
@@ -1350,14 +1341,20 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default="all",
         help=(
-            "Comma-separated visible CUDA device ids to use with DataParallel "
-            '(default: "all", e.g. "0,1").'
+            "(DEPRECATED: ignored in DDP mode) "
+            "Comma-separated visible CUDA device ids. Use torch.distributed.launch instead."
         ),
     )
     t.add_argument(
         "--single-gpu",
         action="store_true",
-        help="Disable DataParallel and force one CUDA device.",
+        help="(DEPRECATED: ignored in DDP mode) Disable multi-GPU and force single device.",
+    )
+    t.add_argument(
+        "--local-rank",
+        type=int,
+        default=0,
+        help="(Auto-set by torch.distributed.launch) Local rank for distributed training.",
     )
     t.add_argument(
         "--max-train-batches",
@@ -1500,7 +1497,10 @@ def build_argparser() -> argparse.ArgumentParser:
 def main() -> None:
     print("[DEBUG] Program started", flush=True)
     parser = build_argparser()
-    args = parser.parse_args()
+    # Use parse_known_args so launcher-injected flags like --local-rank (from
+    # torch.distributed.launch / torchrun) are silently ignored at the top level.
+    # The subparser already registers --local-rank for completeness.
+    args, _unknown = parser.parse_known_args()
     print(f"[DEBUG] Args parsed: {args.cmd}", flush=True)
 
     if args.cmd == "train":

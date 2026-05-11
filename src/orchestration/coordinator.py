@@ -49,6 +49,14 @@ class NotionPublicationTarget:
 
 
 @dataclass(frozen=True)
+class BudgetHint:
+    """Token-spend guard injected into every agent prompt."""
+
+    max_edits: int = 3
+    stop_condition: str = "one passing focused test"
+
+
+@dataclass(frozen=True)
 class OrchestrationState:
     goal: str
     task_type: TaskType
@@ -73,6 +81,7 @@ class TaskPacket:
     expected_artifacts: tuple[str, ...]
     run_manifest_required: bool
     notion_publication: NotionPublicationTarget = field(default_factory=NotionPublicationTarget)
+    budget_hint: BudgetHint = field(default_factory=BudgetHint)
 
 
 _KEYWORDS: tuple[tuple[TaskType, tuple[str, ...]], ...] = (
@@ -133,6 +142,35 @@ _KEYWORDS: tuple[tuple[TaskType, tuple[str, ...]], ...] = (
 )
 
 
+# Maps task type to (file_scope, quick_test_cmd) for coding agents.
+_CODING_FOCUS: dict[TaskType, tuple[str, str]] = {
+    TaskType.ATPG: (
+        "src/atpg/",
+        "python -m pytest tests/test_ai_podem.py tests/test_reconv_solver.py -x -q",
+    ),
+    TaskType.ML: (
+        "src/ml/",
+        "python -m pytest tests/test_model_pe.py -x -q",
+    ),
+    TaskType.BENCHMARK: (
+        "scripts/",
+        "python -m pytest tests/ -x -q",
+    ),
+    TaskType.DOCS: (
+        "docs/",
+        "python -m pytest tests/ -x -q",
+    ),
+    TaskType.THEORY: (
+        "docs/ src/atpg/",
+        "python -m pytest tests/ -x -q",
+    ),
+    TaskType.REVIEW: (
+        "<diff>",
+        "python -m pytest tests/ -x -q",
+    ),
+}
+
+
 _ROLE_BY_TASK: dict[TaskType, AgentRole] = {
     TaskType.ATPG: AgentRole.ATPG_SOLVER,
     TaskType.ML: AgentRole.ML_TRAINING,
@@ -168,9 +206,7 @@ _PHASE_TASK_TYPE: dict[str, TaskType] = {
 }
 
 
-def classify_task(
-    goal: str, changed_files: tuple[str, ...] = ()
-) -> TaskType:
+def classify_task(goal: str, changed_files: tuple[str, ...] = ()) -> TaskType:
     """Classify work by highest keyword-hit score, not first match."""
     text = " ".join((goal, *changed_files)).lower()
     best_type = TaskType.REVIEW
@@ -181,6 +217,11 @@ def classify_task(
             best_score = score
             best_type = task_type
     return best_type
+
+
+def get_coding_focus(task_type: TaskType) -> tuple[str, str]:
+    """Return (file_scope, quick_test_cmd) for the coding agent of a given task type."""
+    return _CODING_FOCUS.get(task_type, ("<repo>", "python -m pytest tests/ -x -q"))
 
 
 def create_task_packet(
@@ -211,30 +252,24 @@ def create_task_packet(
     constraints = [
         "Use the deepgate conda environment.",
         "Prefer python -m entrypoints for repo modules.",
-        "Keep edits compatible with Ruff line length 100 "
-        "and rules E/F/I.",
-        "Do not make unsupported result claims without "
-        "artifact provenance.",
+        "Keep edits compatible with Ruff line length 100 and rules E/F/I.",
+        "Do not make unsupported result claims without artifact provenance.",
     ]
-    notion_publication = NotionPublicationTarget(
-        enabled=False, status="not_applicable"
-    )
+    notion_publication = NotionPublicationTarget(enabled=False, status="not_applicable")
     if task_type in {TaskType.DOCS, TaskType.THEORY, TaskType.BENCHMARK}:
-        constraints.append(
-            "Treat Notion as canonical for method/results "
-            "documentation."
-        )
-        constraints.append(
-            "Update experiment steps in Notion using dated "
-            "log entries."
-        )
+        constraints.append("Treat Notion as canonical for method/results documentation.")
+        constraints.append("Update experiment steps in Notion using dated log entries.")
         notion_publication = NotionPublicationTarget()
     if task_type is TaskType.THEORY:
-        constraints.append(
-            "Synchronize theoretical-framework changes "
-            "with docs/paper_draft.tex."
-        )
+        constraints.append("Synchronize theoretical-framework changes with docs/paper_draft.tex.")
 
+    file_scope, quick_test = _CODING_FOCUS.get(
+        task_type, ("<repo>", "python -m pytest tests/ -x -q")
+    )
+    budget_hint = BudgetHint(
+        max_edits=5 if task_type is TaskType.BENCHMARK else 3,
+        stop_condition=f"passing: {quick_test}",
+    )
     return TaskPacket(
         owner_agent=owner,
         task_type=task_type,
@@ -244,6 +279,7 @@ def create_task_packet(
         expected_artifacts=_expected_artifacts(task_type),
         run_manifest_required=run_manifest_required,
         notion_publication=notion_publication,
+        budget_hint=budget_hint,
     )
 
 

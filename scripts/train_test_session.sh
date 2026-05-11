@@ -108,13 +108,18 @@ LAMBDA_LOGIC="${LAMBDA_LOGIC:-1.0}"
 LAMBDA_FULL_LOGIC="${LAMBDA_FULL_LOGIC:-0.5}"
 
 CANDIDATE_COUNT="${CANDIDATE_COUNT:-8}"
+AI_ATTEMPTS="${AI_ATTEMPTS:-1}"
+ENABLE_AI_PROPAGATION="${ENABLE_AI_PROPAGATION:-0}"
 MAX_BACKTRACKS="${MAX_BACKTRACKS:-5000}"
+COMPARE_CLASSIC="${COMPARE_CLASSIC:-0}"
+CLASSIC_TIMEOUT="${CLASSIC_TIMEOUT:-30}"
 AMP_FLAG="${AMP_FLAG:---amp}"
 ITC99_BENCHMARK_LIMIT_FAULTS="${ITC99_BENCHMARK_LIMIT_FAULTS:-0}"
 BASELINE_COVERAGE="${BASELINE_COVERAGE:-0.1817}"
 BASELINE_LABEL="${BASELINE_LABEL:-unlinked_candidate 1% ITC99 gate}"
 BASELINE_SOURCE="${BASELINE_SOURCE:-docs/checkpoint_compatibility_summary.md}"
 COVERAGE_TARGET="${COVERAGE_TARGET:-1.0}"
+BACKTRACK_TARGET="${BACKTRACK_TARGET:-0}"
 
 MIN_CACHE_FREE_GB="${MIN_CACHE_FREE_GB:-20}"
 MIN_REPO_FREE_GB="${MIN_REPO_FREE_GB:-5}"
@@ -314,8 +319,10 @@ if contains_stage test; then
     --manifest-out "${REPORT_DIR}/itc99_gate_run_manifest.json"
     --notion-summary-out "${REPORT_DIR}/notion_result_summary.md"
     --candidate-count "$CANDIDATE_COUNT"
+    --ai-attempts "$AI_ATTEMPTS"
     --candidate-seed-base "$ITC99_SEED"
     --max-backtracks "$MAX_BACKTRACKS"
+    --classic-timeout "$CLASSIC_TIMEOUT"
     --baseline-coverage "$BASELINE_COVERAGE"
     --baseline-label "$BASELINE_LABEL"
     --baseline-source "$BASELINE_SOURCE"
@@ -325,6 +332,15 @@ if contains_stage test; then
   if [[ "$ITC99_BENCHMARK_LIMIT_FAULTS" != "0" ]]; then
     benchmark_args+=(--limit-faults "$ITC99_BENCHMARK_LIMIT_FAULTS")
   fi
+  if [[ "$COMPARE_CLASSIC" == "1" ]]; then
+    benchmark_args+=(--compare-classic)
+  fi
+  if [[ "$ENABLE_AI_PROPAGATION" == "1" ]]; then
+    benchmark_args+=(--enable-ai-propagation)
+  fi
+  if [[ "$BACKTRACK_TARGET" == "1" ]]; then
+    benchmark_args+=(--backtrack-target)
+  fi
   run_step python "${benchmark_args[@]}"
 else
   log "Skipping test"
@@ -332,22 +348,36 @@ fi
 
 if contains_stage full_itc99_test; then
   MODEL_PATH="${MODEL_PATH:-${CHECKPOINT_DIR}/best_model.pth}"
-  run_step python -m scripts.benchmark_itc99_gate \
-    --model "$MODEL_PATH" \
-    --fault-list "$ITC99_FAULT_LIST" \
-    --out "${REPORT_DIR}/itc99_full_report.json" \
-    --csv-out "${REPORT_DIR}/itc99_full_per_fault.csv" \
-    --manifest-out "${REPORT_DIR}/itc99_full_run_manifest.json" \
-    --notion-summary-out "${REPORT_DIR}/notion_full_result_summary.md" \
-    --candidate-count "$CANDIDATE_COUNT" \
-    --candidate-seed-base "$ITC99_SEED" \
-    --max-backtracks "$MAX_BACKTRACKS" \
-    --baseline-coverage "$BASELINE_COVERAGE" \
-    --baseline-label "$BASELINE_LABEL" \
-    --baseline-source "$BASELINE_SOURCE" \
-    --coverage-target "$COVERAGE_TARGET" \
-    --run-id "$RUN_ID" \
+  full_benchmark_args=(
+    -m scripts.benchmark_itc99_gate
+    --model "$MODEL_PATH"
+    --fault-list "$ITC99_FAULT_LIST"
+    --out "${REPORT_DIR}/itc99_full_report.json"
+    --csv-out "${REPORT_DIR}/itc99_full_per_fault.csv"
+    --manifest-out "${REPORT_DIR}/itc99_full_run_manifest.json"
+    --notion-summary-out "${REPORT_DIR}/notion_full_result_summary.md"
+    --candidate-count "$CANDIDATE_COUNT"
+    --ai-attempts "$AI_ATTEMPTS"
+    --candidate-seed-base "$ITC99_SEED"
+    --max-backtracks "$MAX_BACKTRACKS"
+    --classic-timeout "$CLASSIC_TIMEOUT"
+    --baseline-coverage "$BASELINE_COVERAGE"
+    --baseline-label "$BASELINE_LABEL"
+    --baseline-source "$BASELINE_SOURCE"
+    --coverage-target "$COVERAGE_TARGET"
+    --run-id "$RUN_ID"
     --full
+  )
+  if [[ "$COMPARE_CLASSIC" == "1" ]]; then
+    full_benchmark_args+=(--compare-classic)
+  fi
+  if [[ "$ENABLE_AI_PROPAGATION" == "1" ]]; then
+    full_benchmark_args+=(--enable-ai-propagation)
+  fi
+  if [[ "$BACKTRACK_TARGET" == "1" ]]; then
+    full_benchmark_args+=(--backtrack-target)
+  fi
+  run_step python "${full_benchmark_args[@]}"
 else
   log "Skipping full_itc99_test"
 fi

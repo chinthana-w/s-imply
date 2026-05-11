@@ -70,6 +70,12 @@ python -m src.orchestration.cli multi-run "Improve the train/test pipeline" --co
 - a `docs_results_agent`, unless `--no-docs-agent` is passed, which runs only
   after the gate agents complete successfully.
 
+If a coding agent or gate agent fails, the parent runtime does not stop at the
+first problem. It packages the failed run logs, checkpoints, artifacts, and
+stdout tails into sibling summaries, launches a scoped workaround agent, and
+then retries the affected gate phase. Recovery is bounded by
+`--max-recovery-attempts` so a bad run cannot loop forever; the default is `2`.
+
 The runtime writes `multi_agent_plan.json` and `multi_agent_summary.json` in the
 parent run directory. Child agents communicate through checkpoints, logs,
 artifacts, and the shared worktree; there is no hidden in-memory chat bus.

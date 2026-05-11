@@ -6,7 +6,14 @@ import sys
 from src.orchestration.coordinator import AgentRole, TaskType, classify_task, create_task_packet
 from src.orchestration.mcp_server import handle_request
 from src.orchestration.runner import (
+    _SIBLING_PER_CAP,
     RunStatus,
+    _collect_sibling_summaries,
+    _inject_gemini_prompt,
+    _is_gemini_command,
+    _multi_agent_specs,
+    _recovery_specs,
+    _supports_auto_resume,
     complete_run,
     default_agent_command,
     dispatch_task,
@@ -302,7 +309,7 @@ def test_run_cli_dispatches_and_launches_with_one_command(tmp_path):
             "--runs-dir",
             str(tmp_path),
             "--agent-cmd",
-            f"{sys.executable} -c \"import sys; data=sys.stdin.read(); "
+            f'{sys.executable} -c "import sys; data=sys.stdin.read(); '
             "print('received', 'Run:' in data)\"",
         ],
         text=True,
@@ -316,17 +323,14 @@ def test_run_cli_dispatches_and_launches_with_one_command(tmp_path):
     assert "Status: completed" in result.stdout
     assert len(records) == 1
     assert records[0].status == RunStatus.COMPLETED
-    assert "received True" in (
-        tmp_path / records[0].run_id / "agent_stdout.log"
-    ).read_text()
+    assert "received True" in (tmp_path / records[0].run_id / "agent_stdout.log").read_text()
 
 
 def test_multi_agent_runtime_runs_code_gates_and_docs(tmp_path):
     command = (
         sys.executable,
         "-c",
-        "import sys; data=sys.stdin.read(); print('role_context', "
-        "'Runtime Context' in data)",
+        "import sys; data=sys.stdin.read(); print('role_context', 'Runtime Context' in data)",
     )
 
     result = run_multi_agent_runtime(
@@ -340,6 +344,7 @@ def test_multi_agent_runtime_runs_code_gates_and_docs(tmp_path):
 
     assert result.final_status == RunStatus.COMPLETED
     assert parent.status == RunStatus.COMPLETED
+    # 2 coding + 2 lean gates + 1 docs = 5 children
     assert len(result.child_run_ids) == 5
     assert summary["status"] == "completed"
     assert any("coding-agent-1" in run_id for run_id in result.child_run_ids)
@@ -350,12 +355,24 @@ def test_multi_agent_runtime_runs_code_gates_and_docs(tmp_path):
         assert "role_context True" in stdout
 
 
-def test_multi_agent_runtime_stops_when_gate_fails(tmp_path):
+def test_multi_agent_runtime_recovers_and_retries_failed_gate(tmp_path):
+    marker = tmp_path / "workaround.txt"
+    fake_agent = tmp_path / "fake_agent.py"
+    fake_agent.write_text(
+        "import pathlib, sys\n"
+        f"marker = pathlib.Path({str(marker)!r})\n"
+        "data = sys.stdin.read()\n"
+        "if 'workaround_agent' in data:\n"
+        "    marker.write_text('done')\n"
+        "    print('workaround applied')\n"
+        "    sys.exit(0)\n"
+        "print('agent ran')\n"
+        "if 'Role: test_coverage_gate' in data and not marker.exists():\n"
+        "    sys.exit(2)\n"
+    )
     command = (
         sys.executable,
-        "-c",
-        "import sys; data=sys.stdin.read(); "
-        "sys.exit(2 if 'test_coverage_gate' in data else 0)",
+        str(fake_agent),
     )
 
     result = run_multi_agent_runtime(
@@ -365,10 +382,40 @@ def test_multi_agent_runtime_stops_when_gate_fails(tmp_path):
         code_agents=1,
     )
 
-    assert result.final_status == RunStatus.FAILED
-    # Gates now run in parallel, so both launch even if one fails
-    assert len(result.child_run_ids) == 3
+    parent = load_run(result.run_id, runs_dir=tmp_path)
+    summary = json.loads((tmp_path / result.run_id / "multi_agent_summary.json").read_text())
+
+    assert result.final_status == RunStatus.COMPLETED
+    assert parent.status == RunStatus.COMPLETED
+    assert summary["status"] == "completed"
     assert any("test-coverage-gate" in run_id for run_id in result.child_run_ids)
+    assert any("gate-workaround-agent-attempt-1" in run_id for run_id in result.child_run_ids)
+    assert any("test-coverage-gate-retry-1" in run_id for run_id in result.child_run_ids)
+    assert any("docs-results-agent" in run_id for run_id in result.child_run_ids)
+
+
+def test_multi_agent_runtime_fails_after_recovery_limit(tmp_path):
+    command = (
+        sys.executable,
+        "-c",
+        "import sys; sys.stdin.read(); sys.exit(2)",
+    )
+
+    result = run_multi_agent_runtime(
+        "Improve training coverage",
+        runs_dir=tmp_path,
+        agent_cmd=command,
+        code_agents=1,
+        max_recovery_attempts=1,
+    )
+
+    parent = load_run(result.run_id, runs_dir=tmp_path)
+    summary = json.loads((tmp_path / result.run_id / "multi_agent_summary.json").read_text())
+
+    assert result.final_status == RunStatus.FAILED
+    assert parent.status == RunStatus.FAILED
+    assert "coordinated recovery" in summary["message"]
+    assert any("code-workaround-agent-attempt-1" in run_id for run_id in result.child_run_ids)
     assert not any("docs-results-agent" in run_id for run_id in result.child_run_ids)
 
 
@@ -507,3 +554,142 @@ def test_default_agent_command_supports_gemini_profile():
 
     assert command[:2] == ("gemini", "--skip-trust")
     assert "-p" in command
+
+
+# --- Anti-thrash invariant tests ---
+
+
+def test_sibling_summary_per_entry_capped(tmp_path):
+    """Each sibling summary must not exceed _SIBLING_PER_CAP chars (+truncation marker)."""
+    command = (sys.executable, "-c", "import sys; sys.stdin.read(); print('x' * 5000)")
+    dispatch_task("Review ATPG regression risk", runs_dir=tmp_path, run_id="cap-001")
+    result = launch_run("cap-001", runs_dir=tmp_path, agent_cmd=command)
+
+    summaries = _collect_sibling_summaries(["cap-001"], [result], tmp_path)
+    _, detail = summaries[0]
+
+    assert len(detail) <= _SIBLING_PER_CAP + len(" [truncated]")
+
+
+def test_gate_prompt_contains_pytest_command(tmp_path):
+    command = (sys.executable, "-c", "import sys; sys.stdin.read(); print('done')")
+    run_multi_agent_runtime(
+        "Improve training coverage",
+        runs_dir=tmp_path,
+        agent_cmd=command,
+        code_agents=1,
+        include_docs_agent=False,
+    )
+    gate_runs = [r for r in list_runs(tmp_path) if "test-coverage-gate" in r.run_id]
+    assert gate_runs
+    prompt = (tmp_path / gate_runs[0].run_id / "agent_prompt.md").read_text()
+    assert "pytest" in prompt
+
+
+def test_recovery_spec_goal_contains_failed_run_id(tmp_path):
+    dispatch_task("Review ATPG regression risk", runs_dir=tmp_path, run_id="fail-001")
+    failed_result = launch_run(
+        "fail-001",
+        runs_dir=tmp_path,
+        agent_cmd=(sys.executable, "-c", "import sys; sys.stdin.read(); sys.exit(1)"),
+    )
+    specs = _recovery_specs("Fix training bug", "code", 1, (failed_result,))
+    assert "fail-001" in specs[0].goal
+
+
+def test_coding_spec_goal_contains_file_scope():
+    specs = _multi_agent_specs("Fix ATPG backtrace bug", code_agents=1, include_docs_agent=False)
+    code_spec = next(s for s in specs if s.phase == "code")
+    assert any(
+        kw in code_spec.goal for kw in ("src/atpg/", "src/ml/", "scripts/", "docs/", "<repo>")
+    )
+
+
+def test_build_agent_prompt_contains_budget_section(tmp_path):
+    dispatch_task("Fix GradScaler checkpoint compatibility", runs_dir=tmp_path, run_id="budget-001")
+    prompt = (tmp_path / "budget-001" / "agent_prompt.md").read_text()
+    assert "## Budget" in prompt
+    assert "Max file edits" in prompt
+
+
+def test_two_lean_gates_replace_single_merged_gate():
+    specs = _multi_agent_specs("Improve training coverage", code_agents=1, include_docs_agent=False)
+    gate_specs = [s for s in specs if s.phase == "gate"]
+    assert len(gate_specs) == 2
+    roles = {s.role for s in gate_specs}
+    assert roles == {"test_coverage_gate", "quality_review_gate"}
+    cov = next(s for s in gate_specs if s.role == "test_coverage_gate")
+    qual = next(s for s in gate_specs if s.role == "quality_review_gate")
+    # Coverage gate must invoke pytest; quality gate must check ruff, not rerun tests.
+    assert "pytest" in cov.goal
+    assert "ruff" in qual.goal
+    assert "pytest" not in qual.goal
+
+
+# --- Gemini CLI compatibility tests ---
+
+
+def test_gemini_prompt_injected_into_p_arg():
+    """_inject_gemini_prompt replaces the -p placeholder with the actual prompt."""
+    base_cmd = ("gemini", "--skip-trust", "--approval-mode", "yolo", "-p", "")
+    result = _inject_gemini_prompt(base_cmd, "hello agent")
+    idx = list(result).index("-p")
+    assert result[idx + 1] == "hello agent"
+    # Original command must be unchanged.
+    assert base_cmd[-1] == ""
+
+
+def test_gemini_prompt_appended_when_p_absent():
+    """_inject_gemini_prompt falls back to appending -p when not present."""
+    base_cmd = ("gemini", "--skip-trust")
+    result = _inject_gemini_prompt(base_cmd, "hello agent")
+    assert result[-2] == "-p"
+    assert result[-1] == "hello agent"
+
+
+def test_supports_auto_resume_covers_gemini_and_codex():
+    assert _supports_auto_resume(("gemini", "-p", ""))
+    assert _supports_auto_resume(("codex", "exec", "-"))
+    assert not _supports_auto_resume(("claude",))
+    assert not _supports_auto_resume(("python", "-m", "something"))
+
+
+def test_is_gemini_command_matches_by_basename():
+    assert _is_gemini_command(("/usr/local/bin/gemini", "--skip-trust"))
+    assert not _is_gemini_command(("codex",))
+    assert not _is_gemini_command(())
+
+
+def test_default_agent_command_gemini_has_p_placeholder():
+    cmd = default_agent_command("gemini")
+    assert "-p" in cmd
+    # Placeholder must be the empty string so _inject_gemini_prompt can replace it.
+    idx = list(cmd).index("-p")
+    assert cmd[idx + 1] == ""
+
+
+def test_launch_run_with_fake_gemini_delivers_prompt(tmp_path):
+    """A fake 'gemini' binary that reads argv prints the -p content."""
+    fake_gemini = tmp_path / "gemini"
+    fake_gemini.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "if '-p' in args:\n"
+        "    idx = args.index('-p')\n"
+        "    print('got_prompt', len(args[idx + 1]) > 0)\n"
+        "else:\n"
+        "    print('no_prompt_arg')\n"
+    )
+    fake_gemini.chmod(0o755)
+
+    dispatch_task("Review ATPG regression risk", runs_dir=tmp_path, run_id="gem-001")
+    result = launch_run(
+        "gem-001",
+        runs_dir=tmp_path,
+        agent_cmd=(str(fake_gemini), "--skip-trust", "--approval-mode", "yolo", "-p", ""),
+    )
+    stdout = (tmp_path / "gem-001" / "agent_stdout.log").read_text()
+
+    assert result.final_status == RunStatus.COMPLETED
+    assert "got_prompt True" in stdout

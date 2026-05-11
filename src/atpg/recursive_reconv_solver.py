@@ -148,13 +148,10 @@ class HierarchicalReconvSolver:
         if target_node not in self.pair_cache:
             self.pair_cache[target_node] = self._collect_and_sort_pairs(target_node)
             self._pair_cache_dirty = True  # Mark for disk persistence
-        pairs_by_reconv = self.pair_cache[target_node]
+        sorted_pairs = self.pair_cache[target_node]
 
         if self.verbose:
-            print(
-                f"[Solver] Collected {sum(len(v) for v in pairs_by_reconv.values())} "
-                f"reconvergent pairs"
-            )
+            print(f"[Solver] Collected {len(sorted_pairs)} reconvergent pairs")
 
         # Initial constraints: target + provided constraints
         initial_constraints = {}
@@ -176,7 +173,7 @@ class HierarchicalReconvSolver:
         self.nodes_visited = 0
         self.inferences = 0
         final_assignment = self._backward_justify(
-            queue, initial_constraints, solved_pairs, pairs_by_reconv, seed
+            queue, initial_constraints, solved_pairs, sorted_pairs, seed
         )
 
         return final_assignment
@@ -206,18 +203,11 @@ class HierarchicalReconvSolver:
             reconv_node = p["reconv"]
             dist_to_target = distances.get(reconv_node, 9999)
             total_path_len = len(p["paths"][0]) + len(p["paths"][1])
-            return (total_path_len + dist_to_target, total_path_len)
+            # Primary: total_path_len (shortest first), Secondary: dist_to_target (closest first)
+            return (total_path_len, dist_to_target)
 
         pairs.sort(key=pair_cost)
-
-        pairs_by_reconv = {}
-        for p in pairs:
-            r = p["reconv"]
-            if r not in pairs_by_reconv:
-                pairs_by_reconv[r] = []
-            pairs_by_reconv[r].append(p)
-
-        return pairs_by_reconv
+        return pairs
 
     def _get_transitive_fanin(self, root: int, max_depth: int = 20) -> Set[int]:
         """BFS backwards to find all nodes feeding root up to max_depth."""
@@ -320,7 +310,7 @@ class HierarchicalReconvSolver:
         queue: List[int],
         assignment: Dict[int, LogicValue],
         solved_pairs: Set[int],
-        pairs_by_reconv: Dict[int, List[Dict[str, Any]]],
+        sorted_pairs: List[Dict[str, Any]],
         seed: Optional[int] = None,
     ) -> Optional[Dict[int, LogicValue]]:
         """Queue-based backward justification with just-in-time AI predictor."""
@@ -338,6 +328,116 @@ class HierarchicalReconvSolver:
         if self.nodes_visited >= self.nodes_visited_limit:
             return None
 
+        # 1. Hierarchical: Try to solve the next unsolved pair from the pre-calculated sorted list.
+        # This ensures we solve inner/shorter pairs before outer/longer ones.
+        next_pair = None
+        for p in sorted_pairs:
+            if id(p) not in solved_pairs:
+                next_pair = p
+                break
+
+        if next_pair:
+            if self.verbose:
+                print(
+                    f"[Solver] Solving pair {_format_pair(next_pair)}, "
+                    f"current assignment {_format_assignment(assignment)}"
+                )
+            self.inferences += 1
+            prediction_result = self.predictor.predict(next_pair, assignment, seed=seed)
+            inputs_snapshot = None
+            if isinstance(prediction_result, tuple):
+                candidates, inputs_snapshot = prediction_result
+            else:
+                candidates = prediction_result
+
+            if not candidates:
+                if self.verbose:
+                    print(f"[Solver] Predictor returned no candidates for {_format_pair(next_pair)}")
+                return None  # Fail fast if a reconvergent spot cannot be solved
+
+            for i, assignment_part in enumerate(candidates):
+                if self.nodes_visited >= self.nodes_visited_limit:
+                    return None
+                if self.verbose:
+                    print(
+                        f"[Solver] Trying candidate {i + 1}/{len(candidates)} for "
+                        f"{_format_pair(next_pair)}: {_format_assignment(assignment_part)}"
+                    )
+                
+                step_record = None
+                if self.recorder and inputs_snapshot:
+                    step_record = self.recorder.log_step(
+                        node_ids=inputs_snapshot["node_ids"],
+                        mask_valid=inputs_snapshot["mask_valid"],
+                        gate_types=inputs_snapshot["gate_types"],
+                        files=inputs_snapshot["files"],
+                        pair_info=next_pair,
+                        selected_assignment=assignment_part,
+                    )
+
+                new_assignment = assignment.copy()
+                conflict = False
+                for k, v in assignment_part.items():
+                    if not self._check_global_consistency(k, v, new_assignment):
+                        conflict = True
+                        break
+                    new_assignment[k] = v
+
+                if conflict:
+                    if step_record and self.recorder:
+                        self.recorder.mark_backtrack(penalty=-0.5)
+                    continue
+
+                # Detailed Logic Consistency Check
+                for k in assignment_part.keys():
+                    gate_obj = self.circuit[k]
+                    if gate_obj.type != GateType.INPT:
+                        input_vals = [
+                            new_assignment.get(fin, LogicValue.XD) for fin in gate_obj.fin
+                        ]
+                        comp_val = self._compute_gate_robust(gate_obj.type, input_vals)
+                        if comp_val != LogicValue.XD and comp_val != new_assignment[k]:
+                            conflict = True
+                            break
+                    for fout in gate_obj.fot:
+                        if fout in new_assignment:
+                            fout_obj = self.circuit[fout]
+                            input_vals = [
+                                new_assignment.get(fin, LogicValue.XD) for fin in fout_obj.fin
+                            ]
+                            comp_val = self._compute_gate_robust(fout_obj.type, input_vals)
+                            if comp_val != LogicValue.XD and comp_val != new_assignment[fout]:
+                                conflict = True
+                                break
+                    if conflict:
+                        break
+
+                if conflict:
+                    if step_record and self.recorder:
+                        self.recorder.mark_backtrack(penalty=-0.5)
+                    continue
+
+                new_queue = list(queue)
+                # Enqueue new requirements that are not PIs
+                for k in assignment_part.keys():
+                    if k not in new_queue and self.circuit[k].type != GateType.INPT:
+                        new_queue.append(k)
+
+                new_solved = set(solved_pairs)
+                new_solved.add(id(next_pair))
+
+                result = self._backward_justify(
+                    new_queue, new_assignment, new_solved, sorted_pairs, seed
+                )
+                if result is not None:
+                    return result
+
+                if step_record and self.recorder:
+                    self.recorder.mark_backtrack(penalty=-0.5)
+
+            return None
+
+        # 2. Standard Gate Justification (when all reconvergent pairs are solved)
         if not queue:
             return assignment
 
@@ -353,173 +453,8 @@ class HierarchicalReconvSolver:
             input_vals = [assignment.get(fin, LogicValue.XD) for fin in gate_obj.fin]
             if self._compute_gate_robust(gate_obj.type, input_vals) == val:
                 return self._backward_justify(
-                    list(queue), assignment, solved_pairs, pairs_by_reconv, seed
+                    list(queue), assignment, solved_pairs, sorted_pairs, seed
                 )
-
-        # Check if gate is a terminus for any UNsolved path pairs
-        unsolved_pairs = []
-        if gate in pairs_by_reconv:
-            unsolved_pairs = [p for p in pairs_by_reconv[gate] if id(p) not in solved_pairs]
-
-        if unsolved_pairs:
-            if self.verbose:
-                print(
-                    f"[Solver] Gate {gate} has {len(unsolved_pairs)} unsolved pair(s), "
-                    f"current assignment {_format_assignment(assignment)}"
-                )
-            # Suspend normal backtrace, try AI model on all available unsolved pairs
-            for pair in unsolved_pairs:
-                if (
-                    self.nodes_visited >= self.nodes_visited_limit
-                    or self.inferences >= self.inference_limit
-                ):
-                    return None
-                self.inferences += 1
-                if self.verbose:
-                    print(
-                        f"[Solver] Querying predictor for {_format_pair(pair)} with "
-                        f"assignment {_format_assignment(assignment)}"
-                    )
-                prediction_result = self.predictor.predict(pair, assignment, seed=seed)
-                inputs_snapshot = None
-                if isinstance(prediction_result, tuple):
-                    candidates, inputs_snapshot = prediction_result
-                else:
-                    candidates = prediction_result
-
-                if not candidates:
-                    if self.verbose:
-                        print(f"[Solver] Predictor returned no candidates for {_format_pair(pair)}")
-                    continue
-
-                if self.verbose:
-                    print(
-                        f"[Solver] Predictor returned {len(candidates)} candidate(s) for "
-                        f"{_format_pair(pair)}"
-                    )
-
-                for i, assignment_part in enumerate(candidates):
-                    if self.nodes_visited >= self.nodes_visited_limit:
-                        return None
-                    if self.verbose:
-                        print(
-                            f"[Solver] Trying candidate {i + 1}/{len(candidates)}: "
-                            f"{_format_assignment(assignment_part)}"
-                        )
-                    step_record = None
-                    if self.recorder and inputs_snapshot:
-                        step_record = self.recorder.log_step(
-                            node_ids=inputs_snapshot["node_ids"],
-                            mask_valid=inputs_snapshot["mask_valid"],
-                            gate_types=inputs_snapshot["gate_types"],
-                            files=inputs_snapshot["files"],
-                            pair_info=pair,
-                            selected_assignment=assignment_part,
-                        )
-
-                    new_assignment = assignment.copy()
-                    conflict = False
-                    for k, v in assignment_part.items():
-                        if not self._check_global_consistency(k, v, new_assignment):
-                            conflict = True
-                            if self.verbose:
-                                print(
-                                    f"[Solver] Rejecting candidate due to global conflict at "
-                                    f"gate {k}={_logic_value_label(v)}"
-                                )
-                            break
-                        new_assignment[k] = v
-
-                    if conflict:
-                        if step_record and self.recorder:
-                            self.recorder.mark_backtrack(penalty=-0.5)
-                        continue
-
-                    # Detailed Logic Consistency Check
-                    for k in assignment_part.keys():
-                        gate_obj = self.circuit[k]
-                        if gate_obj.type != GateType.INPT:
-                            input_vals = [
-                                new_assignment.get(fin, LogicValue.XD) for fin in gate_obj.fin
-                            ]
-                            comp_val = self._compute_gate_robust(gate_obj.type, input_vals)
-                            if comp_val != LogicValue.XD and comp_val != new_assignment[k]:
-                                conflict = True
-                                if self.verbose:
-                                    print(
-                                        f"[Solver] Rejecting candidate due to logic mismatch at "
-                                        f"gate {k}: expected {_logic_value_label(comp_val)}, "
-                                        f"got {_logic_value_label(new_assignment[k])}"
-                                    )
-                                break
-                        for fout in gate_obj.fot:
-                            if fout in new_assignment:
-                                fout_obj = self.circuit[fout]
-                                input_vals = [
-                                    new_assignment.get(fin, LogicValue.XD) for fin in fout_obj.fin
-                                ]
-                                comp_val = self._compute_gate_robust(fout_obj.type, input_vals)
-                                if comp_val != LogicValue.XD and comp_val != new_assignment[fout]:
-                                    conflict = True
-                                    if self.verbose:
-                                        print(
-                                            f"[Solver] Rejecting candidate due to fanout mismatch "
-                                            f"at gate {fout}: expected {_logic_value_label(comp_val)}, "
-                                            f"got {_logic_value_label(new_assignment[fout])}"
-                                        )
-                                    break
-                        if conflict:
-                            break
-
-                    if conflict:
-                        if step_record and self.recorder:
-                            self.recorder.mark_backtrack(penalty=-0.5)
-                        continue
-
-                    new_queue = list(queue)
-                    # Enqueue new requirements that are not PIs
-                    for k in assignment_part.keys():
-                        if k not in new_queue and self.circuit[k].type != GateType.INPT:
-                            new_queue.append(k)
-
-                    new_solved = set(solved_pairs)
-                    new_solved.add(id(pair))
-
-                    if self.verbose:
-                        print(
-                            f"[Solver] Candidate accepted provisionally. Next queue={new_queue}, "
-                            f"assignment={_format_assignment(new_assignment)}"
-                        )
-
-                    result = self._backward_justify(
-                        new_queue, new_assignment, new_solved, pairs_by_reconv, seed
-                    )
-                    if result is not None:
-                        if self.verbose:
-                            print(
-                                f"[Solver] Candidate led to solution: "
-                                f"{_format_assignment(result)}"
-                            )
-                        return result
-
-                    if self.verbose:
-                        print(
-                            f"[Solver] Candidate backtracked: "
-                            f"{_format_assignment(assignment_part)}"
-                        )
-
-                    if step_record and self.recorder:
-                        self.recorder.mark_backtrack(penalty=-0.5)
-
-            # If all pairs failed/contradicted, fail fast instead of hanging in standard DFS
-            return None
-
-        # Standard Gate Justification
-        gate_obj = self.circuit[gate]
-        if gate_obj.type == GateType.INPT:
-            return self._backward_justify(
-                list(queue), assignment, solved_pairs, pairs_by_reconv, seed
-            )
 
         options = self._justify_gate(gate, val, assignment)
         if not options:
@@ -536,7 +471,7 @@ class HierarchicalReconvSolver:
                     new_queue.append(r_node)
 
             result = self._backward_justify(
-                new_queue, new_assignment, solved_pairs, pairs_by_reconv, seed
+                new_queue, new_assignment, solved_pairs, sorted_pairs, seed
             )
             if result is not None:
                 return result

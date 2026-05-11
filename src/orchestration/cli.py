@@ -67,6 +67,7 @@ def main() -> None:
     multi_run.add_argument("--agent", choices=["codex", "gemini", "claude"])
     multi_run.add_argument("--agent-cmd", default="")
     multi_run.add_argument("--timeout-s", type=int)
+    multi_run.add_argument("--max-recovery-attempts", type=int, default=2)
     _add_codex_resume_args(multi_run)
     multi_run.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR))
 
@@ -190,6 +191,7 @@ def main() -> None:
             codex_auto_resume=args.codex_auto_resume,
             codex_resume_delay_s=args.codex_resume_delay_s,
             codex_max_resumes=args.codex_max_resumes,
+            max_recovery_attempts=args.max_recovery_attempts,
         )
         print(_format_multi_agent_result(result))
     elif args.command == "status":
@@ -369,8 +371,8 @@ def _format_launch_blocked(record) -> str:
     run_dir = Path(record.run_dir)
     status_cmd = f"python -m src.orchestration.cli status {record.run_id}"
     prompt_cmd = f"python -m src.orchestration.cli prompt {record.run_id}"
-    fail_cmd = f"python -m src.orchestration.cli fail {record.run_id} \"reason\""
-    complete_cmd = f"python -m src.orchestration.cli complete {record.run_id} \"summary\""
+    fail_cmd = f'python -m src.orchestration.cli fail {record.run_id} "reason"'
+    complete_cmd = f'python -m src.orchestration.cli complete {record.run_id} "summary"'
     return (
         f"Run {record.run_id} is {record.status.value}; launch only starts queued runs.\n\n"
         f"{format_run_status(record)}\n\n"
