@@ -8,6 +8,7 @@ sys.path.append(os.getcwd())
 from src.atpg import benchmark_ai_podem
 from src.atpg.ai_podem import (
     AIBacktracer,
+    StaticHintBacktracer,
     ai_podem,
 )
 from src.atpg.podem import BACKTRACK_LIMIT, SUCCESS, TIMEOUT
@@ -238,6 +239,30 @@ class TestAIPodem(unittest.TestCase):
         res = backtracer(objective, circuit)
         self.assertIn(res.gate_id, [1, 2])
         print("\nTest AI Backtracer Logic: OK")
+
+    def test_no_fallback_ai_backtracer_uses_solver_without_reconv_pairs(self):
+        """No-fallback backtrace should still use solver gate justification."""
+        circuit, total_gates = create_mock_circuit()
+        solver = MagicMock()
+        solver.circuit = circuit
+        solver.pair_cache = {}
+        solver._collect_and_sort_pairs.return_value = []
+        solver.solve.return_value = {1: LogicValue.ONE}
+
+        backtracer = AIBacktracer(solver, no_fallback=True)
+        res = backtracer(Fault(3, LogicValue.ONE), circuit)
+
+        self.assertEqual(res.gate_id, 1)
+        self.assertEqual(res.value, LogicValue.ONE)
+        solver.solve.assert_called_once()
+
+    def test_static_hint_backtracer_respects_no_fallback(self):
+        """Activation hints must not silently fall back in no-fallback mode."""
+        circuit, total_gates = create_mock_circuit()
+        backtracer = StaticHintBacktracer({}, no_fallback=True)
+
+        with self.assertRaisesRegex(RuntimeError, "fallback is disabled"):
+            backtracer(Fault(3, LogicValue.ONE), circuit)
 
 
 class TestAIPodemBenchmark(unittest.TestCase):

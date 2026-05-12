@@ -366,16 +366,41 @@ Extended ITC99 benchmark gating without promoting a full ITC99 result:
     and should be appended to the canonical page before the documentation state
     is treated as synchronized.
 
-### M. ITC99 Gate Benchmark & Solver Refinement
-**Timestamp: 2026-05-11**
-Refined the hierarchical justification logic and reached 100% no-fallback coverage on ITC99 gated subsets:
-- **Solver Optimization**: Refactored `_collect_and_sort_pairs` in `HierarchicalReconvSolver` to prioritize total path length. This ensures nested reconvergent structures are solved from the inside out, significantly improving convergence on complex logic cones in `b17.bench`.
-- **ITC99 Gated Result**:
-    - **Scope**: 250-fault deterministic subset of the 10% ITC99 `b17` gate.
-    - **Coverage**: **100%** no-fallback AI-PODEM coverage (Target: 80%).
-    - **Backtracks**: AI matched classic PODEM (237 total backtracks) on this subset, successfully integrating the hybrid loop without search overhead.
-    - **Backtrace Smarts**: Introduced `ImprovedHintBacktracer` and internal AI fallback mechanisms to improve propagation robustness.
-- **Decision Status**: The candidate checkpoint (`iscas85_89_20260507_095012/best_model.pth`) passed the coverage target for the smoke slice. Full 10% gate promotion is pending statistically significant backtrack reduction on harder faults.
+### M. No-Fallback AI Mode Status
+**Timestamp: 2026-05-12**
+Rechecked the no-fallback AI path after the 2026-05-11 gated-slice reports and
+the 2026-05-12 sibling validation:
+-   **Runtime Scope**: `no_fallback=True` disables the final clean PODEM retry in
+    `ai_podem()`. `ModelPairPredictor` also suppresses its internal algorithmic
+    fallback candidates when model-ranked candidates are empty. The current
+    ITC99 gate benchmark additionally forces no-fallback backtracers and runs
+    PODEM with `max_backtracks=0`, so it measures one-shot AI/hint success, not
+    classic search recovery.
+-   **Failure Semantics**: In propagation mode, `AIBacktracer` now attempts the
+    hierarchical solver even when no reconvergent pairs were cached. If no usable
+    PI assignment is returned, no-fallback mode returns `Fault(-1, -1)`, which
+    `podem_recursion()` treats as `UNTESTABLE` without trying the opposite PI
+    branch. `StaticHintBacktracer` raises when hints cannot drive a complete PI
+    path instead of silently falling back to `simple_backtrace`.
+-   **Validated Observation**: The current no-fallback behavior is therefore
+    limited to faults solved by direct AI activation/hints with no classic
+    backtracking. It should be treated as working only for simple faults that
+    classic PODEM also solves with zero backtracks until a broader benchmark
+    artifact proves otherwise.
+-   **2026-05-12 Validation**: Sibling focused validation passed
+    `conda run -n deepgate python -m pytest tests/test_ai_podem.py
+    tests/test_reconv_solver.py -x -q` with 12 tests passing, including tests
+    for solver use without cached reconvergent pairs and strict hint
+    no-fallback behavior.
+-   **Gate Status**: No current artifact proves the target of 80% no-fallback
+    coverage on the configured 6,445-fault ITC99 gate. The quality gates also
+    reported Ruff failures in sibling-touched benchmark/helper files, so no
+    promotion result is documented here.
+-   **Next Modifications to Improve Coverage**: Replace immediate
+    `Fault(-1, -1)` termination with AI-owned alternative candidate iteration,
+    let strict propagation return a different AI candidate before declaring
+    `UNTESTABLE`, and record benchmark scope/backtrack comparability directly in
+    report artifacts before any Notion or repo result claim is promoted.
 
 ## 7. Current Challenges & Roadmap
 -   **Handling "Don't Cares" (X)**: The current model predicts binary 0/1. Integrating explicit X prediction or X-tolerance in the loss function is an ongoing area of research.

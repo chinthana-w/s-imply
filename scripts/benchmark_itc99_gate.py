@@ -52,9 +52,10 @@ class ImprovedHintBacktracer:
     simple_backtrace for the remainder of that specific backtrace path.
     """
 
-    def __init__(self, hints: Dict[int, LogicValue], verbose: bool = False):
+    def __init__(self, hints: Dict[int, LogicValue], verbose: bool = False, no_fallback: bool = False):
         self.hints = {int(k): LogicValue(v) for k, v in hints.items()}
         self.verbose = verbose
+        self.no_fallback = no_fallback
 
     def __call__(self, objective: Fault, circuit: list) -> Fault:
         curr_id = int(objective.gate_id)
@@ -78,6 +79,8 @@ class ImprovedHintBacktracer:
                     break
 
             if next_id is None:
+                if self.no_fallback:
+                    raise RuntimeError(f"[AI-HINT] No hint for gate {curr_id} and fallback is disabled.")
                 # No hint for this gate's fanins, fall back to simple_backtrace from here
                 if self.verbose:
                     print(f"[AI-HINT] No hint for gate {curr_id}, falling back to classic.")
@@ -371,7 +374,7 @@ def main() -> None:
         enable_ai_activation=True,
         enable_ai_propagation=args.enable_ai_propagation,
         verbose=False,
-        no_fallback=False,
+        no_fallback=True,
         candidate_count=args.candidate_count,
         candidate_seed_base=args.candidate_seed_base,
     )
@@ -446,16 +449,17 @@ def main() -> None:
                                 circuit[gid].val = val
 
                         if args.enable_ai_propagation:
-                            backtracer = AIBacktracer(solver, no_fallback=False)
+                            backtracer = AIBacktracer(solver, no_fallback=True)
                         else:
-                            backtracer = ImprovedHintBacktracer(ai_assignment)
+                            backtracer = ImprovedHintBacktracer(ai_assignment, no_fallback=True)
 
                     result = podem(
                         circuit,
                         fault,
                         total_gates,
                         backtrace_func=backtracer,
-                        max_backtracks=args.max_backtracks,
+                        max_backtracks=0,
+                        timeout=5.0,
                     )
                     ok = (int(result) == SUCCESS)
                 except Exception as exc:

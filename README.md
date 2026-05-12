@@ -116,6 +116,15 @@ decision for the full 6,445-fault 10% gate.  Promote to full ITC99 only after a
 comparable 10% gate artifact reaches at least 80% no-fallback coverage and uses
 fewer AI backtracks than classic PODEM on the same faults.
 
+Current strict no-fallback runs are intentionally narrow.  In this mode,
+`ai_podem()` does not retry clean PODEM, model prediction does not add internal
+fallback candidates, strict hint backtrace raises when hints cannot complete a
+PI path, and propagation backtrace failure returns `UNTESTABLE`.  The ITC99 gate
+benchmark also sets `max_backtracks=0`, so a passing fault means the AI
+activation/hint path solved the fault without classic backtracking.  Until a
+full 6,445-fault gate artifact proves otherwise, treat no-fallback AI coverage
+as limited to simple faults that classic PODEM can solve with zero backtracks.
+
 For a repo-local quick session, use the guarded wrapper:
 
 ```bash

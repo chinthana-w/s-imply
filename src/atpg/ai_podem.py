@@ -100,7 +100,7 @@ class AIBacktracer:
                 else:
                     pairs = self.solver.pair_cache[objective.gate_id]
 
-                if not pairs:
+                if not pairs and not self.no_fallback:
                     if self.verbose:
                         print(
                             f"  [AI-BT] No reconv pairs for gate {objective.gate_id}, skipping AI."
@@ -171,10 +171,12 @@ class AIBacktracer:
             pass
 
         if self.no_fallback:
-            raise RuntimeError(
-                f"[AI-BT] AI backtrace failed for gate {objective.gate_id}"
-                " and fallback is disabled."
-            )
+            if self.verbose:
+                print(
+                    f"  [AI-BT] AI backtrace failed for gate {objective.gate_id}; "
+                    "returning UNTESTABLE decision because fallback is disabled."
+                )
+            return Fault(-1, -1)
         # Fallback to simple
         if self.verbose:
             print("  [AI-BT] Fallback to simple_backtrace")
@@ -193,14 +195,21 @@ class StaticHintBacktracer:
         self,
         hints: Dict[int, LogicValue],
         verbose: bool = False,
+        no_fallback: bool = False,
     ):
         self.hints = {int(k): LogicValue(v) for k, v in hints.items()}
         self.verbose = verbose
+        self.no_fallback = no_fallback
 
     def __call__(self, objective: Fault, circuit: List[Gate]) -> Fault:
         result = self._hinted_backtrace(objective, circuit)
         if result is not None:
             return result
+        if self.no_fallback:
+            raise RuntimeError(
+                f"[AI-HINT] No complete hint path for gate {objective.gate_id}"
+                " and fallback is disabled."
+            )
         return simple_backtrace(objective, circuit)
 
     def _hinted_backtrace(self, objective: Fault, circuit: List[Gate]) -> Fault | None:
@@ -914,7 +923,11 @@ def ai_podem(
                         no_fallback=no_fallback,
                     )
                 elif ai_assignment:
-                    backtracer = StaticHintBacktracer(ai_assignment, verbose=verbose)
+                    backtracer = StaticHintBacktracer(
+                        ai_assignment,
+                        verbose=verbose,
+                        no_fallback=no_fallback,
+                    )
 
                 result = mogu_podem_wrapper(
                     circuit,
