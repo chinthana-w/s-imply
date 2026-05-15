@@ -93,10 +93,11 @@ def get_rl_usage_counters():
 
 def reset_statistics():
     """Reset global statistics counters"""
-    global backtrack_count, backtrace_count, total_recursive_calls
+    global backtrack_count, backtrace_count, total_recursive_calls, backtrace_hops
     backtrack_count = 0
     backtrace_count = 0
     total_recursive_calls = 0
+    backtrace_hops = 0
 
 
 def get_statistics():

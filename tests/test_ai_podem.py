@@ -256,6 +256,24 @@ class TestAIPodem(unittest.TestCase):
         self.assertEqual(res.value, LogicValue.ONE)
         solver.solve.assert_called_once()
 
+    def test_ai_backtracer_passes_live_internal_constraints(self):
+        """AI propagation must preserve assigned internal and D-frontier state."""
+        circuit, total_gates = create_mock_circuit()
+        circuit[1].val = LogicValue.ONE
+        circuit[3].val = LogicValue.D
+        solver = MagicMock()
+        solver.circuit = circuit
+        solver.pair_cache = {}
+        solver._collect_and_sort_pairs.return_value = []
+        solver.solve.return_value = {2: LogicValue.ONE}
+
+        backtracer = AIBacktracer(solver, no_fallback=True)
+        backtracer(Fault(4, LogicValue.ZERO), circuit)
+
+        constraints = solver.solve.call_args.args[2]
+        self.assertEqual(constraints[1], LogicValue.ONE)
+        self.assertEqual(constraints[3], LogicValue.ONE)
+
     def test_static_hint_backtracer_respects_no_fallback(self):
         """Activation hints must not silently fall back in no-fallback mode."""
         circuit, total_gates = create_mock_circuit()

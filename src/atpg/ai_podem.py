@@ -58,6 +58,17 @@ def _format_pair(pair_info: Dict[str, Any]) -> str:
     )
 
 
+def _binary_constraint_value(value: LogicValue | int) -> LogicValue | None:
+    value = LogicValue(value)
+    if value in (LogicValue.ZERO, LogicValue.ONE):
+        return value
+    if value == LogicValue.D:
+        return LogicValue.ONE
+    if value == LogicValue.DB:
+        return LogicValue.ZERO
+    return None
+
+
 @dataclass
 class AiPodemConfig:
     model_path: str
@@ -69,6 +80,7 @@ class AiPodemConfig:
     candidate_count: int = 8
     candidate_seed_base: int = 20260504
     candidate_temperature: float = 0.7
+    enable_symbolic_repair: bool = True
 
 
 class AIBacktracer:
@@ -107,12 +119,15 @@ class AIBacktracer:
                         )
                     return simple_backtrace(objective, circuit)
 
-            # Build constraints from currently assigned PIs
+            # Build constraints from the live PODEM state.  D/DB carry the
+            # good-circuit value needed by the reconvergent justification solver.
             current_constraints = {}
-            for i in self.pi_indices:
-                g = self.circuit[i]
-                if g.val in (LogicValue.ZERO, LogicValue.ONE):
-                    current_constraints[i] = g.val
+            for i, g in enumerate(self.circuit):
+                if g is None:
+                    continue
+                constraint_val = _binary_constraint_value(g.val)
+                if constraint_val is not None:
+                    current_constraints[i] = constraint_val
 
             import hashlib
 
@@ -708,20 +723,31 @@ class ModelPairPredictor(ReconvPairPredictor):
             ranked.append((n_internal, assignment))
 
         ranked.sort(key=lambda x: x[0])
-        candidates = [assignment for _, assignment in ranked]
+        model_candidates = [assignment for _, assignment in ranked]
+        candidates = list(model_candidates)
+        repair_candidates = []
 
-        if not candidates and not self.config.no_fallback:
+        if self.config.enable_symbolic_repair:
             fallback, _ = self._fallback_solve(pair_info, constraints)
-            candidates.extend(fallback)
+            seen = {
+                tuple(sorted((int(k), int(v)) for k, v in candidate.items()))
+                for candidate in candidates
+            }
+            for candidate in fallback:
+                signature = tuple(sorted((int(k), int(v)) for k, v in candidate.items()))
+                if signature not in seen:
+                    repair_candidates.append(candidate)
+                    candidates.append(candidate)
+                    seen.add(signature)
             if self.config.verbose:
                 print(
                     f"[AI-MODEL] Rejected {rejected} model candidate(s); added "
-                    f"{len(fallback)} fallback candidates for {_format_pair(pair_info)}"
+                    f"{len(fallback)} symbolic repair candidates for {_format_pair(pair_info)}"
                 )
         elif not candidates and self.config.verbose:
             print(
                 f"[AI-MODEL] Rejected {rejected} model candidate(s); "
-                f"fallback disabled for {_format_pair(pair_info)}"
+                f"symbolic repair disabled for {_format_pair(pair_info)}"
             )
         elif self.config.verbose:
             print(
@@ -729,7 +755,12 @@ class ModelPairPredictor(ReconvPairPredictor):
                 f"rejected {rejected} for {_format_pair(pair_info)}"
             )
 
-        return candidates[: max(1, int(self.config.candidate_count))], inputs_snapshot
+        limit = max(1, int(self.config.candidate_count))
+        if repair_candidates and len(candidates) > limit:
+            model_limit = max(0, limit - len(repair_candidates))
+            candidates = model_candidates[:model_limit] + repair_candidates
+
+        return candidates[:limit], inputs_snapshot
 
     def _verify_assignment_logic(
         self, assignment: Dict[int, LogicValue], constraints: Dict[int, LogicValue] = None

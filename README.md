@@ -4,7 +4,8 @@ A Topology-Aware Justification Oracle for digital circuits using Multi-Path Tran
 
 ## 🚀 Key Features
 - **3-Valued Logic Reasoning**: Explicitly handles `0`, `1`, and `X` (Don't Care) logic states.
-- **Topology-Aware Embeddings**: Maps physical gate identities across reconvergent paths for global consistency.
+- **Topology-Aware Embeddings**: Combines DeepGate node features, gate-type embeddings,
+  logic-value channels, and path-order positional encoding.
 - **Physics-Informed Training**: Incorporates differentiable logic consistency loss to enforce Boolean truth tables.
 - **Hybrid AI-PODEM**: Integrates AI-based justification directly into the PODEM backtrace loop.
 - **Hierarchical Reconvergence**: Specialized `HierarchicalReconvSolver` for nested logic structures.
@@ -55,7 +56,10 @@ python -m scripts.collect_experience \
 ```
 
 ### 3. Model Training
-Train the transformer using a combination of supervised labels and physics-informed consistency losses.
+Train the transformer using supervised node labels, solvability labels, shared-node consistency,
+and physics-informed logic losses. The current runtime shuffles path order during training,
+uses shard-slice loading when processed shards are available, supports CUDA OOM retry/skip
+behavior, and writes atomic checkpoints.
 
 ```bash
 python -m src.ml.train train \
@@ -115,6 +119,11 @@ validate the benchmark/reporting path only; do not treat them as a promotion
 decision for the full 6,445-fault 10% gate.  Promote to full ITC99 only after a
 comparable 10% gate artifact reaches at least 80% no-fallback coverage and uses
 fewer AI backtracks than classic PODEM on the same faults.
+
+As of the 2026-05-12 docs/results pass, no new training run, checkpoint
+compatibility improvement, ITC99 gate benchmark, or model-quality promotion was
+produced. The validated state is a clean ML/test baseline:
+`conda run -n deepgate python -m pytest tests/ -x -q` passed with 57 tests.
 
 Current strict no-fallback runs are intentionally narrow.  In this mode,
 `ai_podem()` does not retry clean PODEM, model prediction does not add internal

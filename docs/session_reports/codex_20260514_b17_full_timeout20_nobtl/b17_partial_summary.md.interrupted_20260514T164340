@@ -1,0 +1,101 @@
+# b17 Full-Fault Coverage Timing Summary
+
+- CSV: `docs/session_reports/codex_20260514_b17_full_timeout20_nobtl/b17_full_per_fault.csv`
+- Processed faults: `6700/64458` (10.39%)
+- AI no-fallback coverage over processed faults: `6444/6700` = `96.1791%`
+- AI coverage lower bound over all expected faults: `6444/64458` = `9.9972%`
+- Classic coverage over processed faults: `6444/6700` = `96.1791%`
+
+## Classic Result Codes
+
+| Result | Count |
+|---|---:|
+| SUCCESS | 6444 |
+| TIMEOUT | 210 |
+| UNTESTABLE | 46 |
+
+## Timing Breakdown
+
+| Segment | Total s | Mean s | Median s | P90 s | P99 s | Max s |
+|---|---:|---:|---:|---:|---:|---:|
+| AI total per fault | 9626.11 | 1.4367 | 0.4420 | 1.6463 | 20.0678 | 20.2330 |
+| AI precheck solver | 0.06 | 0.0000 | 0.0000 | 0.0000 | 0.0001 | 0.0008 |
+| AI precheck simulation | 126.60 | 0.0189 | 0.0319 | 0.0335 | 0.0459 | 0.0742 |
+| AI hint solver | 0.01 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0001 |
+| AI-guided PODEM search | 9474.31 | 1.4141 | 0.4095 | 1.6105 | 20.0256 | 20.1813 |
+| Classic total per fault | 8778.82 | 1.3103 | 0.4070 | 1.6032 | 20.0305 | 20.2373 |
+
+## Slowest AI Faults
+
+| Fault index | Gate | Fault val | AI ok | AI time s | Classic ok | Classic time s |
+|---:|---:|---:|:---|---:|:---|---:|
+| 6536 | 3269 | 3 | False | 20.2330 | False | 20.0083 |
+| 6504 | 3253 | 3 | False | 20.1704 | False | 20.0047 |
+| 6691 | 3346 | 4 | False | 20.1627 | False | 20.0078 |
+| 6622 | 3312 | 3 | False | 20.1618 | False | 20.0035 |
+| 6320 | 3161 | 3 | False | 20.1460 | False | 20.0078 |
+| 6686 | 3344 | 3 | False | 20.1419 | False | 20.0174 |
+| 6694 | 3348 | 3 | False | 20.1349 | False | 20.0641 |
+| 6568 | 3285 | 3 | False | 20.1306 | False | 20.0048 |
+| 6651 | 3326 | 4 | False | 20.1236 | False | 20.1073 |
+| 6667 | 3334 | 4 | False | 20.1215 | False | 20.0050 |
+| 6337 | 3169 | 4 | False | 20.1204 | False | 20.0094 |
+| 5270 | 2636 | 3 | False | 20.1200 | False | 20.0176 |
+| 3523 | 1762 | 4 | False | 20.1138 | False | 20.0194 |
+| 5194 | 2598 | 3 | False | 20.1107 | False | 20.0006 |
+| 6653 | 3327 | 4 | False | 20.1099 | False | 20.0722 |
+| 4896 | 2449 | 3 | False | 20.1089 | False | 20.0175 |
+| 6488 | 3245 | 3 | False | 20.1056 | False | 20.0218 |
+| 6618 | 3310 | 3 | False | 20.1036 | False | 20.0433 |
+| 6634 | 3318 | 3 | False | 20.1034 | False | 20.0318 |
+| 3564 | 1783 | 3 | False | 20.1028 | False | 20.0270 |
+
+## Slowest Classic Faults
+
+| Fault index | Gate | Fault val | Classic result | Classic backtracks | Classic recursive calls | Classic time s | AI ok | AI time s |
+|---:|---:|---:|---|---:|---:|---:|:---|---:|
+| 6642 | 3322 | 3 | TIMEOUT | 238 | 525 | 20.2373 | False | 20.0661 |
+| 6699 | 3350 | 4 | TIMEOUT | 288 | 637 | 20.1321 | False | 20.0423 |
+| 6635 | 3318 | 4 | TIMEOUT | 242 | 543 | 20.1263 | False | 20.0519 |
+| 1739 | 870 | 4 | TIMEOUT | 308 | 697 | 20.1132 | False | 20.0126 |
+| 6651 | 3326 | 4 | TIMEOUT | 260 | 575 | 20.1073 | False | 20.1236 |
+| 5239 | 2620 | 4 | TIMEOUT | 312 | 689 | 20.0988 | False | 20.0398 |
+| 6364 | 3183 | 3 | TIMEOUT | 311 | 683 | 20.0969 | False | 20.0660 |
+| 6620 | 3311 | 3 | TIMEOUT | 256 | 601 | 20.0896 | False | 20.0408 |
+| 5493 | 2747 | 4 | TIMEOUT | 311 | 695 | 20.0842 | False | 20.0361 |
+| 6666 | 3334 | 3 | TIMEOUT | 246 | 555 | 20.0822 | False | 20.0970 |
+| 6333 | 3167 | 4 | TIMEOUT | 312 | 644 | 20.0784 | False | 20.0462 |
+| 6643 | 3322 | 4 | TIMEOUT | 252 | 564 | 20.0780 | False | 20.0443 |
+| 3463 | 1732 | 4 | TIMEOUT | 314 | 658 | 20.0766 | False | 20.0427 |
+| 6332 | 3167 | 3 | TIMEOUT | 324 | 669 | 20.0730 | False | 20.0692 |
+| 6653 | 3327 | 4 | TIMEOUT | 258 | 573 | 20.0722 | False | 20.1099 |
+| 5524 | 2763 | 3 | TIMEOUT | 322 | 689 | 20.0715 | False | 20.0651 |
+| 5280 | 2641 | 3 | TIMEOUT | 313 | 693 | 20.0706 | False | 20.0526 |
+| 3327 | 1664 | 4 | TIMEOUT | 313 | 662 | 20.0691 | False | 20.0730 |
+| 6490 | 3246 | 3 | TIMEOUT | 226 | 606 | 20.0691 | False | 20.0743 |
+| 6689 | 3345 | 4 | TIMEOUT | 256 | 670 | 20.0660 | False | 20.0665 |
+
+## Highest Classic Backtrack Counts
+
+| Fault index | Gate | Fault val | Classic result | Classic backtracks | Classic time s | AI ok | AI time s |
+|---:|---:|---:|---|---:|---:|:---|---:|
+| 6332 | 3167 | 3 | TIMEOUT | 324 | 20.0730 | False | 20.0692 |
+| 4547 | 2274 | 4 | TIMEOUT | 323 | 20.0508 | False | 20.0421 |
+| 4715 | 2358 | 4 | TIMEOUT | 323 | 20.0338 | False | 20.0460 |
+| 3523 | 1762 | 4 | TIMEOUT | 323 | 20.0194 | False | 20.1138 |
+| 4714 | 2358 | 3 | TIMEOUT | 323 | 20.0175 | False | 20.0834 |
+| 4928 | 2465 | 3 | TIMEOUT | 323 | 20.0158 | False | 20.0538 |
+| 3433 | 1717 | 4 | TIMEOUT | 323 | 20.0079 | False | 20.0461 |
+| 4546 | 2274 | 3 | TIMEOUT | 323 | 20.0077 | False | 20.0396 |
+| 4929 | 2465 | 4 | TIMEOUT | 323 | 20.0020 | False | 20.0441 |
+| 5524 | 2763 | 3 | TIMEOUT | 322 | 20.0715 | False | 20.0651 |
+| 5186 | 2594 | 3 | TIMEOUT | 322 | 20.0579 | False | 20.0561 |
+| 4804 | 2403 | 3 | TIMEOUT | 322 | 20.0359 | False | 20.0678 |
+| 4931 | 2466 | 4 | TIMEOUT | 322 | 20.0351 | False | 20.0438 |
+| 5017 | 2509 | 4 | TIMEOUT | 322 | 20.0116 | False | 20.0500 |
+| 3026 | 1514 | 3 | TIMEOUT | 321 | 20.0252 | False | 20.0466 |
+| 4896 | 2449 | 3 | TIMEOUT | 321 | 20.0175 | False | 20.1089 |
+| 4805 | 2403 | 4 | TIMEOUT | 321 | 20.0062 | False | 20.0714 |
+| 4855 | 2428 | 4 | TIMEOUT | 320 | 20.0032 | False | 20.0422 |
+| 4039 | 2020 | 4 | TIMEOUT | 319 | 20.0387 | False | 20.0611 |
+| 4930 | 2466 | 3 | TIMEOUT | 319 | 20.0191 | False | 20.0421 |

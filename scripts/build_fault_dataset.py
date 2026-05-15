@@ -72,7 +72,7 @@ from tqdm import tqdm
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from src.atpg.logic_sim_three import logic_sim, reset_gates
-from src.atpg.podem import get_all_faults
+from src.atpg.podem import SUCCESS, get_all_faults, initialize, podem, simple_backtrace
 from src.atpg.recursive_reconv_solver import HierarchicalReconvSolver
 from src.ml.data.embedding import EmbeddingExtractor
 from src.util.io import parse_bench_file
@@ -197,6 +197,53 @@ def _sim_patterns_until_target(
     return patterns
 
 
+def _collect_binary_assignment(circuit, total_gates: int) -> Dict[int, int]:
+    return {
+        i: int(circuit[i].val)
+        for i in range(1, total_gates + 1)
+        if circuit[i] is not None and circuit[i].val in (LogicValue.ZERO, LogicValue.ONE)
+    }
+
+
+def _detecting_pattern_assignment(
+    circuit,
+    total_gates: int,
+    topo_order: List[int],
+    fault,
+    timeout: float,
+    max_backtracks: int,
+) -> Optional[Dict[int, int]]:
+    """Use classic PODEM only as an offline teacher for a detecting pattern."""
+    reset_gates(circuit, total_gates)
+    initialize(circuit, total_gates)
+    result = podem(
+        circuit,
+        fault,
+        total_gates,
+        backtrace_func=simple_backtrace,
+        timeout=timeout,
+        max_backtracks=max_backtracks,
+    )
+    if result != SUCCESS:
+        return None
+
+    pi_values = {
+        i: circuit[i].val
+        for i in range(1, total_gates + 1)
+        if circuit[i] is not None
+        and circuit[i].type == GateType.INPT
+        and circuit[i].val in (LogicValue.ZERO, LogicValue.ONE)
+    }
+    if not pi_values:
+        return None
+
+    reset_gates(circuit, total_gates)
+    for gate_id, value in pi_values.items():
+        circuit[gate_id].val = value
+    logic_sim(circuit, total_gates, fault=None, topo_order=topo_order)
+    return _collect_binary_assignment(circuit, total_gates)
+
+
 # ---------------------------------------------------------------------------
 # Pair ordering (mirrors HierarchicalReconvSolver._collect_and_sort_pairs)
 # ---------------------------------------------------------------------------
@@ -206,10 +253,13 @@ def _collect_sorted_pairs(
     solver: HierarchicalReconvSolver, target_node: int
 ) -> List[Dict[str, Any]]:
     """Return reconvergent pairs in the same order the solver would process them."""
-    pairs_by_reconv = solver._collect_and_sort_pairs(target_node)
+    raw_pairs = solver._collect_and_sort_pairs(target_node)
     flat: List[Dict[str, Any]] = []
-    for pairs in pairs_by_reconv.values():
-        flat.extend(pairs)
+    if isinstance(raw_pairs, dict):
+        for pairs in raw_pairs.values():
+            flat.extend(pairs)
+    else:
+        flat.extend(raw_pairs)
 
     # Re-sort with same key as solver to guarantee identical ordering
     cone_nodes = solver._get_transitive_fanin(target_node)
@@ -232,7 +282,7 @@ def _collect_sorted_pairs(
         reconv_node = p["reconv"]
         dist_to_target = distances.get(reconv_node, 9999)
         total_path_len = len(p["paths"][0]) + len(p["paths"][1])
-        return (total_path_len + dist_to_target, total_path_len)
+        return (total_path_len, dist_to_target)
 
     flat.sort(key=pair_cost)
     return flat
@@ -259,6 +309,9 @@ def build_samples_for_circuit(
     patterns_per_fault: int = 1,
     unsat_ratio: float = 0.0,
     max_samples_per_circuit: int = 0,
+    pattern_source: str = "detecting",
+    classic_timeout: float = 5.0,
+    classic_max_backtracks: int = 5000,
 ) -> List[Dict[str, Any]]:
     """Generate all training samples for one circuit file.
 
@@ -312,15 +365,29 @@ def build_samples_for_circuit(
             LogicValue.ONE if fault.value == LogicValue.D else LogicValue.ZERO
         )
 
-        assignments = _sim_patterns_until_target(
-            circuit,
-            total_gates,
-            topo_order,
-            fault.gate_id,
-            target_val,
-            sim_attempts,
-            max(1, patterns_per_fault),
-        )
+        assignments: List[Dict[int, int]] = []
+        if pattern_source == "detecting":
+            detecting_assignment = _detecting_pattern_assignment(
+                circuit,
+                total_gates,
+                topo_order,
+                fault,
+                timeout=classic_timeout,
+                max_backtracks=classic_max_backtracks,
+            )
+            if detecting_assignment is not None:
+                assignments.append(detecting_assignment)
+
+        if not assignments:
+            assignments = _sim_patterns_until_target(
+                circuit,
+                total_gates,
+                topo_order,
+                fault.gate_id,
+                target_val,
+                sim_attempts,
+                max(1, patterns_per_fault),
+            )
         if not assignments:
             skipped_no_sim += 1
             continue
@@ -502,6 +569,27 @@ def main() -> None:
         help="Hard cap on generated samples per circuit (0 = no cap).",
     )
     parser.add_argument(
+        "--pattern-source",
+        choices=["detecting", "activation"],
+        default="detecting",
+        help=(
+            "Use classic PODEM detecting patterns as the offline teacher when possible, "
+            "or random activation-only patterns."
+        ),
+    )
+    parser.add_argument(
+        "--classic-timeout",
+        type=float,
+        default=5.0,
+        help="Per-fault classic PODEM timeout for detecting-pattern teacher generation.",
+    )
+    parser.add_argument(
+        "--classic-max-backtracks",
+        type=int,
+        default=5000,
+        help="Per-fault classic PODEM backtrack cap for detecting-pattern teacher generation.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -549,6 +637,9 @@ def main() -> None:
                 patterns_per_fault=args.patterns_per_fault,
                 unsat_ratio=args.unsat_ratio,
                 max_samples_per_circuit=args.max_samples_per_circuit,
+                pattern_source=args.pattern_source,
+                classic_timeout=args.classic_timeout,
+                classic_max_backtracks=args.classic_max_backtracks,
             )
         except Exception as e:
             tqdm.write(f"  [WARN] Sample generation failed for {bench_path}: {e}. Skipping.")

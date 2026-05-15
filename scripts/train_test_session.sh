@@ -33,6 +33,8 @@ fi
 ROOT_DIR="${TRAIN_TEST_SESSION_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$ROOT_DIR"
 
+PYTHON_BIN="${PYTHON_BIN:-python}"
+
 timestamp() {
   date +"%Y-%m-%d %H:%M:%S"
 }
@@ -83,6 +85,9 @@ ITC99_SEED="${ITC99_SEED:-20260504}"
 PATTERNS_PER_FAULT="${PATTERNS_PER_FAULT:-1}"
 SIM_ATTEMPTS="${SIM_ATTEMPTS:-50}"
 UNSAT_RATIO="${UNSAT_RATIO:-0.10}"
+PATTERN_SOURCE="${PATTERN_SOURCE:-detecting}"
+TEACHER_CLASSIC_TIMEOUT="${TEACHER_CLASSIC_TIMEOUT:-5}"
+TEACHER_CLASSIC_MAX_BACKTRACKS="${TEACHER_CLASSIC_MAX_BACKTRACKS:-5000}"
 
 MAX_LEN="${MAX_LEN:-50}"
 SHARD_SIZE="${SHARD_SIZE:-5000}"
@@ -111,6 +116,7 @@ CANDIDATE_COUNT="${CANDIDATE_COUNT:-8}"
 AI_ATTEMPTS="${AI_ATTEMPTS:-1}"
 ENABLE_AI_PROPAGATION="${ENABLE_AI_PROPAGATION:-0}"
 MAX_BACKTRACKS="${MAX_BACKTRACKS:-5000}"
+AI_TIMEOUT="${AI_TIMEOUT:-5}"
 COMPARE_CLASSIC="${COMPARE_CLASSIC:-0}"
 CLASSIC_TIMEOUT="${CLASSIC_TIMEOUT:-30}"
 AMP_FLAG="${AMP_FLAG:---amp}"
@@ -241,18 +247,21 @@ if contains_stage build_data; then
     --patterns-per-fault "$PATTERNS_PER_FAULT"
     --sim_attempts "$SIM_ATTEMPTS"
     --unsat-ratio "$UNSAT_RATIO"
+    --pattern-source "$PATTERN_SOURCE"
+    --classic-timeout "$TEACHER_CLASSIC_TIMEOUT"
+    --classic-max-backtracks "$TEACHER_CLASSIC_MAX_BACKTRACKS"
     --seed "$DATA_SEED"
   )
   if [[ "$MAX_SAMPLES_PER_CIRCUIT" != "0" ]]; then
     build_args+=(--max-samples-per-circuit "$MAX_SAMPLES_PER_CIRCUIT")
   fi
-  run_step python "${build_args[@]}"
+  run_step "$PYTHON_BIN" "${build_args[@]}"
 else
   log "Skipping build_data"
 fi
 
 if contains_stage preprocess; then
-  run_step python -m src.ml.core.dataset preprocess \
+  run_step "$PYTHON_BIN" -m src.ml.core.dataset preprocess \
     --input "$CHUNK_DIR" \
     --out "$SHARD_DIR" \
     --max_len "$MAX_LEN" \
@@ -264,7 +273,7 @@ else
 fi
 
 if contains_stage select_gate; then
-  run_step python -m scripts.select_itc99_gate_faults \
+  run_step "$PYTHON_BIN" -m scripts.select_itc99_gate_faults \
     --bench "$ITC99_BENCH" \
     --output "$ITC99_FAULT_LIST" \
     --fraction 0.10 \
@@ -275,7 +284,7 @@ fi
 
 if contains_stage train; then
   train_args=(
-    python -m src.ml.train train
+    "$PYTHON_BIN" -m src.ml.train train
     --dataset "$CHUNK_DIR" \
     --processed-dir "$SHARD_DIR" \
     --output "$CHECKPOINT_DIR" \
@@ -322,6 +331,7 @@ if contains_stage test; then
     --ai-attempts "$AI_ATTEMPTS"
     --candidate-seed-base "$ITC99_SEED"
     --max-backtracks "$MAX_BACKTRACKS"
+    --ai-timeout "$AI_TIMEOUT"
     --classic-timeout "$CLASSIC_TIMEOUT"
     --baseline-coverage "$BASELINE_COVERAGE"
     --baseline-label "$BASELINE_LABEL"
@@ -341,7 +351,7 @@ if contains_stage test; then
   if [[ "$BACKTRACK_TARGET" == "1" ]]; then
     benchmark_args+=(--backtrack-target)
   fi
-  run_step python "${benchmark_args[@]}"
+  run_step "$PYTHON_BIN" "${benchmark_args[@]}"
 else
   log "Skipping test"
 fi
@@ -360,6 +370,7 @@ if contains_stage full_itc99_test; then
     --ai-attempts "$AI_ATTEMPTS"
     --candidate-seed-base "$ITC99_SEED"
     --max-backtracks "$MAX_BACKTRACKS"
+    --ai-timeout "$AI_TIMEOUT"
     --classic-timeout "$CLASSIC_TIMEOUT"
     --baseline-coverage "$BASELINE_COVERAGE"
     --baseline-label "$BASELINE_LABEL"
@@ -377,14 +388,14 @@ if contains_stage full_itc99_test; then
   if [[ "$BACKTRACK_TARGET" == "1" ]]; then
     full_benchmark_args+=(--backtrack-target)
   fi
-  run_step python "${full_benchmark_args[@]}"
+  run_step "$PYTHON_BIN" "${full_benchmark_args[@]}"
 else
   log "Skipping full_itc99_test"
 fi
 
 if contains_stage iscas85_test; then
   MODEL_PATH="${MODEL_PATH:-${CHECKPOINT_DIR}/best_model.pth}"
-  run_step python -m scripts.benchmark_iscas85_nofallback \
+  run_step "$PYTHON_BIN" -m scripts.benchmark_iscas85_nofallback \
     --model "$MODEL_PATH" \
     --bench_dir "$ISCAS85_DIR" \
     --out_dir "${CACHE_ROOT}/iscas85_bench" \

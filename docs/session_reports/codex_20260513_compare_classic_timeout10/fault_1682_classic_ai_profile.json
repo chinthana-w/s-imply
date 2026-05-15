@@ -1,0 +1,794 @@
+{
+  "fault_index": 1682,
+  "fault": {
+    "gate_id": 8211,
+    "fault_val": 4,
+    "fault_val_label": "DB",
+    "gate_type": null
+  },
+  "bench": "data/bench/ITC99/b17.bench",
+  "model": "checkpoints/reconv_solver_fix_20260511/best_model.pth",
+  "classic_timeout_s": 300.0,
+  "ai_timeout_s": 300.0,
+  "max_backtracks": 5000,
+  "classic": {
+    "result_code": 1,
+    "result_name": "SUCCESS",
+    "success": true,
+    "elapsed_s": 14.19780683517456,
+    "stats": {
+      "backtrack_count": 177,
+      "backtrace_count": 0,
+      "backtrace_hops": 409,
+      "total_recursive_calls": 363
+    },
+    "logic_sim_calls": 539,
+    "logic_sim_time_s": 13.548187655309448,
+    "trace": {
+      "first_events": [
+        {
+          "event": 1,
+          "recursive_calls_before": 1,
+          "backtracks_before": 0,
+          "objective_gate": 8211,
+          "objective_type": "NOT",
+          "objective_value": "0",
+          "pi_gate": 908,
+          "pi_value": "1"
+        },
+        {
+          "event": 2,
+          "recursive_calls_before": 2,
+          "backtracks_before": 0,
+          "objective_gate": 8211,
+          "objective_type": "NOT",
+          "objective_value": "0",
+          "pi_gate": 1048,
+          "pi_value": "1"
+        },
+        {
+          "event": 3,
+          "recursive_calls_before": 3,
+          "backtracks_before": 0,
+          "objective_gate": 7098,
+          "objective_type": "NOT",
+          "objective_value": "1",
+          "pi_gate": 1050,
+          "pi_value": "0"
+        },
+        {
+          "event": 4,
+          "recursive_calls_before": 4,
+          "backtracks_before": 0,
+          "objective_gate": 30598,
+          "objective_type": "AND",
+          "objective_value": "1",
+          "pi_gate": 907,
+          "pi_value": "1"
+        },
+        {
+          "event": 5,
+          "recursive_calls_before": 5,
+          "backtracks_before": 0,
+          "objective_gate": 7097,
+          "objective_type": "NOR",
+          "objective_value": "1",
+          "pi_gate": 1051,
+          "pi_value": "0"
+        },
+        {
+          "event": 6,
+          "recursive_calls_before": 6,
+          "backtracks_before": 0,
+          "objective_gate": 10006,
+          "objective_type": "NOT",
+          "objective_value": "1",
+          "pi_gate": 1052,
+          "pi_value": "0"
+        },
+        {
+          "event": 7,
+          "recursive_calls_before": 7,
+          "backtracks_before": 0,
+          "objective_gate": 10841,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1053,
+          "pi_value": "1"
+        },
+        {
+          "event": 8,
+          "recursive_calls_before": 9,
+          "backtracks_before": 0,
+          "objective_gate": 11783,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1054,
+          "pi_value": "1"
+        },
+        {
+          "event": 9,
+          "recursive_calls_before": 11,
+          "backtracks_before": 0,
+          "objective_gate": 12987,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1055,
+          "pi_value": "1"
+        },
+        {
+          "event": 10,
+          "recursive_calls_before": 13,
+          "backtracks_before": 0,
+          "objective_gate": 13879,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1056,
+          "pi_value": "1"
+        },
+        {
+          "event": 11,
+          "recursive_calls_before": 15,
+          "backtracks_before": 0,
+          "objective_gate": 14559,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1057,
+          "pi_value": "1"
+        },
+        {
+          "event": 12,
+          "recursive_calls_before": 17,
+          "backtracks_before": 0,
+          "objective_gate": 15574,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1058,
+          "pi_value": "1"
+        },
+        {
+          "event": 13,
+          "recursive_calls_before": 19,
+          "backtracks_before": 0,
+          "objective_gate": 16857,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1059,
+          "pi_value": "1"
+        },
+        {
+          "event": 14,
+          "recursive_calls_before": 21,
+          "backtracks_before": 0,
+          "objective_gate": 17686,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1060,
+          "pi_value": "1"
+        },
+        {
+          "event": 15,
+          "recursive_calls_before": 23,
+          "backtracks_before": 0,
+          "objective_gate": 18450,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1061,
+          "pi_value": "1"
+        },
+        {
+          "event": 16,
+          "recursive_calls_before": 25,
+          "backtracks_before": 0,
+          "objective_gate": 19183,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1062,
+          "pi_value": "1"
+        },
+        {
+          "event": 17,
+          "recursive_calls_before": 27,
+          "backtracks_before": 0,
+          "objective_gate": 19844,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1063,
+          "pi_value": "1"
+        },
+        {
+          "event": 18,
+          "recursive_calls_before": 29,
+          "backtracks_before": 0,
+          "objective_gate": 20661,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1064,
+          "pi_value": "1"
+        },
+        {
+          "event": 19,
+          "recursive_calls_before": 31,
+          "backtracks_before": 0,
+          "objective_gate": 21545,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1065,
+          "pi_value": "1"
+        },
+        {
+          "event": 20,
+          "recursive_calls_before": 33,
+          "backtracks_before": 0,
+          "objective_gate": 22386,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1066,
+          "pi_value": "1"
+        },
+        {
+          "event": 21,
+          "recursive_calls_before": 35,
+          "backtracks_before": 0,
+          "objective_gate": 23891,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1067,
+          "pi_value": "1"
+        },
+        {
+          "event": 22,
+          "recursive_calls_before": 37,
+          "backtracks_before": 0,
+          "objective_gate": 24827,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1068,
+          "pi_value": "1"
+        },
+        {
+          "event": 23,
+          "recursive_calls_before": 39,
+          "backtracks_before": 0,
+          "objective_gate": 25964,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1069,
+          "pi_value": "1"
+        },
+        {
+          "event": 24,
+          "recursive_calls_before": 41,
+          "backtracks_before": 0,
+          "objective_gate": 26814,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1070,
+          "pi_value": "1"
+        },
+        {
+          "event": 25,
+          "recursive_calls_before": 43,
+          "backtracks_before": 0,
+          "objective_gate": 27463,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1071,
+          "pi_value": "1"
+        },
+        {
+          "event": 26,
+          "recursive_calls_before": 45,
+          "backtracks_before": 0,
+          "objective_gate": 28168,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1072,
+          "pi_value": "1"
+        },
+        {
+          "event": 27,
+          "recursive_calls_before": 47,
+          "backtracks_before": 0,
+          "objective_gate": 28601,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1073,
+          "pi_value": "1"
+        },
+        {
+          "event": 28,
+          "recursive_calls_before": 49,
+          "backtracks_before": 0,
+          "objective_gate": 29007,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1074,
+          "pi_value": "1"
+        },
+        {
+          "event": 29,
+          "recursive_calls_before": 51,
+          "backtracks_before": 0,
+          "objective_gate": 29417,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1075,
+          "pi_value": "1"
+        },
+        {
+          "event": 30,
+          "recursive_calls_before": 53,
+          "backtracks_before": 0,
+          "objective_gate": 29837,
+          "objective_type": "NAND",
+          "objective_value": "1",
+          "pi_gate": 1076,
+          "pi_value": "1"
+        }
+      ],
+      "top_objectives": [
+        [
+          [
+            8211,
+            "0"
+          ],
+          4
+        ],
+        [
+          [
+            7097,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            10006,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            10841,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            11783,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            12987,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            13879,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            14559,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            15574,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            16857,
+            "1"
+          ],
+          4
+        ]
+      ],
+      "top_pi_assignments": [
+        [
+          [
+            1051,
+            "0"
+          ],
+          4
+        ],
+        [
+          [
+            1052,
+            "0"
+          ],
+          4
+        ],
+        [
+          [
+            1053,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            1054,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            1055,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            1056,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            1057,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            1058,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            1059,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            1060,
+            "1"
+          ],
+          4
+        ]
+      ]
+    },
+    "profile_text": "         16894507 function calls (16894145 primitive calls) in 14.198 seconds\n\n   Ordered by: cumulative time\n   List reduced from 47 to 14 due to restriction <14>\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n        1    0.000    0.000   14.198   14.198 podem.py:136(podem)\n    363/1    0.003    0.000   14.149   14.149 podem.py:223(podem_recursion)\n      539    0.002    0.000   13.549    0.025 <stdin>:110(counted_logic_sim)\n      539    7.809    0.014   13.546    0.025 logic_sim_three.py:109(logic_sim)\n 16588803    5.735    0.000    5.735    0.000 logic_sim_three.py:25(compute_gate_value)\n      363    0.590    0.002    0.590    0.002 logic_sim_three.py:185(fault_is_at_po)\n        1    0.017    0.017    0.019    0.019 util.py:64(calculate_distance_to_primary_outputs)\n        1    0.013    0.013    0.017    0.017 util.py:39(get_topological_order)\n        1    0.011    0.011    0.012    0.012 util.py:13(calculate_distance_to_primary_inputs)\n      362    0.002    0.000    0.004    0.000 podem.py:348(get_objective)\n      185    0.001    0.000    0.003    0.000 <stdin>:118(traced_backtrace)\n      185    0.001    0.000    0.002    0.000 podem.py:302(simple_backtrace)\n    96687    0.002    0.000    0.002    0.000 {method 'popleft' of 'collections.deque' objects}\n     1126    0.001    0.000    0.002    0.000 {method 'sort' of 'list' objects}\n\n\n",
+    "total_gates": 32229
+  },
+  "ai": {
+    "result_code": 1,
+    "result_name": "SUCCESS",
+    "success": true,
+    "elapsed_s": 0.2460339069366455,
+    "solve_elapsed_s": 0.29641056060791016,
+    "seed": 20262186,
+    "assignment_size": 24,
+    "assignment_pi_count": 7,
+    "assignment_sample": [
+      {
+        "gate": 908,
+        "type": "INPT",
+        "value": "0"
+      },
+      {
+        "gate": 1047,
+        "type": "INPT",
+        "value": "0"
+      },
+      {
+        "gate": 1048,
+        "type": "INPT",
+        "value": "0"
+      },
+      {
+        "gate": 1049,
+        "type": "INPT",
+        "value": "0"
+      },
+      {
+        "gate": 1079,
+        "type": "INPT",
+        "value": "1"
+      },
+      {
+        "gate": 1080,
+        "type": "INPT",
+        "value": "1"
+      },
+      {
+        "gate": 1081,
+        "type": "INPT",
+        "value": "1"
+      },
+      {
+        "gate": 3207,
+        "type": "NOT",
+        "value": "1"
+      },
+      {
+        "gate": 3230,
+        "type": "NAND",
+        "value": "1"
+      },
+      {
+        "gate": 3241,
+        "type": "NAND",
+        "value": "1"
+      },
+      {
+        "gate": 3242,
+        "type": "NAND",
+        "value": "1"
+      },
+      {
+        "gate": 3723,
+        "type": "NAND",
+        "value": "0"
+      },
+      {
+        "gate": 3724,
+        "type": "NOT",
+        "value": "0"
+      },
+      {
+        "gate": 3727,
+        "type": "NOT",
+        "value": "0"
+      },
+      {
+        "gate": 3728,
+        "type": "NAND",
+        "value": "1"
+      },
+      {
+        "gate": 4372,
+        "type": "NAND",
+        "value": "1"
+      },
+      {
+        "gate": 4374,
+        "type": "NAND",
+        "value": "0"
+      },
+      {
+        "gate": 4375,
+        "type": "NAND",
+        "value": "1"
+      },
+      {
+        "gate": 4471,
+        "type": "NAND",
+        "value": "1"
+      },
+      {
+        "gate": 4472,
+        "type": "NAND",
+        "value": "0"
+      },
+      {
+        "gate": 5211,
+        "type": "NAND",
+        "value": "1"
+      },
+      {
+        "gate": 6133,
+        "type": "NAND",
+        "value": "0"
+      },
+      {
+        "gate": 7095,
+        "type": "OR",
+        "value": "1"
+      },
+      {
+        "gate": 8211,
+        "type": "NOT",
+        "value": "0"
+      }
+    ],
+    "precheck_detected": false,
+    "stats": {
+      "backtrack_count": 0,
+      "backtrace_count": 0,
+      "backtrace_hops": 31,
+      "total_recursive_calls": 9
+    },
+    "logic_sim_calls": 8,
+    "logic_sim_time_s": 0.20201498802634887,
+    "trace": {
+      "first_events": [
+        {
+          "event": 1,
+          "recursive_calls_before": 1,
+          "backtracks_before": 0,
+          "objective_gate": 8211,
+          "objective_type": "NOT",
+          "objective_value": "0",
+          "pi_gate": 908,
+          "pi_value": "0",
+          "hinted_pi": true
+        },
+        {
+          "event": 2,
+          "recursive_calls_before": 2,
+          "backtracks_before": 0,
+          "objective_gate": 8211,
+          "objective_type": "NOT",
+          "objective_value": "0",
+          "pi_gate": 1079,
+          "pi_value": "1",
+          "hinted_pi": true
+        },
+        {
+          "event": 3,
+          "recursive_calls_before": 3,
+          "backtracks_before": 0,
+          "objective_gate": 7098,
+          "objective_type": "NOT",
+          "objective_value": "1",
+          "pi_gate": 1082,
+          "pi_value": "0",
+          "hinted_pi": false
+        },
+        {
+          "event": 4,
+          "recursive_calls_before": 4,
+          "backtracks_before": 0,
+          "objective_gate": 7098,
+          "objective_type": "NOT",
+          "objective_value": "1",
+          "pi_gate": 1080,
+          "pi_value": "0",
+          "hinted_pi": true
+        },
+        {
+          "event": 5,
+          "recursive_calls_before": 5,
+          "backtracks_before": 0,
+          "objective_gate": 30598,
+          "objective_type": "AND",
+          "objective_value": "1",
+          "pi_gate": 907,
+          "pi_value": "1",
+          "hinted_pi": false
+        },
+        {
+          "event": 6,
+          "recursive_calls_before": 6,
+          "backtracks_before": 0,
+          "objective_gate": 30598,
+          "objective_type": "AND",
+          "objective_value": "1",
+          "pi_gate": 1277,
+          "pi_value": "0",
+          "hinted_pi": false
+        },
+        {
+          "event": 7,
+          "recursive_calls_before": 7,
+          "backtracks_before": 0,
+          "objective_gate": 30598,
+          "objective_type": "AND",
+          "objective_value": "1",
+          "pi_gate": 906,
+          "pi_value": "0",
+          "hinted_pi": false
+        },
+        {
+          "event": 8,
+          "recursive_calls_before": 8,
+          "backtracks_before": 0,
+          "objective_gate": 30598,
+          "objective_type": "AND",
+          "objective_value": "1",
+          "pi_gate": 1110,
+          "pi_value": "1",
+          "hinted_pi": false
+        }
+      ],
+      "top_objectives": [
+        [
+          [
+            30598,
+            "1"
+          ],
+          4
+        ],
+        [
+          [
+            8211,
+            "0"
+          ],
+          2
+        ],
+        [
+          [
+            7098,
+            "1"
+          ],
+          2
+        ]
+      ],
+      "top_pi_assignments": [
+        [
+          [
+            908,
+            "0"
+          ],
+          1
+        ],
+        [
+          [
+            1079,
+            "1"
+          ],
+          1
+        ],
+        [
+          [
+            1082,
+            "0"
+          ],
+          1
+        ],
+        [
+          [
+            1080,
+            "0"
+          ],
+          1
+        ],
+        [
+          [
+            907,
+            "1"
+          ],
+          1
+        ],
+        [
+          [
+            1277,
+            "0"
+          ],
+          1
+        ],
+        [
+          [
+            906,
+            "0"
+          ],
+          1
+        ],
+        [
+          [
+            1110,
+            "1"
+          ],
+          1
+        ]
+      ]
+    },
+    "profile_text": "         406712 function calls (406704 primitive calls) in 0.246 seconds\n\n   Ordered by: cumulative time\n   List reduced from 49 to 14 due to restriction <14>\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n        1    0.000    0.000    0.246    0.246 podem.py:136(podem)\n      9/1    0.000    0.000    0.217    0.217 podem.py:223(podem_recursion)\n        8    0.000    0.000    0.202    0.025 <stdin>:204(counted_logic_sim)\n        8    0.114    0.014    0.202    0.025 logic_sim_three.py:109(logic_sim)\n   246216    0.088    0.000    0.088    0.000 logic_sim_three.py:25(compute_gate_value)\n        1    0.014    0.014    0.017    0.017 util.py:64(calculate_distance_to_primary_outputs)\n        9    0.014    0.002    0.014    0.002 logic_sim_three.py:185(fault_is_at_po)\n        1    0.010    0.010    0.012    0.012 util.py:13(calculate_distance_to_primary_inputs)\n    30784    0.002    0.000    0.002    0.000 {method 'add' of 'set' objects}\n    64458    0.001    0.000    0.001    0.000 {method 'popleft' of 'collections.deque' objects}\n    64458    0.001    0.000    0.001    0.000 {method 'append' of 'collections.deque' objects}\n        8    0.000    0.000    0.000    0.000 <stdin>:214(traced_ai_backtrace)\n        2    0.000    0.000    0.000    0.000 {method 'clear' of 'dict' objects}\n        8    0.000    0.000    0.000    0.000 benchmark_itc99_gate.py:78(__call__)\n\n\n",
+    "total_gates": 32229
+  }
+}

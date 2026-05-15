@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Dict
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -27,8 +28,6 @@ from src.atpg.ai_podem import (
     AiPodemConfig,
     HierarchicalReconvSolver,
     ModelPairPredictor,
-    StaticHintBacktracer,
-    ai_podem,
 )
 from src.atpg.logic_sim_three import fault_is_at_po, logic_sim, reset_gates
 from src.atpg.podem import (
@@ -44,6 +43,20 @@ from src.util.io import parse_bench_file
 from src.util.struct import Fault, GateType, LogicValue
 
 
+def _logic_value_label(value: LogicValue | int) -> str:
+    mapping = {
+        LogicValue.ZERO: "0",
+        LogicValue.ONE: "1",
+        LogicValue.XD: "X",
+        LogicValue.D: "D",
+        LogicValue.DB: "DB",
+    }
+    try:
+        return mapping[LogicValue(value)]
+    except Exception:
+        return str(value)
+
+
 class ImprovedHintBacktracer:
     """Backtrace using AI hints, falling back to classic only when hints are missing.
 
@@ -52,10 +65,17 @@ class ImprovedHintBacktracer:
     simple_backtrace for the remainder of that specific backtrace path.
     """
 
-    def __init__(self, hints: Dict[int, LogicValue], verbose: bool = False, no_fallback: bool = False):
+    def __init__(
+        self,
+        hints: Dict[int, LogicValue],
+        verbose: bool = False,
+        no_fallback: bool = False,
+        strict_no_fallback: bool = False,
+    ):
         self.hints = {int(k): LogicValue(v) for k, v in hints.items()}
         self.verbose = verbose
         self.no_fallback = no_fallback
+        self.strict_no_fallback = strict_no_fallback
 
     def __call__(self, objective: Fault, circuit: list) -> Fault:
         curr_id = int(objective.gate_id)
@@ -79,11 +99,18 @@ class ImprovedHintBacktracer:
                     break
 
             if next_id is None:
-                if self.no_fallback:
-                    raise RuntimeError(f"[AI-HINT] No hint for gate {curr_id} and fallback is disabled.")
-                # No hint for this gate's fanins, fall back to simple_backtrace from here
+                if self.strict_no_fallback:
+                    if self.verbose:
+                        print(
+                            f"[AI-HINT] No hint for gate {curr_id}; strict no-fallback failed."
+                        )
+                    return Fault(-1, -1)
+                # No hint for this gate's fanins.  No-fallback means the
+                # benchmark will not do a clean classic retry after AI fails;
+                # ordinary PODEM still needs its base backtrace for objectives
+                # outside the AI hint cone.
                 if self.verbose:
-                    print(f"[AI-HINT] No hint for gate {curr_id}, falling back to classic.")
+                    print(f"[AI-HINT] No hint for gate {curr_id}; using base backtrace.")
                 return simple_backtrace(Fault(curr_id, curr_target), circuit)
 
             if self.verbose:
@@ -159,9 +186,16 @@ def _write_csv(path: str, per_fault: list[dict]) -> None:
         "precheck_success",
         "precheck_attempts",
         "precheck_pi_assignments",
-        "ai_backtracks",
+        "ai_precheck_solve_time_s",
+        "ai_precheck_sim_time_s",
+        "ai_hint_solve_time_s",
+        "ai_podem_search_time_s",
+        "ai_podem_backtracks_diagnostic",
+        "ai_strict_zero_backtrack",
         "classic_ok",
+        "classic_result_code",
         "classic_backtracks",
+        "classic_recursive_calls",
         "ai_less_backtracks",
         "ai_error",
         "time_s",
@@ -169,7 +203,7 @@ def _write_csv(path: str, per_fault: list[dict]) -> None:
     ]
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(per_fault)
     os.replace(tmp_path, path)
@@ -194,6 +228,21 @@ def _select_device(requested: str) -> str:
     return requested
 
 
+def _ai_podem_backtrack_budget(args: argparse.Namespace) -> int:
+    """No-fallback disables classic fallback, not PODEM's search budget."""
+    if getattr(args, "strict_ai_no_fallback", False):
+        return 0
+    if getattr(args, "no_backtrack_limit", False):
+        return sys.maxsize
+    return int(args.max_backtracks)
+
+
+def _classic_podem_backtrack_budget(args: argparse.Namespace) -> int:
+    if getattr(args, "no_backtrack_limit", False):
+        return sys.maxsize
+    return int(args.max_backtracks)
+
+
 def _build_manifest(args: argparse.Namespace, outputs: list[str]) -> dict:
     return {
         "run_id": args.run_id,
@@ -216,7 +265,10 @@ def _build_manifest(args: argparse.Namespace, outputs: list[str]) -> dict:
             "activation_precheck": args.activation_precheck,
             "candidate_seed_base": args.candidate_seed_base,
             "enable_ai_propagation": args.enable_ai_propagation,
+            "strict_ai_no_fallback": getattr(args, "strict_ai_no_fallback", False),
             "max_backtracks": args.max_backtracks,
+            "no_backtrack_limit": getattr(args, "no_backtrack_limit", False),
+            "ai_timeout": args.ai_timeout,
             "compare_classic": args.compare_classic,
             "classic_timeout": args.classic_timeout,
             "coverage_target": args.coverage_target,
@@ -238,6 +290,28 @@ def _write_notion_summary(path: str, report: dict, manifest_path: str | None) ->
         if baseline["decision_comparable"]
         else f"not decision-comparable: {baseline['comparison_note']}"
     )
+    if report["compare_classic"]:
+        backtrack_line = (
+            f"- Classic search effort: `{report['classic_backtracks_total']}` total "
+            f"backtracks, `{report['classic_backtracks_on_ai_success']}` on AI-solved "
+            "faults; AI/model backtrack comparison=N/A"
+        )
+    else:
+        backtrack_line = (
+            f"- AI-guided PODEM search diagnostic: `{report['ai_backtracks_total']}` "
+            "internal PODEM backtracks; "
+            "classic not measured (`--compare-classic` was not enabled); "
+            "AI/model backtrack comparison=N/A"
+        )
+
+    if report["backtrack_target"]:
+        backtrack_target_line = (
+            "- Backtrack target enabled: True; pass=N/A because AI has no "
+            "comparable backtrack metric"
+        )
+    else:
+        backtrack_target_line = "- Backtrack target enabled: False; pass=N/A"
+
     lines = [
         f"## Experiment Log - {report['created_at'][:10]} ITC99 Gate Benchmark",
         "",
@@ -253,9 +327,7 @@ def _write_notion_summary(path: str, report: dict, manifest_path: str | None) ->
         [
             f"- Metrics: {report['succeeded']}/{report['total']} faults detected "
             f"({report['coverage']:.4%} no-fallback coverage)",
-            f"- Backtracks: AI `{report['ai_backtracks_total']}`, classic "
-            f"`{report['classic_backtracks_total']}`; "
-            f"AI less than classic={report['passed_backtrack_target']}",
+            backtrack_line,
             f"- Activation precheck: {report['activation_precheck_succeeded']} "
             f"zero-backtrack detections",
             f"- Baseline: {baseline['label']} at {baseline['coverage']:.4%} "
@@ -263,8 +335,7 @@ def _write_notion_summary(path: str, report: dict, manifest_path: str | None) ->
             f"- Baseline comparison: {comparison_text}",
             f"- Coverage target: {report['coverage_target']:.4%}; "
             f"pass={report['passed_coverage_target']}",
-            f"- Backtrack target enabled: {report['backtrack_target']}; "
-            f"pass={report['passed_backtrack_target']}",
+            backtrack_target_line,
             "- Result: measurement artifact created; no promotion decision without "
             "reviewing the full gate target.",
             "- Next step: validate the candidate checkpoint on the configured 10% ITC99 "
@@ -286,6 +357,12 @@ def main() -> None:
     parser.add_argument("--fault-list", default="data/bench/ITC99/b17_gate_10pct_faults.json")
     parser.add_argument("--out", default="docs/itc99_gate_report.json")
     parser.add_argument("--max-backtracks", type=int, default=5000)
+    parser.add_argument(
+        "--no-backtrack-limit",
+        action="store_true",
+        help="Disable the PODEM backtrack cap; wall-clock timeout still applies",
+    )
+    parser.add_argument("--ai-timeout", type=float, default=5.0)
     parser.add_argument("--candidate-count", type=int, default=8)
     parser.add_argument(
         "--ai-attempts",
@@ -305,6 +382,14 @@ def main() -> None:
         help="Disable zero-backtrack validation of the AI activation assignment",
     )
     parser.set_defaults(activation_precheck=True)
+    parser.add_argument(
+        "--strict-ai-no-fallback",
+        action="store_true",
+        help=(
+            "Require AI to provide all backtrace guidance: no clean classic retry, "
+            "no base simple_backtrace for missing hints, and zero AI PODEM backtracks."
+        ),
+    )
     parser.add_argument("--candidate-seed-base", type=int, default=20260504)
     parser.add_argument("--full", action="store_true", help="Ignore fault-list and run all faults")
     parser.add_argument("--limit-faults", type=int, default=0)
@@ -325,6 +410,12 @@ def main() -> None:
     parser.add_argument("--csv-out", default="")
     parser.add_argument("--manifest-out", default="")
     parser.add_argument("--notion-summary-out", default="")
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="When --csv-out is set, rewrite the per-fault CSV every N faults for long runs",
+    )
     parser.add_argument("--baseline-coverage", type=float, default=0.1817)
     parser.add_argument("--baseline-label", default="unlinked_candidate 1% ITC99 gate")
     parser.add_argument("--baseline-source", default="docs/checkpoint_compatibility_summary.md")
@@ -401,6 +492,10 @@ def main() -> None:
         precheck_success = False
         precheck_attempts = 0
         precheck_pi_assignments = 0
+        ai_precheck_solve_time = 0.0
+        ai_precheck_sim_time = 0.0
+        ai_hint_solve_time = 0.0
+        ai_podem_search_time = 0.0
         fault_ai_backtracks = 0
         ai_error = None
         t0 = time.time()
@@ -413,7 +508,9 @@ def main() -> None:
                 attempts_used = attempt + 1
                 current_seed = args.candidate_seed_base + idx + (attempt * len(faults))
                 reset_gates(circuit, total_gates)
+                solve_start = time.time()
                 ai_assignment = solver.solve(fault.gate_id, activation_val, seed=current_seed)
+                ai_precheck_solve_time += time.time() - solve_start
                 if not ai_assignment:
                     continue
                 precheck_pi_assignments = 0
@@ -423,7 +520,9 @@ def main() -> None:
                         precheck_pi_assignments += 1
                 if precheck_pi_assignments == 0:
                     continue
+                sim_start = time.time()
                 logic_sim(circuit, total_gates, fault)
+                ai_precheck_sim_time += time.time() - sim_start
                 if fault_is_at_po(circuit, total_gates):
                     detected = True
                     precheck_success = True
@@ -437,30 +536,44 @@ def main() -> None:
                 reset_statistics()
                 try:
                     activation_val = (
-                        LogicValue.ONE if fault.value in [LogicValue.ZERO, LogicValue.D] else LogicValue.ZERO
+                        LogicValue.ONE
+                        if fault.value in [LogicValue.ZERO, LogicValue.D]
+                        else LogicValue.ZERO
                     )
                     current_seed = args.candidate_seed_base + idx + (attempt * len(faults))
+                    solve_start = time.time()
                     ai_assignment = solver.solve(fault.gate_id, activation_val, seed=current_seed)
+                    ai_hint_solve_time += time.time() - solve_start
 
                     backtracer = None
                     if ai_assignment:
-                        for gid, val in ai_assignment.items():
-                            if circuit[gid].type == GateType.INPT:
-                                circuit[gid].val = val
-
+                        # The precheck above is the only place where AI PI prefill
+                        # is accepted as a complete zero-backtrack pattern.  If it
+                        # did not detect the fault, do not lock those PI values into
+                        # PODEM; use the assignment as guidance instead so ordinary
+                        # PODEM backtracking can recover from bad model activations.
                         if args.enable_ai_propagation:
                             backtracer = AIBacktracer(solver, no_fallback=True)
                         else:
-                            backtracer = ImprovedHintBacktracer(ai_assignment, no_fallback=True)
+                            backtracer = ImprovedHintBacktracer(
+                                ai_assignment,
+                                no_fallback=True,
+                                strict_no_fallback=args.strict_ai_no_fallback,
+                            )
+                    elif args.strict_ai_no_fallback:
+                        ai_error = "strict no-fallback: AI solver returned no assignment"
+                        break
 
+                    search_start = time.time()
                     result = podem(
                         circuit,
                         fault,
                         total_gates,
                         backtrace_func=backtracer,
-                        max_backtracks=0,
-                        timeout=5.0,
+                        max_backtracks=_ai_podem_backtrack_budget(args),
+                        timeout=args.ai_timeout,
                     )
+                    ai_podem_search_time += time.time() - search_start
                     ok = (int(result) == SUCCESS)
                 except Exception as exc:
                     ok = False
@@ -477,7 +590,9 @@ def main() -> None:
         failed += int(not detected)
 
         classic_ok = None
+        classic_result_code = None
         classic_backtracks = None
+        classic_recursive_calls = None
         classic_elapsed = None
         ai_less_backtracks = None
         if args.compare_classic:
@@ -490,19 +605,21 @@ def main() -> None:
                 total_gates,
                 backtrace_func=simple_backtrace,
                 timeout=args.classic_timeout,
-                max_backtracks=args.max_backtracks,
+                max_backtracks=_classic_podem_backtrack_budget(args),
             )
             classic_elapsed = time.time() - classic_start
-            classic_ok = int(classic_result) == SUCCESS
-            classic_backtracks = int(get_statistics().get("backtrack_count", 0))
+            classic_result_code = int(classic_result)
+            classic_ok = classic_result_code == SUCCESS
+            classic_stats = get_statistics()
+            classic_backtracks = int(classic_stats.get("backtrack_count", 0))
+            classic_recursive_calls = int(classic_stats.get("total_recursive_calls", 0))
             classic_succeeded += int(classic_ok)
             classic_backtracks_total += classic_backtracks
             classic_time_total += classic_elapsed
             if detected:
                 ai_backtracks_on_success += fault_ai_backtracks
                 classic_backtracks_on_ai_success += classic_backtracks
-                ai_less_backtracks = fault_ai_backtracks < classic_backtracks
-                ai_less_backtracks_count += int(ai_less_backtracks)
+                ai_less_backtracks = None
         per_fault.append(
             {
                 "fault_index": idx,
@@ -513,9 +630,16 @@ def main() -> None:
                 "precheck_success": precheck_success,
                 "precheck_attempts": precheck_attempts,
                 "precheck_pi_assignments": precheck_pi_assignments,
-                "ai_backtracks": fault_ai_backtracks,
+                "ai_precheck_solve_time_s": round(ai_precheck_solve_time, 4),
+                "ai_precheck_sim_time_s": round(ai_precheck_sim_time, 4),
+                "ai_hint_solve_time_s": round(ai_hint_solve_time, 4),
+                "ai_podem_search_time_s": round(ai_podem_search_time, 4),
+                "ai_podem_backtracks_diagnostic": fault_ai_backtracks,
+                "ai_strict_zero_backtrack": fault_ai_backtracks == 0,
                 "classic_ok": classic_ok,
+                "classic_result_code": classic_result_code,
                 "classic_backtracks": classic_backtracks,
+                "classic_recursive_calls": classic_recursive_calls,
                 "ai_less_backtracks": ai_less_backtracks,
                 "ai_error": ai_error,
                 "time_s": round(elapsed, 4),
@@ -530,21 +654,13 @@ def main() -> None:
                 f"coverage={succeeded / (idx + 1):.2%}",
                 flush=True,
             )
+        if args.csv_out and args.checkpoint_every and (idx + 1) % args.checkpoint_every == 0:
+            _write_csv(args.csv_out, per_fault)
 
     coverage = succeeded / max(1, len(faults))
-    backtrack_target_comparable = bool(args.compare_classic and succeeded)
-    ai_backtrack_ratio = (
-        ai_backtracks_on_success / classic_backtracks_on_ai_success
-        if classic_backtracks_on_ai_success
-        else None
-    )
-    passed_backtrack_target = (
-        not args.backtrack_target
-        or (
-            backtrack_target_comparable
-            and ai_backtracks_on_success < classic_backtracks_on_ai_success
-        )
-    )
+    passed_backtrack_target = None
+    backtrack_target_comparable = False
+    ai_backtrack_ratio = None
     outputs = [args.out]
     if args.csv_out:
         outputs.append(args.csv_out)
@@ -573,7 +689,10 @@ def main() -> None:
         "activation_precheck_succeeded": activation_precheck_succeeded,
         "candidate_seed_base": args.candidate_seed_base,
         "enable_ai_propagation": args.enable_ai_propagation,
+        "strict_ai_no_fallback": getattr(args, "strict_ai_no_fallback", False),
         "max_backtracks": args.max_backtracks,
+        "no_backtrack_limit": getattr(args, "no_backtrack_limit", False),
+        "ai_timeout": args.ai_timeout,
         "total": len(faults),
         "succeeded": succeeded,
         "failed": failed,
@@ -582,6 +701,20 @@ def main() -> None:
         "passed_coverage_target": coverage >= args.coverage_target,
         "backtrack_target": args.backtrack_target,
         "passed_backtrack_target": passed_backtrack_target,
+        "backtrack_target_comparable": backtrack_target_comparable,
+        "backtrack_comparison_note": (
+            "classic backtracks were not measured; AI has no comparable backtrack metric"
+            if not args.compare_classic
+            else (
+                "classic backtracks were measured for ranking only; AI has no "
+                "comparable backtrack metric"
+            )
+        ),
+        "ai_backtrack_metric_valid": False,
+        "ai_backtrack_metric_note": (
+            "ai_podem_backtracks_diagnostic fields are internal PODEM search diagnostics, "
+            "not AI/model backtrack counts"
+        ),
         "compare_classic": args.compare_classic,
         "classic_timeout": args.classic_timeout,
         "classic_succeeded": classic_succeeded,

@@ -1,0 +1,66 @@
+{
+  "csv": "docs/session_reports/codex_20260514_b17_full_timeout20_nobtl/b17_full_per_fault.csv",
+  "expected_total": 64458,
+  "processed_faults": 12600,
+  "progress": 0.19547612398771294,
+  "ai_succeeded": 11235,
+  "ai_coverage_seen": 0.8916666666666667,
+  "ai_coverage_expected_total": 0.17429954388904403,
+  "classic_succeeded": 11268,
+  "classic_coverage_seen": 0.8942857142857142,
+  "classic_results": {
+    "SUCCESS": 11268,
+    "TIMEOUT": 1241,
+    "UNTESTABLE": 91
+  },
+  "timing": {
+    "ai_total": {
+      "total": 36228.11510000007,
+      "mean": 2.87524723015873,
+      "median": 0.5046,
+      "p90": 20.04201,
+      "p99": 20.154101999999998,
+      "max": 20.5528
+    },
+    "ai_precheck_solve": {
+      "total": 72.58750000000275,
+      "mean": 0.005760912698412698,
+      "median": 0.0,
+      "p90": 0.0147,
+      "p99": 0.09490400000000009,
+      "max": 0.5664
+    },
+    "ai_precheck_sim": {
+      "total": 317.678099999999,
+      "mean": 0.02521254761904762,
+      "median": 0.0329,
+      "p90": 0.0347,
+      "p99": 0.0382,
+      "max": 0.0522
+    },
+    "ai_hint_solve": {
+      "total": 2.2661999999999645,
+      "mean": 0.00017985714285714285,
+      "median": 0.0,
+      "p90": 0.00010000000000000002,
+      "p99": 0.0007,
+      "max": 0.1475
+    },
+    "ai_podem_search": {
+      "total": 35786.89159999991,
+      "mean": 2.840229492063492,
+      "median": 0.46495,
+      "p90": 20.002209999999998,
+      "p99": 20.059701,
+      "max": 20.5157
+    },
+    "classic_total": {
+      "total": 33767.940500000084,
+      "mean": 2.6799952777777776,
+      "median": 0.46295,
+      "p90": 15.62172000000002,
+      "p99": 20.060505,
+      "max": 20.437
+    }
+  }
+}

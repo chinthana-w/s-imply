@@ -75,14 +75,17 @@ XOR_TABLE = [
 class DFrontier:
     def __init__(self):
         self.gates = []
+        self._gate_set = set()
 
     def add(self, gate_id):
-        if gate_id not in self.gates:
+        if gate_id not in self._gate_set:
             self.gates.append(gate_id)
+            self._gate_set.add(gate_id)
 
     def remove(self, gate_id):
-        if gate_id in self.gates:
+        if gate_id in self._gate_set:
             self.gates.remove(gate_id)
+            self._gate_set.remove(gate_id)
 
     def is_empty(self):
         return len(self.gates) == 0
@@ -91,7 +94,8 @@ class DFrontier:
         return self.gates[0] if self.gates else None
 
     def clear(self):
-        self.gates = []
+        self.gates.clear()
+        self._gate_set.clear()
 
     def sort(self, key_func):
         self.gates.sort(key=key_func)
@@ -99,11 +103,26 @@ class DFrontier:
 
 d_frontier = DFrontier()
 _dist_map = {}
+_primary_output_cache = {}
 
 
 def set_d_frontier_sort(distance_map):
     global _dist_map
     _dist_map = distance_map
+
+
+def _primary_outputs(circuit: List[Gate], total_gates: int) -> tuple[int, ...]:
+    cache_key = (id(circuit), total_gates)
+    cached = _primary_output_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    outputs = tuple(
+        i
+        for i in range(1, total_gates + 1)
+        if circuit[i] is not None and circuit[i].type != 0 and circuit[i].nfo == 0
+    )
+    _primary_output_cache[cache_key] = outputs
+    return outputs
 
 
 def logic_sim(circuit: List[Gate], total_gates: int, fault=None, topo_order=None) -> None:
@@ -159,7 +178,8 @@ def logic_sim(circuit: List[Gate], total_gates: int, fault=None, topo_order=None
 
     # Update D-frontier
     d_frontier.clear()
-    for i in range(1, total_gates + 1):
+    gate_ids = topo_order if topo_order else range(1, total_gates + 1)
+    for i in gate_ids:
         if circuit[i].val == LogicValue.XD:
             for fin in circuit[i].fin:
                 if circuit[fin].val in (LogicValue.D, LogicValue.DB):
@@ -184,10 +204,9 @@ def reset_gates(circuit: List[Gate], total_gates: int) -> None:
 
 def fault_is_at_po(circuit: List[Gate], total_gates: int) -> bool:
     """Check if any primary output has a fault value (D or DB)."""
-    for i in range(1, total_gates + 1):
-        if circuit[i].type != 0 and circuit[i].nfo == 0:
-            if circuit[i].val in (LogicValue.D, LogicValue.DB):
-                return True
+    for i in _primary_outputs(circuit, total_gates):
+        if circuit[i].val in (LogicValue.D, LogicValue.DB):
+            return True
     return False
 
 
