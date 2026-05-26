@@ -328,13 +328,18 @@ class HierarchicalReconvSolver:
         if self.nodes_visited >= self.nodes_visited_limit:
             return None
 
+        if not queue:
+            return assignment
+
         # 1. Hierarchical: Try to solve the next unsolved pair from the pre-calculated sorted list.
         # This ensures we solve inner/shorter pairs before outer/longer ones.
+        active_nodes = set(queue)
         next_pair = None
         for p in sorted_pairs:
             if id(p) not in solved_pairs:
-                next_pair = p
-                break
+                if p.get("reconv") in active_nodes or p.get("start") in active_nodes:
+                    next_pair = p
+                    break
 
         if next_pair:
             if self.verbose:
@@ -352,7 +357,10 @@ class HierarchicalReconvSolver:
 
             if not candidates:
                 if self.verbose:
-                    print(f"[Solver] Predictor returned no candidates for {_format_pair(next_pair)}")
+                    print(
+                        "[Solver] Predictor returned no candidates for "
+                        f"{_format_pair(next_pair)}"
+                    )
                 return None  # Fail fast if a reconvergent spot cannot be solved
 
             for i, assignment_part in enumerate(candidates):
@@ -437,10 +445,7 @@ class HierarchicalReconvSolver:
 
             return None
 
-        # 2. Standard Gate Justification (when all reconvergent pairs are solved)
-        if not queue:
-            return assignment
-
+        # 2. Standard Gate Justification (when no queued reconvergent pair is ready)
         # Sort queue: highest ID (furthest back) first
         queue.sort(reverse=True)
 

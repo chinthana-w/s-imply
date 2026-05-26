@@ -1,0 +1,64 @@
+{
+  "csv": "docs/session_reports/codex_20260514_b17_full_timeout20_nobtl/b17_full_per_fault.csv",
+  "expected_total": 64458,
+  "processed_faults": 900,
+  "progress": 0.013962580284836637,
+  "ai_succeeded": 0,
+  "ai_coverage_seen": 0.0,
+  "ai_coverage_expected_total": 0.0,
+  "classic_succeeded": 900,
+  "classic_coverage_seen": 1.0,
+  "classic_results": {
+    "SUCCESS": 900
+  },
+  "timing": {
+    "ai_total": {
+      "total": 3.2549000000000006,
+      "mean": 0.0036165555555555556,
+      "median": 0.0036,
+      "p90": 0.0037,
+      "p99": 0.0044,
+      "max": 0.0068
+    },
+    "ai_precheck_solve": {
+      "total": 0.0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p99": 0.0,
+      "max": 0.0
+    },
+    "ai_precheck_sim": {
+      "total": 0.0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p99": 0.0,
+      "max": 0.0
+    },
+    "ai_hint_solve": {
+      "total": 0.0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p99": 0.0,
+      "max": 0.0
+    },
+    "ai_podem_search": {
+      "total": 0.0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p99": 0.0,
+      "max": 0.0
+    },
+    "classic_total": {
+      "total": 368.49159999999995,
+      "mean": 0.40943511111111114,
+      "median": 0.086,
+      "p90": 0.42081,
+      "p99": 7.439495,
+      "max": 7.7715
+    }
+  }
+}

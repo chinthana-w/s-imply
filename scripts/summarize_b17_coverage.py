@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import statistics
 from collections import Counter
 from pathlib import Path
@@ -89,6 +90,10 @@ def summarize(csv_path: Path, expected_total: int) -> tuple[dict, str]:
     ai_ok = [row for row in rows if _truth(row.get("ok"))]
     classic_ok = [row for row in rows if _truth(row.get("classic_ok"))]
     classic_results = Counter(_classic_result_name(row) for row in rows)
+    target = 0.80
+    target_denominator = len(classic_ok)
+    target_required = math.ceil(target * target_denominator) if target_denominator else 0
+    target_observed = len(ai_ok) / target_denominator if target_denominator else 0.0
 
     ai_total = [_num(row.get("time_s")) for row in rows]
     ai_precheck_solve = [_num(row.get("ai_precheck_solve_time_s")) for row in rows]
@@ -119,6 +124,15 @@ def summarize(csv_path: Path, expected_total: int) -> tuple[dict, str]:
         "ai_coverage_expected_total": len(ai_ok) / expected_total if expected_total else 0.0,
         "classic_succeeded": len(classic_ok),
         "classic_coverage_seen": len(classic_ok) / total_seen if total_seen else 0.0,
+        "target": {
+            "coverage": target,
+            "denominator": "classic_succeeded",
+            "denominator_count": target_denominator,
+            "required_faults": target_required,
+            "observed_faults": len(ai_ok),
+            "observed_coverage": target_observed,
+            "passed": len(ai_ok) >= target_required if target_denominator else False,
+        },
         "classic_results": dict(classic_results),
         "timing": {
             "ai_total": _time_summary(ai_total),
@@ -136,11 +150,11 @@ def summarize(csv_path: Path, expected_total: int) -> tuple[dict, str]:
         f"- CSV: `{csv_path}`",
         f"- Processed faults: `{total_seen}/{expected_total}` ({summary['progress']:.2%})",
         (
-            "- AI no-fallback coverage over processed faults: "
+            "- AI/system-mode coverage over processed faults: "
             f"`{len(ai_ok)}/{total_seen}` = `{summary['ai_coverage_seen']:.4%}`"
         ),
         (
-            "- AI coverage lower bound over all expected faults: "
+            "- AI/system-mode coverage lower bound over all expected faults: "
             f"`{len(ai_ok)}/{expected_total}` = "
             f"`{summary['ai_coverage_expected_total']:.4%}`"
         ),
@@ -148,6 +162,12 @@ def summarize(csv_path: Path, expected_total: int) -> tuple[dict, str]:
             "- Classic coverage over processed faults: "
             f"`{len(classic_ok)}/{total_seen}` = "
             f"`{summary['classic_coverage_seen']:.4%}`"
+        ),
+        (
+            "- Target metric: AI/system mode must cover `80.0000%` of faults covered "
+            f"by classic PODEM; observed `{len(ai_ok)}/{target_denominator}` = "
+            f"`{target_observed:.4%}`, required `{target_required}`, "
+            f"pass=`{summary['target']['passed']}`"
         ),
         "",
         "## Classic Result Codes",

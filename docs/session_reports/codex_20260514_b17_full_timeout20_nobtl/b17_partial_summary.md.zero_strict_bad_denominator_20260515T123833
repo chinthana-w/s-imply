@@ -1,0 +1,99 @@
+# b17 Full-Fault Coverage Timing Summary
+
+- CSV: `docs/session_reports/codex_20260514_b17_full_timeout20_nobtl/b17_full_per_fault.csv`
+- Processed faults: `900/64458` (1.40%)
+- AI no-fallback coverage over processed faults: `0/900` = `0.0000%`
+- AI coverage lower bound over all expected faults: `0/64458` = `0.0000%`
+- Classic coverage over processed faults: `900/900` = `100.0000%`
+
+## Classic Result Codes
+
+| Result | Count |
+|---|---:|
+| SUCCESS | 900 |
+
+## Timing Breakdown
+
+| Segment | Total s | Mean s | Median s | P90 s | P99 s | Max s |
+|---|---:|---:|---:|---:|---:|---:|
+| AI total per fault | 3.25 | 0.0036 | 0.0036 | 0.0037 | 0.0044 | 0.0068 |
+| AI precheck solver | 0.00 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+| AI precheck simulation | 0.00 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+| AI hint solver | 0.00 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+| AI-guided PODEM search | 0.00 | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+| Classic total per fault | 368.49 | 0.4094 | 0.0860 | 0.4208 | 7.4395 | 7.7715 |
+
+## Slowest AI Faults
+
+| Fault index | Gate | Fault val | AI ok | AI time s | Classic ok | Classic time s |
+|---:|---:|---:|:---|---:|:---|---:|
+| 500 | 251 | 3 | False | 0.0068 | True | 0.0816 |
+| 556 | 279 | 3 | False | 0.0068 | True | 0.1484 |
+| 400 | 201 | 3 | False | 0.0057 | True | 0.4364 |
+| 86 | 44 | 3 | False | 0.0054 | True | 0.0931 |
+| 800 | 401 | 3 | False | 0.0053 | True | 0.0639 |
+| 300 | 151 | 3 | False | 0.0051 | True | 0.2308 |
+| 464 | 233 | 3 | False | 0.0047 | True | 0.0923 |
+| 847 | 424 | 4 | False | 0.0045 | True | 0.0904 |
+| 100 | 51 | 3 | False | 0.0044 | True | 0.0742 |
+| 252 | 127 | 3 | False | 0.0044 | True | 0.0663 |
+| 802 | 402 | 3 | False | 0.0044 | True | 0.0610 |
+| 850 | 426 | 3 | False | 0.0044 | True | 0.0959 |
+| 852 | 427 | 3 | False | 0.0044 | True | 0.0876 |
+| 804 | 403 | 3 | False | 0.0043 | True | 0.0590 |
+| 851 | 426 | 4 | False | 0.0043 | True | 0.0903 |
+| 869 | 435 | 4 | False | 0.0043 | True | 0.0814 |
+| 461 | 231 | 4 | False | 0.0042 | True | 0.0807 |
+| 515 | 258 | 4 | False | 0.0042 | True | 0.0858 |
+| 516 | 259 | 3 | False | 0.0042 | True | 0.0851 |
+| 549 | 275 | 4 | False | 0.0042 | True | 0.4661 |
+
+## Slowest Classic Faults
+
+| Fault index | Gate | Fault val | Classic result | Classic backtracks | Classic recursive calls | Classic time s | AI ok | AI time s |
+|---:|---:|---:|---|---:|---:|---:|:---|---:|
+| 7 | 4 | 4 | SUCCESS | 115 | 255 | 7.7715 | False | 0.0036 |
+| 3 | 2 | 4 | SUCCESS | 115 | 255 | 7.7155 | False | 0.0039 |
+| 2 | 2 | 3 | SUCCESS | 115 | 255 | 7.6017 | False | 0.0036 |
+| 4 | 3 | 3 | SUCCESS | 115 | 255 | 7.5769 | False | 0.0037 |
+| 20 | 11 | 3 | SUCCESS | 115 | 255 | 7.5252 | False | 0.0035 |
+| 14 | 8 | 3 | SUCCESS | 115 | 255 | 7.4955 | False | 0.0037 |
+| 6 | 4 | 3 | SUCCESS | 115 | 255 | 7.4873 | False | 0.0036 |
+| 24 | 13 | 3 | SUCCESS | 115 | 255 | 7.4510 | False | 0.0035 |
+| 19 | 10 | 4 | SUCCESS | 115 | 255 | 7.4489 | False | 0.0036 |
+| 5 | 3 | 4 | SUCCESS | 115 | 255 | 7.4394 | False | 0.0036 |
+| 17 | 9 | 4 | SUCCESS | 115 | 255 | 7.4011 | False | 0.0036 |
+| 23 | 12 | 4 | SUCCESS | 115 | 255 | 7.3845 | False | 0.0035 |
+| 22 | 12 | 3 | SUCCESS | 115 | 255 | 7.3807 | False | 0.0036 |
+| 31 | 16 | 4 | SUCCESS | 115 | 255 | 7.3711 | False | 0.0036 |
+| 18 | 10 | 3 | SUCCESS | 115 | 255 | 7.3548 | False | 0.0037 |
+| 9 | 5 | 4 | SUCCESS | 115 | 255 | 7.3514 | False | 0.0037 |
+| 25 | 13 | 4 | SUCCESS | 115 | 255 | 7.3403 | False | 0.0036 |
+| 15 | 8 | 4 | SUCCESS | 115 | 255 | 7.3395 | False | 0.0040 |
+| 30 | 16 | 3 | SUCCESS | 115 | 255 | 7.3360 | False | 0.0036 |
+| 13 | 7 | 4 | SUCCESS | 115 | 255 | 7.3325 | False | 0.0036 |
+
+## Highest Classic Backtrack Counts
+
+| Fault index | Gate | Fault val | Classic result | Classic backtracks | Classic time s | AI ok | AI time s |
+|---:|---:|---:|---|---:|---:|:---|---:|
+| 7 | 4 | 4 | SUCCESS | 115 | 7.7715 | False | 0.0036 |
+| 3 | 2 | 4 | SUCCESS | 115 | 7.7155 | False | 0.0039 |
+| 2 | 2 | 3 | SUCCESS | 115 | 7.6017 | False | 0.0036 |
+| 4 | 3 | 3 | SUCCESS | 115 | 7.5769 | False | 0.0037 |
+| 20 | 11 | 3 | SUCCESS | 115 | 7.5252 | False | 0.0035 |
+| 14 | 8 | 3 | SUCCESS | 115 | 7.4955 | False | 0.0037 |
+| 6 | 4 | 3 | SUCCESS | 115 | 7.4873 | False | 0.0036 |
+| 24 | 13 | 3 | SUCCESS | 115 | 7.4510 | False | 0.0035 |
+| 19 | 10 | 4 | SUCCESS | 115 | 7.4489 | False | 0.0036 |
+| 5 | 3 | 4 | SUCCESS | 115 | 7.4394 | False | 0.0036 |
+| 17 | 9 | 4 | SUCCESS | 115 | 7.4011 | False | 0.0036 |
+| 23 | 12 | 4 | SUCCESS | 115 | 7.3845 | False | 0.0035 |
+| 22 | 12 | 3 | SUCCESS | 115 | 7.3807 | False | 0.0036 |
+| 31 | 16 | 4 | SUCCESS | 115 | 7.3711 | False | 0.0036 |
+| 18 | 10 | 3 | SUCCESS | 115 | 7.3548 | False | 0.0037 |
+| 9 | 5 | 4 | SUCCESS | 115 | 7.3514 | False | 0.0037 |
+| 25 | 13 | 4 | SUCCESS | 115 | 7.3403 | False | 0.0036 |
+| 15 | 8 | 4 | SUCCESS | 115 | 7.3395 | False | 0.0040 |
+| 30 | 16 | 3 | SUCCESS | 115 | 7.3360 | False | 0.0036 |
+| 13 | 7 | 4 | SUCCESS | 115 | 7.3325 | False | 0.0036 |

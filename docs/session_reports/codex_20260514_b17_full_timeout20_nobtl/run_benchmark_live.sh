@@ -6,6 +6,7 @@ OUT_DIR=docs/session_reports/codex_20260514_b17_full_timeout20_nobtl
 
 {
   echo "started $(date -Is)"
+  echo "${BASHPID}" > "${OUT_DIR}/run.pid"
   exec /home/local1/miniconda3/envs/deepgate/bin/python -u -m scripts.benchmark_itc99_gate \
     --model checkpoints/reconv_solver_fix_20260511/best_model.pth \
     --device cuda \

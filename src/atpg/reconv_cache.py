@@ -38,8 +38,15 @@ def persist_pair_cache(bench_path: str, pair_cache: dict) -> None:
     if not pair_cache:
         return
     path = _cache_path(bench_path)
+    tmp_path = path + ".tmp"
     try:
-        with open(path, "wb") as f:
+        with open(tmp_path, "wb") as f:
             pickle.dump(pair_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, path)
     except Exception as e:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
         print(f"[Warning] Failed to persist reconv pair cache for {bench_path}: {e}")

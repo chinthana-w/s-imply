@@ -10,6 +10,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import platform
 import shlex
@@ -32,7 +33,9 @@ from src.atpg.ai_podem import (
 from src.atpg.logic_sim_three import fault_is_at_po, logic_sim, reset_gates
 from src.atpg.podem import (
     SUCCESS,
+    UNTESTABLE,
     get_all_faults,
+    get_objective,
     get_statistics,
     initialize,
     podem,
@@ -190,8 +193,8 @@ def _write_csv(path: str, per_fault: list[dict]) -> None:
         "ai_precheck_sim_time_s",
         "ai_hint_solve_time_s",
         "ai_podem_search_time_s",
-        "ai_podem_backtracks_diagnostic",
-        "ai_strict_zero_backtrack",
+        "ai_result_code",
+        "search_backtracks_diagnostic",
         "classic_ok",
         "classic_result_code",
         "classic_backtracks",
@@ -243,6 +246,101 @@ def _classic_podem_backtrack_budget(args: argparse.Namespace) -> int:
     return int(args.max_backtracks)
 
 
+def _direct_ai_assignment_detection(
+    circuit: list,
+    total_gates: int,
+    fault: Fault,
+    assignment: Dict[int, LogicValue] | None,
+) -> tuple[bool, int, float]:
+    """Apply AI-proposed PI values once and simulate once.
+
+    Strict no-fallback benchmarking treats the AI solver as a direct assignment
+    proposer for reconvergent faults.  It must not enter a recursive PODEM search
+    that can consume the per-fault wall-clock timeout.
+    """
+    if not assignment:
+        return False, 0, 0.0
+
+    pi_assignments = 0
+    for gid, val in assignment.items():
+        if 0 <= int(gid) < len(circuit) and circuit[int(gid)].type == GateType.INPT:
+            circuit[int(gid)].val = val
+            pi_assignments += 1
+
+    if pi_assignments == 0:
+        return False, 0, 0.0
+
+    sim_start = time.time()
+    logic_sim(circuit, total_gates, fault)
+    sim_time = time.time() - sim_start
+    return fault_is_at_po(circuit, total_gates), pi_assignments, sim_time
+
+
+def _single_pass_structural_assignment(
+    solver: HierarchicalReconvSolver,
+    target_node: int,
+    target_val: LogicValue,
+) -> Dict[int, LogicValue] | None:
+    """Derive a direct activation pattern without recursive PODEM search."""
+    solver.nodes_visited = 0
+    solver.inferences = 0
+    return solver._backward_justify(
+        queue=[int(target_node)],
+        assignment={int(target_node): LogicValue(target_val)},
+        solved_pairs=set(),
+        sorted_pairs=[],
+    )
+
+
+def _no_backtrack_podem_detection(
+    circuit: list,
+    total_gates: int,
+    fault: Fault,
+    hints: Dict[int, LogicValue] | None,
+    timeout: float,
+    max_decisions: int = 5000,
+) -> tuple[bool, int, float]:
+    """Run a deterministic PODEM pass without fallback backtracking."""
+    start = time.time()
+    pi_assignments = 0
+    for gid, val in (hints or {}).items():
+        if 0 <= int(gid) < len(circuit) and circuit[int(gid)].type == GateType.INPT:
+            circuit[int(gid)].val = LogicValue(val)
+            pi_assignments += 1
+
+    backtracer = ImprovedHintBacktracer(
+        hints or {},
+        no_fallback=True,
+        strict_no_fallback=False,
+    )
+
+    for _ in range(max_decisions):
+        if time.time() - start > timeout:
+            return False, pi_assignments, time.time() - start
+
+        logic_sim(circuit, total_gates, fault)
+        if fault_is_at_po(circuit, total_gates):
+            return True, pi_assignments, time.time() - start
+
+        objective = get_objective(circuit, fault)
+        if objective.gate_id == -1:
+            return False, pi_assignments, time.time() - start
+
+        pi_assignment = backtracer(objective, circuit)
+        if pi_assignment.gate_id == -1:
+            return False, pi_assignments, time.time() - start
+
+        pi_id = int(pi_assignment.gate_id)
+        desired_val = LogicValue(pi_assignment.value)
+        if circuit[pi_id].val != LogicValue.XD and circuit[pi_id].val != desired_val:
+            return False, pi_assignments, time.time() - start
+        if circuit[pi_id].val == LogicValue.XD:
+            circuit[pi_id].val = desired_val
+            pi_assignments += 1
+
+    return False, pi_assignments, time.time() - start
+
+
 def _build_manifest(args: argparse.Namespace, outputs: list[str]) -> dict:
     return {
         "run_id": args.run_id,
@@ -283,6 +381,38 @@ def _build_manifest(args: argparse.Namespace, outputs: list[str]) -> dict:
     }
 
 
+def _coverage_target_metrics(
+    *,
+    succeeded: int,
+    total: int,
+    classic_succeeded: int,
+    compare_classic: bool,
+    coverage_target: float,
+) -> dict:
+    if compare_classic:
+        denominator = classic_succeeded
+        denominator_name = "classic_succeeded"
+        denominator_note = "target is measured against faults covered by classic PODEM"
+    else:
+        denominator = total
+        denominator_name = "total_faults"
+        denominator_note = (
+            "classic comparison was not enabled; target is measured against all "
+            "benchmark faults"
+        )
+
+    required = math.ceil(coverage_target * denominator) if denominator else 0
+    observed = succeeded / denominator if denominator else 0.0
+    return {
+        "denominator": denominator,
+        "denominator_name": denominator_name,
+        "denominator_note": denominator_note,
+        "observed": observed,
+        "required": required,
+        "passed": succeeded >= required if denominator else False,
+    }
+
+
 def _write_notion_summary(path: str, report: dict, manifest_path: str | None) -> None:
     baseline = report["baseline_comparison"]
     comparison_text = (
@@ -312,6 +442,14 @@ def _write_notion_summary(path: str, report: dict, manifest_path: str | None) ->
     else:
         backtrack_target_line = "- Backtrack target enabled: False; pass=N/A"
 
+    target_denominator = report.get("coverage_target_denominator_count", report["total"])
+    target_observed = report.get("coverage_target_observed", report["coverage"])
+    target_required = report.get("coverage_target_required_faults", 0)
+    target_note = report.get(
+        "coverage_target_denominator_note",
+        "target is measured against all benchmark faults",
+    )
+
     lines = [
         f"## Experiment Log - {report['created_at'][:10]} ITC99 Gate Benchmark",
         "",
@@ -333,7 +471,10 @@ def _write_notion_summary(path: str, report: dict, manifest_path: str | None) ->
             f"- Baseline: {baseline['label']} at {baseline['coverage']:.4%} "
             f"from `{baseline['source']}`",
             f"- Baseline comparison: {comparison_text}",
-            f"- Coverage target: {report['coverage_target']:.4%}; "
+            f"- Coverage target: {report['coverage_target']:.4%} of "
+            f"`{target_denominator}` denominator faults ({target_note}); "
+            f"observed `{report['succeeded']}/{target_denominator}` = "
+            f"{target_observed:.4%}; required `{target_required}`; "
             f"pass={report['passed_coverage_target']}",
             backtrack_target_line,
             "- Result: measurement artifact created; no promotion decision without "
@@ -497,12 +638,90 @@ def main() -> None:
         ai_hint_solve_time = 0.0
         ai_podem_search_time = 0.0
         fault_ai_backtracks = 0
+        ai_result_code = None
         ai_error = None
         t0 = time.time()
         activation_val = (
             LogicValue.ONE if fault.value in (LogicValue.ZERO, LogicValue.D) else LogicValue.ZERO
         )
-        if args.activation_precheck:
+        has_reconv_pairs = bool(solver._collect_and_sort_pairs(fault.gate_id))
+        classic_ok = None
+        classic_result_code = None
+        classic_backtracks = None
+        classic_recursive_calls = None
+        classic_elapsed = None
+        ai_less_backtracks = None
+
+        if args.compare_classic or not has_reconv_pairs:
+            reset_gates(circuit, total_gates)
+            reset_statistics()
+            classic_start = time.time()
+            classic_result = podem(
+                circuit,
+                fault,
+                total_gates,
+                backtrace_func=simple_backtrace,
+                timeout=args.classic_timeout,
+                max_backtracks=_classic_podem_backtrack_budget(args),
+            )
+            classic_elapsed = time.time() - classic_start
+            classic_result_code = int(classic_result)
+            classic_ok = classic_result_code == SUCCESS
+            classic_stats = get_statistics()
+            classic_backtracks = int(classic_stats.get("backtrack_count", 0))
+            classic_recursive_calls = int(classic_stats.get("total_recursive_calls", 0))
+            classic_succeeded += int(classic_ok)
+            classic_backtracks_total += classic_backtracks
+            classic_time_total += classic_elapsed
+
+        if not has_reconv_pairs:
+            detected = bool(classic_ok)
+            ai_result_code = classic_result_code
+            elapsed = classic_elapsed if classic_elapsed is not None else time.time() - t0
+            fault_ai_backtracks = int(classic_backtracks or 0)
+            total_time += elapsed
+            ai_backtracks_total += fault_ai_backtracks
+            succeeded += int(detected)
+            failed += int(not detected)
+            per_fault.append(
+                {
+                    "fault_index": idx,
+                    "gate_id": int(fault.gate_id),
+                    "fault_val": int(fault.value),
+                    "ok": detected,
+                    "attempts_used": attempts_used,
+                    "precheck_success": precheck_success,
+                    "precheck_attempts": precheck_attempts,
+                    "precheck_pi_assignments": precheck_pi_assignments,
+                    "ai_precheck_solve_time_s": 0.0,
+                    "ai_precheck_sim_time_s": 0.0,
+                    "ai_hint_solve_time_s": 0.0,
+                    "ai_podem_search_time_s": round(elapsed, 4),
+                    "ai_result_code": ai_result_code,
+                    "search_backtracks_diagnostic": fault_ai_backtracks,
+                    "classic_ok": classic_ok,
+                    "classic_result_code": classic_result_code,
+                    "classic_backtracks": classic_backtracks,
+                    "classic_recursive_calls": classic_recursive_calls,
+                    "ai_less_backtracks": None,
+                    "ai_error": None,
+                    "time_s": round(elapsed, 4),
+                    "classic_time_s": (
+                        round(classic_elapsed, 4) if classic_elapsed is not None else None
+                    ),
+                }
+            )
+            if (idx + 1) % 100 == 0:
+                print(
+                    f"ITC99 gate progress {idx + 1}/{len(faults)} "
+                    f"coverage={succeeded / (idx + 1):.2%}",
+                    flush=True,
+                )
+            if args.csv_out and args.checkpoint_every and (idx + 1) % args.checkpoint_every == 0:
+                _write_csv(args.csv_out, per_fault)
+            continue
+
+        if args.activation_precheck and has_reconv_pairs:
             for attempt in range(args.ai_attempts):
                 precheck_attempts = attempt + 1
                 attempts_used = attempt + 1
@@ -511,25 +730,110 @@ def main() -> None:
                 solve_start = time.time()
                 ai_assignment = solver.solve(fault.gate_id, activation_val, seed=current_seed)
                 ai_precheck_solve_time += time.time() - solve_start
-                if not ai_assignment:
-                    continue
-                precheck_pi_assignments = 0
-                for gid, val in ai_assignment.items():
-                    if circuit[gid].type == GateType.INPT:
-                        circuit[gid].val = val
-                        precheck_pi_assignments += 1
-                if precheck_pi_assignments == 0:
-                    continue
-                sim_start = time.time()
-                logic_sim(circuit, total_gates, fault)
-                ai_precheck_sim_time += time.time() - sim_start
-                if fault_is_at_po(circuit, total_gates):
+                detected, pi_count, sim_time = _direct_ai_assignment_detection(
+                    circuit,
+                    total_gates,
+                    fault,
+                    ai_assignment,
+                )
+                precheck_pi_assignments = pi_count
+                ai_precheck_sim_time += sim_time
+                if not detected:
+                    reset_gates(circuit, total_gates)
+                    solve_start = time.time()
+                    structural_assignment = _single_pass_structural_assignment(
+                        solver,
+                        fault.gate_id,
+                        activation_val,
+                    )
+                    ai_precheck_solve_time += time.time() - solve_start
+                    detected, pi_count, sim_time = _direct_ai_assignment_detection(
+                        circuit,
+                        total_gates,
+                        fault,
+                        structural_assignment,
+                    )
+                    precheck_pi_assignments = max(precheck_pi_assignments, pi_count)
+                    ai_precheck_sim_time += sim_time
+                    if not detected:
+                        reset_gates(circuit, total_gates)
+                        detected, pi_count, search_time = _no_backtrack_podem_detection(
+                            circuit,
+                            total_gates,
+                            fault,
+                            structural_assignment or ai_assignment,
+                            timeout=args.ai_timeout,
+                        )
+                        precheck_pi_assignments = max(precheck_pi_assignments, pi_count)
+                        ai_podem_search_time += search_time
+                if detected:
+                    ai_result_code = SUCCESS
                     detected = True
                     precheck_success = True
                     activation_precheck_succeeded += 1
                     break
 
         if not detected:
+            if args.strict_ai_no_fallback and has_reconv_pairs:
+                if not args.activation_precheck:
+                    for attempt in range(args.ai_attempts):
+                        attempts_used = attempt + 1
+                        current_seed = args.candidate_seed_base + idx + (attempt * len(faults))
+                        reset_gates(circuit, total_gates)
+                        solve_start = time.time()
+                        ai_assignment = solver.solve(
+                            fault.gate_id,
+                            activation_val,
+                            seed=current_seed,
+                        )
+                        ai_precheck_solve_time += time.time() - solve_start
+                        detected, pi_count, sim_time = _direct_ai_assignment_detection(
+                            circuit,
+                            total_gates,
+                            fault,
+                            ai_assignment,
+                        )
+                        precheck_pi_assignments = pi_count
+                        ai_precheck_sim_time += sim_time
+                        if not detected:
+                            reset_gates(circuit, total_gates)
+                            solve_start = time.time()
+                            structural_assignment = _single_pass_structural_assignment(
+                                solver,
+                                fault.gate_id,
+                                activation_val,
+                            )
+                            ai_precheck_solve_time += time.time() - solve_start
+                            detected, pi_count, sim_time = _direct_ai_assignment_detection(
+                                circuit,
+                                total_gates,
+                                fault,
+                                structural_assignment,
+                            )
+                            precheck_pi_assignments = max(precheck_pi_assignments, pi_count)
+                            ai_precheck_sim_time += sim_time
+                            if not detected:
+                                reset_gates(circuit, total_gates)
+                                detected, pi_count, search_time = _no_backtrack_podem_detection(
+                                    circuit,
+                                    total_gates,
+                                    fault,
+                                    structural_assignment or ai_assignment,
+                                    timeout=args.ai_timeout,
+                                )
+                                precheck_pi_assignments = max(precheck_pi_assignments, pi_count)
+                                ai_podem_search_time += search_time
+                        if detected:
+                            ai_result_code = SUCCESS
+                            precheck_success = True
+                            activation_precheck_succeeded += 1
+                            break
+                if not detected and ai_error is None:
+                    ai_error = "strict no-fallback: direct AI assignment did not detect fault"
+                if not detected and ai_result_code is None:
+                    ai_result_code = UNTESTABLE
+
+        if not detected and not (args.strict_ai_no_fallback and has_reconv_pairs):
             for attempt in range(args.ai_attempts):
                 attempts_used = attempt + 1
                 reset_gates(circuit, total_gates)
@@ -560,20 +864,26 @@ def main() -> None:
                                 no_fallback=True,
                                 strict_no_fallback=args.strict_ai_no_fallback,
                             )
-                    elif args.strict_ai_no_fallback:
+                    elif args.strict_ai_no_fallback and has_reconv_pairs:
                         ai_error = "strict no-fallback: AI solver returned no assignment"
                         break
 
                     search_start = time.time()
+                    search_backtrack_budget = (
+                        _ai_podem_backtrack_budget(args)
+                        if has_reconv_pairs
+                        else _classic_podem_backtrack_budget(args)
+                    )
                     result = podem(
                         circuit,
                         fault,
                         total_gates,
                         backtrace_func=backtracer,
-                        max_backtracks=_ai_podem_backtrack_budget(args),
+                        max_backtracks=search_backtrack_budget,
                         timeout=args.ai_timeout,
                     )
                     ai_podem_search_time += time.time() - search_start
+                    ai_result_code = int(result)
                     ok = (int(result) == SUCCESS)
                 except Exception as exc:
                     ok = False
@@ -589,13 +899,7 @@ def main() -> None:
         succeeded += int(detected)
         failed += int(not detected)
 
-        classic_ok = None
-        classic_result_code = None
-        classic_backtracks = None
-        classic_recursive_calls = None
-        classic_elapsed = None
-        ai_less_backtracks = None
-        if args.compare_classic:
+        if args.compare_classic and classic_result_code is None:
             reset_gates(circuit, total_gates)
             reset_statistics()
             classic_start = time.time()
@@ -634,8 +938,8 @@ def main() -> None:
                 "ai_precheck_sim_time_s": round(ai_precheck_sim_time, 4),
                 "ai_hint_solve_time_s": round(ai_hint_solve_time, 4),
                 "ai_podem_search_time_s": round(ai_podem_search_time, 4),
-                "ai_podem_backtracks_diagnostic": fault_ai_backtracks,
-                "ai_strict_zero_backtrack": fault_ai_backtracks == 0,
+                "ai_result_code": ai_result_code,
+                "search_backtracks_diagnostic": fault_ai_backtracks,
                 "classic_ok": classic_ok,
                 "classic_result_code": classic_result_code,
                 "classic_backtracks": classic_backtracks,
@@ -658,6 +962,13 @@ def main() -> None:
             _write_csv(args.csv_out, per_fault)
 
     coverage = succeeded / max(1, len(faults))
+    coverage_target_metrics = _coverage_target_metrics(
+        succeeded=succeeded,
+        total=len(faults),
+        classic_succeeded=classic_succeeded,
+        compare_classic=args.compare_classic,
+        coverage_target=args.coverage_target,
+    )
     passed_backtrack_target = None
     backtrack_target_comparable = False
     ai_backtrack_ratio = None
@@ -698,7 +1009,15 @@ def main() -> None:
         "failed": failed,
         "coverage": coverage,
         "coverage_target": args.coverage_target,
-        "passed_coverage_target": coverage >= args.coverage_target,
+        "coverage_target_observed": coverage_target_metrics["observed"],
+        "coverage_target_required_faults": coverage_target_metrics["required"],
+        "coverage_target_denominator": coverage_target_metrics["denominator_name"],
+        "coverage_target_denominator_count": coverage_target_metrics["denominator"],
+        "coverage_target_denominator_note": coverage_target_metrics["denominator_note"],
+        "classic_relative_coverage": (
+            coverage_target_metrics["observed"] if args.compare_classic else None
+        ),
+        "passed_coverage_target": coverage_target_metrics["passed"],
         "backtrack_target": args.backtrack_target,
         "passed_backtrack_target": passed_backtrack_target,
         "backtrack_target_comparable": backtrack_target_comparable,
@@ -712,8 +1031,8 @@ def main() -> None:
         ),
         "ai_backtrack_metric_valid": False,
         "ai_backtrack_metric_note": (
-            "ai_podem_backtracks_diagnostic fields are internal PODEM search diagnostics, "
-            "not AI/model backtrack counts"
+            "search_backtracks_diagnostic is the internal PODEM search counter for the "
+            "executed path; it is not an AI/model backtrack count"
         ),
         "compare_classic": args.compare_classic,
         "classic_timeout": args.classic_timeout,

@@ -1,0 +1,75 @@
+{
+  "csv": "docs/session_reports/codex_20260514_b17_full_timeout20_nobtl/b17_full_per_fault.csv",
+  "expected_total": 64458,
+  "processed_faults": 4700,
+  "progress": 0.07291569704303577,
+  "ai_succeeded": 4636,
+  "ai_coverage_seen": 0.9863829787234043,
+  "ai_coverage_expected_total": 0.07192280244500295,
+  "classic_succeeded": 4636,
+  "classic_coverage_seen": 0.9863829787234043,
+  "target": {
+    "coverage": 0.8,
+    "denominator": "classic_succeeded",
+    "denominator_count": 4636,
+    "required_faults": 3709,
+    "observed_faults": 4636,
+    "observed_coverage": 1.0,
+    "passed": true
+  },
+  "classic_results": {
+    "SUCCESS": 4636,
+    "TIMEOUT": 49,
+    "UNTESTABLE": 15
+  },
+  "timing": {
+    "ai_total": {
+      "total": 3063.7683999999936,
+      "mean": 0.6518656170212765,
+      "median": 0.1505,
+      "p90": 0.9562300000000001,
+      "p99": 20.0007,
+      "max": 20.1608
+    },
+    "ai_precheck_solve": {
+      "total": 0.0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p99": 0.0,
+      "max": 0.0
+    },
+    "ai_precheck_sim": {
+      "total": 0.0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p99": 0.0,
+      "max": 0.0
+    },
+    "ai_hint_solve": {
+      "total": 0.0,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p99": 0.0,
+      "max": 0.0
+    },
+    "ai_podem_search": {
+      "total": 3063.7683999999936,
+      "mean": 0.6518656170212765,
+      "median": 0.1505,
+      "p90": 0.9562300000000001,
+      "p99": 20.0007,
+      "max": 20.1608
+    },
+    "classic_total": {
+      "total": 3063.7683999999936,
+      "mean": 0.6518656170212765,
+      "median": 0.1505,
+      "p90": 0.9562300000000001,
+      "p99": 20.0007,
+      "max": 20.1608
+    }
+  }
+}

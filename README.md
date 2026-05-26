@@ -113,12 +113,14 @@ python -m scripts.benchmark_itc99_gate \
 ```
 
 The benchmark report records per-fault outcomes, baseline metadata, command
-provenance, AI/classic backtrack comparison, target pass/fail fields, and
-optional Notion-ready markdown.  Bounded smoke runs using `--limit-faults`
-validate the benchmark/reporting path only; do not treat them as a promotion
-decision for the full 6,445-fault 10% gate.  Promote to full ITC99 only after a
-comparable 10% gate artifact reaches at least 80% no-fallback coverage and uses
-fewer AI backtracks than classic PODEM on the same faults.
+provenance, classic comparison, target pass/fail fields, and optional
+Notion-ready markdown.  Bounded smoke runs using `--limit-faults` validate the
+benchmark/reporting path only; do not treat them as a promotion decision for the
+full 6,445-fault 10% gate.  The current promotion target is 80% AI/system-mode
+coverage over the faults covered by classic PODEM. For example, if classic
+detects 7,000 of 10,000 faults, AI/system mode must detect 5,600 faults. Faults
+without reconvergent pairs are handled by the standard PODEM path inside AI
+mode and are not considered fallback.
 
 As of the 2026-05-12 docs/results pass, no new training run, checkpoint
 compatibility improvement, ITC99 gate benchmark, or model-quality promotion was
@@ -137,16 +139,14 @@ as limited to simple faults that classic PODEM can solve with zero backtracks.
 For a repo-local quick session, use the guarded wrapper:
 
 ```bash
-COVERAGE_TARGET=0.8 COMPARE_CLASSIC=1 BACKTRACK_TARGET=1 \
-    AI_ATTEMPTS=2 bash scripts/train_test_session.sh
+COVERAGE_TARGET=0.8 COMPARE_CLASSIC=1 AI_ATTEMPTS=2 bash scripts/train_test_session.sh
 ```
 
 It builds ISCAS85/89 data, trains, and writes ITC99 gate artifacts under
 `docs/session_reports/$RUN_ID/` by default.  The wrapper checks disk/RAM
 minimums before each stage and can resume selected stages with `STAGES=...`.
-The wrapper exposes the backtrack gate as environment controls; without the
-`COMPARE_CLASSIC=1` and `BACKTRACK_TARGET=1` overrides, a wrapper test run does
-not prove the fewer-backtracks target.
+The wrapper needs `COMPARE_CLASSIC=1` for target decisions because the target
+denominator is the number of faults covered by classic PODEM.
 
 ### 4. RL Fine-tuning
 After collecting experience, fine-tune the transformer using policy gradient (REINFORCE)

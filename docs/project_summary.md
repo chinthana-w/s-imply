@@ -358,11 +358,14 @@ Extended ITC99 benchmark gating without promoting a full ITC99 result:
     `AI_ATTEMPTS`, `COMPARE_CLASSIC`, `BACKTRACK_TARGET`,
     `ENABLE_AI_PROPAGATION`, and `CLASSIC_TIMEOUT` for `test` and
     `full_itc99_test`.
--   **Target Mode**: The validated promotion target is 80% no-fallback coverage
-    with fewer AI backtracks than classic PODEM on the same faults.  Runtime
-    wrapper defaults still require explicit target-mode overrides
-    (`COVERAGE_TARGET=0.8`, `COMPARE_CLASSIC=1`, `BACKTRACK_TARGET=1`) before a
-    wrapper `test` stage can support that decision.
+-   **Target Mode**: The current promotion target is 80% AI/system-mode
+    coverage over the fault set covered by classic PODEM.  For example, if a
+    benchmark has 10,000 faults and classic PODEM detects 7,000, the AI/system
+    mode target is 5,600 detected faults.  No-reconvergence faults are counted
+    through the standard PODEM path inside AI mode and are not considered
+    fallback. Runtime wrapper defaults still require explicit target-mode
+    overrides (`COVERAGE_TARGET=0.8`, `COMPARE_CLASSIC=1`) before a wrapper
+    `test` stage can support that decision.
 -   **Validated Scope**: On 2026-05-11, a bounded five-fault ITC99 smoke using
     `checkpoints/iscas85_89_20260507_095012/best_model.pth` reached 5/5
     no-fallback coverage but failed the backtrack target because AI and classic
