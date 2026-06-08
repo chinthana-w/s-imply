@@ -46,6 +46,54 @@ def test_itc99_no_fallback_keeps_configured_backtrack_budget():
     assert benchmark_itc99_gate._ai_podem_backtrack_budget(args) == 123
 
 
+def test_reconv_only_filter_keeps_only_faults_with_pairs():
+    faults = [
+        Fault(1, LogicValue.ZERO),
+        Fault(2, LogicValue.ONE),
+        Fault(3, LogicValue.ZERO),
+    ]
+    solver = SimpleNamespace(
+        _collect_and_sort_pairs=lambda gate_id: [{"reconv": gate_id}] if gate_id in {1, 3} else []
+    )
+
+    filtered, meta = benchmark_itc99_gate._filter_reconv_faults(faults, solver)
+
+    assert [fault.gate_id for fault in filtered] == [1, 3]
+    assert meta["pre_reconv_filter_faults"] == 3
+    assert meta["reconv_faults"] == 2
+    assert meta["non_reconv_faults_skipped"] == 1
+
+
+def test_write_fault_list_round_trips_reusable_reconv_faults(tmp_path):
+    out = tmp_path / "reconv_faults.json"
+    faults = [
+        Fault(10, LogicValue.ZERO),
+        Fault(20, LogicValue.ONE),
+    ]
+
+    benchmark_itc99_gate._write_fault_list(
+        str(out),
+        bench_path="b17.bench",
+        faults=faults,
+        source_meta={"fault_list": "input.json", "full": True},
+        filter_meta={
+            "pre_reconv_filter_faults": 3,
+            "reconv_faults": 2,
+            "non_reconv_faults_skipped": 1,
+        },
+    )
+
+    bench, loaded_faults, meta = benchmark_itc99_gate._load_gate_faults(str(out))
+
+    assert bench == "b17.bench"
+    assert [(fault.gate_id, fault.value) for fault in loaded_faults] == [
+        (10, LogicValue.ZERO),
+        (20, LogicValue.ONE),
+    ]
+    assert meta["filter"]["type"] == "reconv_only"
+    assert meta["source"]["pre_filter_faults"] == 3
+
+
 def test_podem_reset_statistics_clears_recursion_depth():
     podem_mod.depth = 5001
     podem_mod.backtrack_count = 17
@@ -317,6 +365,108 @@ def test_coverage_target_fails_below_classic_relative_threshold():
 
     assert metrics["required"] == 56
     assert metrics["passed"] is False
+
+
+def test_incomplete_coverage_target_uses_attempted_denominator_without_passing():
+    metrics = benchmark_itc99_gate._coverage_target_metrics(
+        succeeded=80,
+        total=1000,
+        attempted=100,
+        classic_succeeded=0,
+        compare_classic=False,
+        coverage_target=0.8,
+        complete=False,
+    )
+
+    assert metrics["denominator_name"] == "attempted_faults"
+    assert metrics["denominator"] == 100
+    assert metrics["observed"] == 0.8
+    assert metrics["required"] == 80
+    assert metrics["passed"] is False
+
+
+def test_resource_abort_reason_trips_on_low_available_memory():
+    args = Namespace(
+        min_available_memory_gb=16.0,
+        max_system_memory_percent=0.0,
+        max_rss_gb=0.0,
+        memory_guard_mode="both",
+    )
+    snapshot = {
+        "mem_available_gb": 8.0,
+        "mem_used_percent": 20.0,
+        "process_rss_gb": 1.0,
+    }
+
+    reason = benchmark_itc99_gate._resource_abort_reason(args, snapshot)
+
+    assert "available memory" in reason
+
+
+def test_resource_abort_reason_accepts_disabled_limits():
+    args = Namespace(
+        min_available_memory_gb=0.0,
+        max_system_memory_percent=0.0,
+        max_rss_gb=0.0,
+        memory_guard_mode="both",
+    )
+
+    assert benchmark_itc99_gate._resource_abort_reason(args, {}) is None
+
+
+def test_resource_abort_reason_process_mode_ignores_system_memory():
+    args = Namespace(
+        min_available_memory_gb=16.0,
+        max_system_memory_percent=50.0,
+        max_rss_gb=2.0,
+        memory_guard_mode="process",
+    )
+    snapshot = {
+        "mem_available_gb": 1.0,
+        "mem_used_percent": 99.0,
+        "process_rss_gb": 1.0,
+    }
+
+    assert benchmark_itc99_gate._resource_abort_reason(args, snapshot) is None
+
+
+def test_resource_abort_reason_process_mode_trips_on_rss():
+    args = Namespace(
+        min_available_memory_gb=0.0,
+        max_system_memory_percent=0.0,
+        max_rss_gb=2.0,
+        memory_guard_mode="process",
+    )
+    snapshot = {
+        "mem_available_gb": 100.0,
+        "mem_used_percent": 10.0,
+        "process_rss_gb": 3.0,
+    }
+
+    reason = benchmark_itc99_gate._resource_abort_reason(args, snapshot)
+
+    assert "process RSS" in reason
+
+
+def test_flush_runtime_caches_clears_solver_and_predictor_caches():
+    solver = SimpleNamespace(
+        pair_cache={1: "a", 2: "b"},
+        _pair_cache_dirty=True,
+        _persist_pair_cache_if_needed=lambda: None,
+    )
+    predictor = SimpleNamespace(prediction_cache={("x",): 1})
+
+    stats = benchmark_itc99_gate._flush_runtime_caches(
+        solver=solver,
+        predictor=predictor,
+        device="cpu",
+    )
+
+    assert stats["solver_pair_cache"] == 2
+    assert stats["predictor_prediction_cache"] == 1
+    assert solver.pair_cache == {}
+    assert solver._pair_cache_dirty is False
+    assert predictor.prediction_cache == {}
 
 
 def test_notion_summary_treats_compare_backtrack_target_as_not_comparable(tmp_path):

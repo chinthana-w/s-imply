@@ -4,10 +4,16 @@ set -euo pipefail
 cd /home/local1/chinthana/s-imply
 OUT_DIR=docs/session_reports/codex_20260514_b17_full_timeout20_nobtl
 
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 {
   echo "started $(date -Is)"
   echo "${BASHPID}" > "${OUT_DIR}/run.pid"
-  exec /home/local1/miniconda3/envs/deepgate/bin/python -u -m scripts.benchmark_itc99_gate \
+  exec nice -n 10 /home/local1/miniconda3/envs/deepgate/bin/python -u -m scripts.benchmark_itc99_gate \
     --model checkpoints/reconv_solver_fix_20260511/best_model.pth \
     --device cuda \
     --fault-list data/bench/ITC99/b17_gate_10pct_faults.json \
@@ -24,6 +30,12 @@ OUT_DIR=docs/session_reports/codex_20260514_b17_full_timeout20_nobtl
     --no-backtrack-limit \
     --strict-ai-no-fallback \
     --coverage-target 0.8 \
+    --torch-num-threads 1 \
+    --min-available-memory-gb 16 \
+    --max-system-memory-percent 80 \
+    --max-rss-gb 24 \
+    --cooldown-s 0.01 \
+    --progress-every 25 \
     --checkpoint-every 100 \
     --run-id codex_20260514_b17_full_timeout20_nobtl
 } 2>&1 | tee "${OUT_DIR}/run.log"
