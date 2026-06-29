@@ -44,6 +44,7 @@ class TestAIPodem(unittest.TestCase):
 
         mock_solver_instance = mock_solver_cls.return_value
         mock_solver_instance.solve.return_value = None  # AI Fails
+        mock_solver_instance.solve_with_retry.return_value = None  # AI Fails
 
         mock_podem.return_value = True
 
@@ -56,7 +57,7 @@ class TestAIPodem(unittest.TestCase):
         )
 
         self.assertTrue(result)
-        self.assertEqual(mock_solver_instance.solve.call_count, 5)
+        self.assertEqual(mock_solver_instance.solve_with_retry.call_count, 5)
         # Should call mogu_podem_wrapper for the clean retry
         mock_podem.assert_called_once()
 
@@ -83,6 +84,7 @@ class TestAIPodem(unittest.TestCase):
         # Solver should NOT be called for activation constraint (step 1)
         mock_solver_instance = mock_solver_cls.return_value
         mock_solver_instance.solve.assert_not_called()
+        mock_solver_instance.solve_with_retry.assert_not_called()
 
         # But 'mogu_podem_wrapper' should be called with a backtrace_func
         args, kwargs = mock_podem.call_args
@@ -125,6 +127,7 @@ class TestAIPodem(unittest.TestCase):
         circuit, total_gates = create_mock_circuit()
         fault = Fault(3, LogicValue.D)
         mock_solver_cls.return_value.solve.return_value = {1: LogicValue.ONE}
+        mock_solver_cls.return_value.solve_with_retry.return_value = {1: LogicValue.ONE}
         mock_podem.side_effect = [False, True]
 
         result = ai_podem(
@@ -175,6 +178,7 @@ class TestAIPodem(unittest.TestCase):
         circuit, total_gates = create_mock_circuit()
         fault = Fault(3, LogicValue.D)
         mock_solver_cls.return_value.solve.return_value = {1: LogicValue.ONE}
+        mock_solver_cls.return_value.solve_with_retry.return_value = {1: LogicValue.ONE}
         mock_podem.side_effect = [BACKTRACK_LIMIT, True]
 
         result = ai_podem(
@@ -223,7 +227,7 @@ class TestAIPodem(unittest.TestCase):
         backtracer = AIBacktracer(solver)
 
         # Case 1: AI Solver finds assignment for Gate 1=1 to satisfy objective
-        solver.solve.return_value = {1: LogicValue.ONE}
+        solver.solve_with_retry.return_value = {1: LogicValue.ONE}
 
         objective = Fault(3, LogicValue.ONE)
         res = backtracer(objective, circuit)
@@ -232,7 +236,7 @@ class TestAIPodem(unittest.TestCase):
         self.assertEqual(res.value, LogicValue.ONE)
 
         # Case 2: AI Solver fails -> Fallback to simple
-        solver.solve.return_value = None
+        solver.solve_with_retry.return_value = None
         # Should fallback to simple_backtrace.
         # simple_backtrace(obj=Gate3, val=1) -> Gate 3 is AND. Needs 1,1.
         # It picks an X input (Gate 1 or 2).
@@ -247,14 +251,14 @@ class TestAIPodem(unittest.TestCase):
         solver.circuit = circuit
         solver.pair_cache = {}
         solver._collect_and_sort_pairs.return_value = []
-        solver.solve.return_value = {1: LogicValue.ONE}
+        solver.solve_with_retry.return_value = {1: LogicValue.ONE}
 
         backtracer = AIBacktracer(solver, no_fallback=True)
         res = backtracer(Fault(3, LogicValue.ONE), circuit)
 
         self.assertEqual(res.gate_id, 1)
         self.assertEqual(res.value, LogicValue.ONE)
-        solver.solve.assert_called_once()
+        solver.solve_with_retry.assert_called_once()
 
     def test_ai_backtracer_passes_live_internal_constraints(self):
         """AI propagation must preserve assigned internal and D-frontier state."""
@@ -265,12 +269,12 @@ class TestAIPodem(unittest.TestCase):
         solver.circuit = circuit
         solver.pair_cache = {}
         solver._collect_and_sort_pairs.return_value = []
-        solver.solve.return_value = {2: LogicValue.ONE}
+        solver.solve_with_retry.return_value = {2: LogicValue.ONE}
 
         backtracer = AIBacktracer(solver, no_fallback=True)
         backtracer(Fault(4, LogicValue.ZERO), circuit)
 
-        constraints = solver.solve.call_args.args[2]
+        constraints = solver.solve_with_retry.call_args.args[2]
         self.assertEqual(constraints[1], LogicValue.ONE)
         self.assertEqual(constraints[3], LogicValue.ONE)
 

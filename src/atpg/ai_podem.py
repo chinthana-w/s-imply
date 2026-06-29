@@ -81,6 +81,7 @@ class AiPodemConfig:
     candidate_seed_base: int = 20260504
     candidate_temperature: float = 0.7
     enable_symbolic_repair: bool = True
+    max_confidence_retries: int = 3  # Confidence-guided retries in solve_with_retry()
 
 
 class AIBacktracer:
@@ -139,11 +140,14 @@ class AIBacktracer:
             if self.verbose:
                 print(f"  [AI-BT] Constraints: {current_constraints}, Seed: {current_seed}")
 
-            solution = self.solver.solve(
+            _predictor_cfg = getattr(self.solver.predictor, "config", None)
+            _max_bt_retries = getattr(_predictor_cfg, "max_confidence_retries", 3)
+            solution = self.solver.solve_with_retry(
                 objective.gate_id,
                 objective.value,
                 current_constraints,
                 seed=current_seed,
+                max_retries=_max_bt_retries,
             )
 
             if solution:
@@ -442,7 +446,7 @@ class ModelPairPredictor(ReconvPairPredictor):
         cache_seed = int(seed if seed is not None else self.config.candidate_seed_base)
         cache_key = (pair_info["start"], pair_info["reconv"], relevant_constraints, cache_seed)
 
-        if len(self.prediction_cache) > 500:
+        if len(self.prediction_cache) > 50:
             self.prediction_cache.clear()
 
         if cache_key in self.prediction_cache:
@@ -578,13 +582,17 @@ class ModelPairPredictor(ReconvPairPredictor):
         for i, p in enumerate(paths):
             batch_mask[0, i, len(p) :] = False
 
-        # Snapshot for RL (Clone to CPU)
-        inputs_snapshot = {
-            "node_ids": batch_ids.cpu(),
-            "mask_valid": batch_mask.cpu(),
-            "gate_types": batch_types.cpu(),
-            "files": [self.circuit_path],
-        }
+        # Snapshot for RL recorder only — skip when no recorder is attached
+        # to avoid holding large tensors in the prediction_cache during benchmarks.
+        if getattr(self, "recorder", None) is not None:
+            inputs_snapshot: dict | None = {
+                "node_ids": batch_ids.cpu(),
+                "mask_valid": batch_mask.cpu(),
+                "gate_types": batch_types.cpu(),
+                "files": [self.circuit_path],
+            }
+        else:
+            inputs_snapshot = None
 
         if self.config.verbose:
             print(f"[AI-MODEL] Query: {_format_pair(pair_info)}")
@@ -670,6 +678,20 @@ class ModelPairPredictor(ReconvPairPredictor):
                 seen_assignments.add(signature)
                 candidate_assignments.append(predicted_assignment)
 
+        # Compute per-candidate min-confidence for retry tracking.
+        # min_confidence = minimum predicted probability across unconstrained path nodes.
+        candidate_confidences: list = []
+        for cidx, c_vals in enumerate(candidate_vals):
+            min_conf = 1.0
+            for pi, p in enumerate(paths):
+                for pj, nid in enumerate(p):
+                    if nid not in constraints:
+                        raw_val = int(c_vals[pi, pj].item())
+                        min_conf = min(
+                            min_conf, float(probs[0, pi, pj, raw_val].item())
+                        )
+            candidate_confidences.append(min_conf)
+
         res = self._rank_solutions_with_model(
             pair_info,
             constraints,
@@ -693,8 +715,28 @@ class ModelPairPredictor(ReconvPairPredictor):
                 f"[AI-MODEL] Ranked candidates: "
                 f"{[_format_assignment(candidate) for candidate in candidates]}"
             )
-        self.prediction_cache[cache_key] = res
-        return res
+        # Attach per-candidate confidences (aligned to ranked output order).
+        # _rank_solutions_with_model may reorder and trim; align confidences to the
+        # returned candidate list using their signatures for a best-effort match.
+        ranked_candidates, snapshot = res
+        sig_to_conf: dict = {}
+        for cidx, (cvals, cconf) in enumerate(zip(candidate_vals, candidate_confidences)):
+            # Build the signature from the matching candidate_assignments entry.
+            if cidx < len(candidate_assignments):
+                sig = tuple(
+                    sorted(
+                        (int(k), int(v))
+                        for k, v in candidate_assignments[cidx].items()
+                    )
+                )
+                sig_to_conf[sig] = min(sig_to_conf.get(sig, 1.0), cconf)
+        ranked_confidences: list = []
+        for rc in ranked_candidates:
+            sig = tuple(sorted((int(k), int(v)) for k, v in rc.items()))
+            ranked_confidences.append(sig_to_conf.get(sig, 0.5))
+        final_res = (ranked_candidates, snapshot, ranked_confidences)
+        self.prediction_cache[cache_key] = final_res
+        return final_res
 
     def _rank_solutions_with_model(
         self,
@@ -929,7 +971,17 @@ def ai_podem(
                     f"[AI-PODEM] Attempt {attempt+1}/{max_attempts}: Justifying Gate "
                     f"{fault.gate_id} @ {activation_val} (Seed: {current_seed})"
                 )
-            ai_assignment = solver.solve(fault.gate_id, activation_val, seed=current_seed)
+            _max_retries = (
+                predictor.config.max_confidence_retries
+                if predictor is not None and hasattr(predictor, "config")
+                else 0
+            )
+            ai_assignment = solver.solve_with_retry(
+                fault.gate_id,
+                activation_val,
+                seed=current_seed,
+                max_retries=_max_retries,
+            )
             if ai_assignment:
                 if verbose:
                     print(

@@ -105,9 +105,7 @@ class ImprovedHintBacktracer:
             if next_id is None:
                 if self.strict_no_fallback:
                     if self.verbose:
-                        print(
-                            f"[AI-HINT] No hint for gate {curr_id}; strict no-fallback failed."
-                        )
+                        print(f"[AI-HINT] No hint for gate {curr_id}; strict no-fallback failed.")
                     return Fault(-1, -1)
                 # No hint for this gate's fanins.  No-fallback means the
                 # benchmark will not do a clean classic retry after AI fails;
@@ -306,11 +304,45 @@ def _resource_snapshot() -> dict[str, float]:
     }
 
 
-def _resource_abort_reason(args: argparse.Namespace, snapshot: dict[str, float]) -> str | None:
+def _resource_pressure_level(args: argparse.Namespace, snapshot: dict[str, float]) -> str:
+    """Return 'ok', 'flush' (soft pressure), or 'abort' (hard limit).
+
+    'flush'  → caches should be cleared; run can continue after.
+    'abort'  → resources critically low; stop cleanly.
+    """
     guard_mode = getattr(args, "memory_guard_mode", "both")
     check_system = guard_mode in {"system", "both"}
     check_process = guard_mode in {"process", "both"}
 
+    flush_threshold_gb = getattr(args, "mem_flush_threshold_gb", 0.0)
+
+    # --- Hard abort limits ---
+    if check_system and args.min_available_memory_gb > 0:
+        if snapshot["mem_available_gb"] < args.min_available_memory_gb:
+            return "abort"
+    if check_system and args.max_system_memory_percent > 0:
+        if snapshot["mem_used_percent"] > args.max_system_memory_percent:
+            return "abort"
+    if check_process and args.max_rss_gb > 0:
+        if snapshot["process_rss_gb"] > args.max_rss_gb:
+            return "abort"
+
+    # --- Soft flush threshold (above the hard abort floor) ---
+    if check_system and flush_threshold_gb > 0:
+        if snapshot["mem_available_gb"] < flush_threshold_gb:
+            return "flush"
+
+    return "ok"
+
+
+def _resource_abort_reason(args: argparse.Namespace, snapshot: dict[str, float]) -> str | None:
+    """Legacy wrapper — returns a description string if we should abort, else None."""
+    level = _resource_pressure_level(args, snapshot)
+    if level != "abort":
+        return None
+    guard_mode = getattr(args, "memory_guard_mode", "both")
+    check_system = guard_mode in {"system", "both"}
+    check_process = guard_mode in {"process", "both"}
     if check_system and args.min_available_memory_gb > 0:
         if snapshot["mem_available_gb"] < args.min_available_memory_gb:
             return (
@@ -326,10 +358,9 @@ def _resource_abort_reason(args: argparse.Namespace, snapshot: dict[str, float])
     if check_process and args.max_rss_gb > 0:
         if snapshot["process_rss_gb"] > args.max_rss_gb:
             return (
-                f"process RSS {snapshot['process_rss_gb']:.2f} GB exceeded "
-                f"{args.max_rss_gb:.2f} GB"
+                f"process RSS {snapshot['process_rss_gb']:.2f} GB exceeded {args.max_rss_gb:.2f} GB"
             )
-    return None
+    return "hard memory limit exceeded"
 
 
 def _flush_runtime_caches(
@@ -407,7 +438,13 @@ def _filter_reconv_faults(
     reconv_faults: list[Fault] = []
     skipped = 0
     for idx, fault in enumerate(faults, start=1):
-        if solver._collect_and_sort_pairs(fault.gate_id):
+        if fault.gate_id in solver.pair_cache:
+            has_pairs = bool(solver.pair_cache[fault.gate_id])
+        else:
+            pairs = solver._collect_and_sort_pairs(fault.gate_id)
+            solver.pair_cache[fault.gate_id] = pairs
+            has_pairs = bool(pairs)
+        if has_pairs:
             reconv_faults.append(fault)
         else:
             skipped += 1
@@ -559,6 +596,7 @@ def _build_manifest(args: argparse.Namespace, outputs: list[str]) -> dict:
             "strict_ai_no_fallback": getattr(args, "strict_ai_no_fallback", False),
             "max_backtracks": args.max_backtracks,
             "no_backtrack_limit": getattr(args, "no_backtrack_limit", False),
+            "max_confidence_retries": args.max_confidence_retries,
             "ai_timeout": args.ai_timeout,
             "compare_classic": args.compare_classic,
             "classic_timeout": args.classic_timeout,
@@ -610,8 +648,7 @@ def _coverage_target_metrics(
             denominator = attempted
             denominator_name = "attempted_faults"
             denominator_note = (
-                "run did not complete; target progress is measured against attempted "
-                "faults only"
+                "run did not complete; target progress is measured against attempted faults only"
             )
 
     required = math.ceil(coverage_target * denominator) if denominator else 0
@@ -752,6 +789,17 @@ def main() -> None:
         ),
     )
     parser.add_argument("--candidate-seed-base", type=int, default=20260504)
+    parser.add_argument(
+        "--max-confidence-retries",
+        type=int,
+        default=3,
+        help=(
+            "Number of confidence-guided retries inside solve_with_retry(). "
+            "On failure the committed pair prediction with the lowest min-confidence "
+            "is bypassed and the solve is retried up to this many times. "
+            "Set to 0 to disable retries (single-shot mode)."
+        ),
+    )
     parser.add_argument("--full", action="store_true", help="Ignore fault-list and run all faults")
     parser.add_argument("--limit-faults", type=int, default=0)
     parser.add_argument(
@@ -791,6 +839,11 @@ def main() -> None:
         help="Run classic PODEM on the same faults for backtrack comparison",
     )
     parser.add_argument("--classic-timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--classic-cache",
+        default="",
+        help="JSON file containing cached classic PODEM results to bypass execution",
+    )
     parser.add_argument("--csv-out", default="")
     parser.add_argument("--manifest-out", default="")
     parser.add_argument("--notion-summary-out", default="")
@@ -809,8 +862,17 @@ def main() -> None:
     parser.add_argument(
         "--min-available-memory-gb",
         type=float,
-        default=8.0,
+        default=4.0,
         help="Abort cleanly before a fault if host available RAM drops below this value",
+    )
+    parser.add_argument(
+        "--mem-flush-threshold-gb",
+        type=float,
+        default=10.0,
+        help=(
+            "Flush solver/predictor caches when available RAM falls below this value "
+            "(must be above --min-available-memory-gb). Set to 0 to disable adaptive flushing."
+        ),
     )
     parser.add_argument(
         "--max-system-memory-percent",
@@ -862,13 +924,42 @@ def main() -> None:
         action="store_true",
         help="Print one line before each fault starts so long timeouts look alive in logs",
     )
+    parser.add_argument(
+        "--start-from-fault",
+        type=int,
+        default=0,
+        help=(
+            "Skip the first N faults (0-indexed). Use to resume an aborted run. "
+            "Pass the fault index printed in the last '[RESOURCE-GUARD] Aborting' line."
+        ),
+    )
     args = parser.parse_args()
+    classic_cache = {}
+    if args.classic_cache:
+        with open(args.classic_cache) as f:
+            cache_data = json.load(f)
+        for row in cache_data.get("per_fault", []):
+            f_idx = row["fault_index"]
+            classic_cache[f_idx] = {
+                "classic_ok": row.get("classic_ok"),
+                "classic_result_code": row.get("classic_result_code"),
+                "classic_backtracks": row.get("classic_backtracks", 0),
+                "classic_recursive_calls": row.get("classic_recursive_calls", 0),
+                "classic_time_s": row.get("classic_time_s", 0.0),
+            }
     if args.ai_attempts < 1:
         raise ValueError("--ai-attempts must be positive")
     if args.progress_every < 1:
         raise ValueError("--progress-every must be positive")
     if args.flush_every < 0:
         raise ValueError("--flush-every must be non-negative")
+    flush_thresh = getattr(args, "mem_flush_threshold_gb", 0.0)
+    abort_thresh = getattr(args, "min_available_memory_gb", 0.0)
+    if flush_thresh > 0 and abort_thresh > 0 and flush_thresh <= abort_thresh:
+        raise ValueError(
+            "--mem-flush-threshold-gb must be above --min-available-memory-gb "
+            f"(got flush={flush_thresh}, abort={abort_thresh})"
+        )
     if args.torch_num_threads > 0:
         torch.set_num_threads(args.torch_num_threads)
 
@@ -902,9 +993,10 @@ def main() -> None:
         no_fallback=True,
         candidate_count=args.candidate_count,
         candidate_seed_base=args.candidate_seed_base,
+        max_confidence_retries=args.max_confidence_retries,
     )
     predictor = ModelPairPredictor(circuit, bench_path, config)
-    solver = HierarchicalReconvSolver(circuit, predictor)
+    solver = HierarchicalReconvSolver(circuit, predictor, circuit_path=bench_path)
 
     if args.limit_faults:
         if args.limit_faults < 1:
@@ -976,7 +1068,9 @@ def main() -> None:
 
     if args.reconv_filter_only:
         if not args.reconv_only:
-            raise RuntimeError("--reconv-filter-only requires --reconv-only or --reconv-fault-list-in")
+            raise RuntimeError(
+                "--reconv-filter-only requires --reconv-only or --reconv-fault-list-in"
+            )
         outputs = [args.out]
         if args.manifest_out:
             outputs.append(args.manifest_out)
@@ -1005,9 +1099,7 @@ def main() -> None:
         _write_json(args.out, report)
         if args.manifest_out:
             _write_json(args.manifest_out, _build_manifest(args, outputs))
-        print(
-            f"ITC99 reconv filter-only: {len(faults)} reconv faults; wrote {args.out}"
-        )
+        print(f"ITC99 reconv filter-only: {len(faults)} reconv faults; wrote {args.out}")
         return
 
     succeeded = 0
@@ -1026,13 +1118,48 @@ def main() -> None:
     final_resource_snapshot = _resource_snapshot()
 
     initialize(circuit, total_gates)
+    start_from = max(0, getattr(args, "start_from_fault", 0))
+    if start_from > 0:
+        print(
+            f"[RESUME] Skipping first {start_from} faults (--start-from-fault={start_from})",
+            flush=True,
+        )
+    _consecutive_flush_attempts = 0  # tracks back-to-back soft-pressure flushes
     for idx, fault in enumerate(faults):
+        if idx < start_from:
+            continue
         resource_snapshot = _resource_snapshot()
         final_resource_snapshot = resource_snapshot
-        abort_reason = _resource_abort_reason(args, resource_snapshot)
-        if abort_reason:
+        pressure = _resource_pressure_level(args, resource_snapshot)
+
+        # --- Adaptive flush on soft pressure ---
+        if pressure == "flush":
+            _consecutive_flush_attempts += 1
+            flush_stats = _flush_runtime_caches(solver=solver, predictor=predictor, device=device)
+            time.sleep(min(2.0 * _consecutive_flush_attempts, 10.0))
+            resource_snapshot = _resource_snapshot()
+            final_resource_snapshot = resource_snapshot
+            pressure = _resource_pressure_level(args, resource_snapshot)
+            print(
+                f"[ADAPTIVE-FLUSH] fault={idx} attempt={_consecutive_flush_attempts} "
+                f"cleared_pair_cache={flush_stats['solver_pair_cache']} "
+                f"cleared_pred_cache={flush_stats['predictor_prediction_cache']} "
+                f"mem_avail={resource_snapshot['mem_available_gb']:.1f}GB "
+                f"pressure_after={pressure}",
+                flush=True,
+            )
+        else:
+            _consecutive_flush_attempts = 0
+
+        # --- Hard abort if still critical after flush ---
+        if pressure == "abort":
+            abort_reason = _resource_abort_reason(args, resource_snapshot)
             aborted_reason = f"before fault {idx}: {abort_reason}"
-            print(f"[RESOURCE-GUARD] Aborting cleanly: {aborted_reason}", flush=True)
+            print(
+                f"[RESOURCE-GUARD] Aborting cleanly: {aborted_reason} "
+                f"(hint: rerun with --start-from-fault {idx})",
+                flush=True,
+            )
             break
         if args.log_fault_start:
             print(
@@ -1059,7 +1186,12 @@ def main() -> None:
         activation_val = (
             LogicValue.ONE if fault.value in (LogicValue.ZERO, LogicValue.D) else LogicValue.ZERO
         )
-        has_reconv_pairs = bool(solver._collect_and_sort_pairs(fault.gate_id))
+        if fault.gate_id in solver.pair_cache:
+            has_reconv_pairs = bool(solver.pair_cache[fault.gate_id])
+        else:
+            pairs = solver._collect_and_sort_pairs(fault.gate_id)
+            solver.pair_cache[fault.gate_id] = pairs
+            has_reconv_pairs = bool(pairs)
         classic_ok = None
         classic_result_code = None
         classic_backtracks = None
@@ -1068,26 +1200,37 @@ def main() -> None:
         ai_less_backtracks = None
 
         if args.compare_classic or not has_reconv_pairs:
-            reset_gates(circuit, total_gates)
-            reset_statistics()
-            classic_start = time.time()
-            classic_result = podem(
-                circuit,
-                fault,
-                total_gates,
-                backtrace_func=simple_backtrace,
-                timeout=args.classic_timeout,
-                max_backtracks=_classic_podem_backtrack_budget(args),
-            )
-            classic_elapsed = time.time() - classic_start
-            classic_result_code = int(classic_result)
-            classic_ok = classic_result_code == SUCCESS
-            classic_stats = get_statistics()
-            classic_backtracks = int(classic_stats.get("backtrack_count", 0))
-            classic_recursive_calls = int(classic_stats.get("total_recursive_calls", 0))
-            classic_succeeded += int(classic_ok)
-            classic_backtracks_total += classic_backtracks
-            classic_time_total += classic_elapsed
+            if args.classic_cache and idx in classic_cache:
+                c_data = classic_cache[idx]
+                classic_ok = c_data["classic_ok"]
+                classic_result_code = c_data["classic_result_code"]
+                classic_backtracks = c_data["classic_backtracks"]
+                classic_recursive_calls = c_data["classic_recursive_calls"]
+                classic_elapsed = c_data["classic_time_s"]
+                classic_succeeded += int(classic_ok)
+                classic_backtracks_total += classic_backtracks
+                classic_time_total += classic_elapsed
+            else:
+                reset_gates(circuit, total_gates)
+                reset_statistics()
+                classic_start = time.time()
+                classic_result = podem(
+                    circuit,
+                    fault,
+                    total_gates,
+                    backtrace_func=simple_backtrace,
+                    timeout=args.classic_timeout,
+                    max_backtracks=_classic_podem_backtrack_budget(args),
+                )
+                classic_elapsed = time.time() - classic_start
+                classic_result_code = int(classic_result)
+                classic_ok = classic_result_code == SUCCESS
+                classic_stats = get_statistics()
+                classic_backtracks = int(classic_stats.get("backtrack_count", 0))
+                classic_recursive_calls = int(classic_stats.get("total_recursive_calls", 0))
+                classic_succeeded += int(classic_ok)
+                classic_backtracks_total += classic_backtracks
+                classic_time_total += classic_elapsed
 
         if not has_reconv_pairs:
             detected = bool(classic_ok)
@@ -1320,7 +1463,7 @@ def main() -> None:
                     )
                     ai_podem_search_time += time.time() - search_start
                     ai_result_code = int(result)
-                    ok = (int(result) == SUCCESS)
+                    ok = int(result) == SUCCESS
                 except Exception as exc:
                     ok = False
                     ai_error = str(exc)
@@ -1336,30 +1479,41 @@ def main() -> None:
         failed += int(not detected)
 
         if args.compare_classic and classic_result_code is None:
-            reset_gates(circuit, total_gates)
-            reset_statistics()
-            classic_start = time.time()
-            classic_result = podem(
-                circuit,
-                fault,
-                total_gates,
-                backtrace_func=simple_backtrace,
-                timeout=args.classic_timeout,
-                max_backtracks=_classic_podem_backtrack_budget(args),
-            )
-            classic_elapsed = time.time() - classic_start
-            classic_result_code = int(classic_result)
-            classic_ok = classic_result_code == SUCCESS
-            classic_stats = get_statistics()
-            classic_backtracks = int(classic_stats.get("backtrack_count", 0))
-            classic_recursive_calls = int(classic_stats.get("total_recursive_calls", 0))
-            classic_succeeded += int(classic_ok)
-            classic_backtracks_total += classic_backtracks
-            classic_time_total += classic_elapsed
-            if detected:
-                ai_backtracks_on_success += fault_ai_backtracks
-                classic_backtracks_on_ai_success += classic_backtracks
-                ai_less_backtracks = None
+            if args.classic_cache and idx in classic_cache:
+                c_data = classic_cache[idx]
+                classic_ok = c_data["classic_ok"]
+                classic_result_code = c_data["classic_result_code"]
+                classic_backtracks = c_data["classic_backtracks"]
+                classic_recursive_calls = c_data["classic_recursive_calls"]
+                classic_elapsed = c_data["classic_time_s"]
+                classic_succeeded += int(classic_ok)
+                classic_backtracks_total += classic_backtracks
+                classic_time_total += classic_elapsed
+            else:
+                reset_gates(circuit, total_gates)
+                reset_statistics()
+                classic_start = time.time()
+                classic_result = podem(
+                    circuit,
+                    fault,
+                    total_gates,
+                    backtrace_func=simple_backtrace,
+                    timeout=args.classic_timeout,
+                    max_backtracks=_classic_podem_backtrack_budget(args),
+                )
+                classic_elapsed = time.time() - classic_start
+                classic_result_code = int(classic_result)
+                classic_ok = classic_result_code == SUCCESS
+                classic_stats = get_statistics()
+                classic_backtracks = int(classic_stats.get("backtrack_count", 0))
+                classic_recursive_calls = int(classic_stats.get("total_recursive_calls", 0))
+                classic_succeeded += int(classic_ok)
+                classic_backtracks_total += classic_backtracks
+                classic_time_total += classic_elapsed
+        if args.compare_classic and classic_ok is not None and detected:
+            ai_backtracks_on_success += fault_ai_backtracks
+            classic_backtracks_on_ai_success += classic_backtracks
+            ai_less_backtracks = None
         per_fault.append(
             {
                 "fault_index": idx,

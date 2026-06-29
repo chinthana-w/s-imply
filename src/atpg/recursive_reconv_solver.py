@@ -68,7 +68,8 @@ class ReconvPairPredictor(abc.ABC):
 
         Returns:
             A list of assignment dictionaries (partial solutions) OR
-            (list of assignment dictionaries, snapshot information).
+            a 2-tuple  (list, snapshot) OR
+            a 3-tuple  (list, snapshot, List[float] per-candidate min-confidence).
             The list is ordered by likelihood/preference.
         """
         pass
@@ -117,6 +118,14 @@ class HierarchicalReconvSolver:
         else:
             self.pair_cache = {}  # Cache reconv pairs per root node
 
+        # --- Confidence-guided retry state ---
+        # Each entry: (pair_object_id, min_confidence_float) for a committed AI prediction.
+        # Populated by _backward_justify; inspected by solve_with_retry.
+        self._decision_stack: List[Tuple[int, float]] = []
+        # pair_object_ids listed here are bypassed by _backward_justify:
+        # their nodes are justified via standard gate rules instead of AI predictions.
+        self._forced_skip: set = set()
+
     def _persist_pair_cache_if_needed(self):
         """Persist pair cache to disk if it was updated during this run."""
         if self._pair_cache_dirty and self.circuit_path:
@@ -133,7 +142,8 @@ class HierarchicalReconvSolver:
         seed: Optional[int] = None,
     ) -> Optional[Dict[int, LogicValue]]:
         """
-        Main entry point. Tries to justify target_node = target_val.
+        Main entry point (single-pass). Tries to justify target_node = target_val.
+        For confidence-guided multi-retry, use solve_with_retry().
         """
         if self.verbose:
             print(
@@ -142,7 +152,7 @@ class HierarchicalReconvSolver:
             )
 
         # 1. & 2. Find relevant pairs (use cache to avoid redundant BFS)
-        if len(self.pair_cache) > 200:
+        if len(self.pair_cache) > 100000:
             self.pair_cache.clear()
 
         if target_node not in self.pair_cache:
@@ -172,11 +182,103 @@ class HierarchicalReconvSolver:
         solved_pairs = set()
         self.nodes_visited = 0
         self.inferences = 0
+        self._decision_stack = []
+        self._forced_skip = set()
         final_assignment = self._backward_justify(
             queue, initial_constraints, solved_pairs, sorted_pairs, seed
         )
 
         return final_assignment
+
+    def solve_with_retry(
+        self,
+        target_node: int,
+        target_val: LogicValue,
+        constraints: Dict[int, LogicValue] | None = None,
+        seed: Optional[int] = None,
+        max_retries: int = 3,
+    ) -> Optional[Dict[int, LogicValue]]:
+        """
+        Confidence-guided retry wrapper around solve().
+
+        On the first failure, inspect _decision_stack to find the committed AI pair
+        prediction with the lowest min-confidence score, then retry with that pair
+        forced into _forced_skip (bypassed — nodes justified via standard gate rules
+        rather than AI candidate).  Repeats up to max_retries times.
+        """
+        if max_retries <= 0:
+            return self.solve(target_node, target_val, constraints, seed)
+
+        # --- Build shared setup (pair cache, initial constraints) once. ---
+        if len(self.pair_cache) > 100000:
+            self.pair_cache.clear()
+
+        if target_node not in self.pair_cache:
+            self.pair_cache[target_node] = self._collect_and_sort_pairs(target_node)
+            self._pair_cache_dirty = True
+        sorted_pairs = self.pair_cache[target_node]
+
+        initial_constraints: Dict[int, LogicValue] = {}
+        if constraints:
+            initial_constraints.update(
+                {k: LogicValue(v) if isinstance(v, int) else v for k, v in constraints.items()}
+            )
+        initial_constraints[target_node] = (
+            LogicValue(target_val) if isinstance(target_val, int) else target_val
+        )
+
+        skipped_pairs: set = set()  # pair object ids already tried as forced-skip
+
+        for attempt in range(max_retries + 1):
+            queue = [target_node]
+            solved_pairs_set: set = set()
+            self.nodes_visited = 0
+            self.inferences = 0
+            self._decision_stack = []
+            self._forced_skip = set(skipped_pairs)
+
+            if self.verbose and attempt > 0:
+                print(
+                    f"[Solver] Confidence-retry attempt {attempt}/{max_retries}: "
+                    f"forced_skip={len(self._forced_skip)} pairs"
+                )
+
+            result = self._backward_justify(
+                queue,
+                dict(initial_constraints),
+                solved_pairs_set,
+                sorted_pairs,
+                seed,
+            )
+
+            if result is not None:
+                if self.verbose and attempt > 0:
+                    print(f"[Solver] Confidence-retry succeeded on attempt {attempt}.")
+                return result
+
+            if attempt >= max_retries:
+                break
+
+            # Find the lowest-confidence committed pair not yet in skipped_pairs.
+            if not self._decision_stack:
+                break  # No AI pairs were committed; no point retrying.
+
+            # Filter out already-skipped entries.
+            candidates = [
+                (pid, conf) for pid, conf in self._decision_stack if pid not in skipped_pairs
+            ]
+            if not candidates:
+                break
+
+            worst_pid, worst_conf = min(candidates, key=lambda x: x[1])
+            if self.verbose:
+                print(
+                    f"[Solver] Retry: forcing pair id={worst_pid} "
+                    f"(min_conf={worst_conf:.4f}) to skip AI prediction."
+                )
+            skipped_pairs.add(worst_pid)
+
+        return None
 
     def _collect_and_sort_pairs(self, root_node: int) -> List[Dict[str, Any]]:
         """Identify and sort reconvergent pairs in the transitive fanin of root_node."""
@@ -342,6 +444,23 @@ class HierarchicalReconvSolver:
                     break
 
         if next_pair:
+            pair_id = id(next_pair)
+
+            # --- Forced-skip: bypass AI prediction for this pair. ---
+            # Instead of calling the predictor, fall through to standard gate
+            # justification for the nodes in the pair's paths.
+            if pair_id in self._forced_skip:
+                if self.verbose:
+                    print(
+                        f"[Solver] Forced-skip pair {_format_pair(next_pair)}: "
+                        "using standard gate justification."
+                    )
+                new_solved = set(solved_pairs)
+                new_solved.add(pair_id)
+                return self._backward_justify(
+                    list(queue), assignment, new_solved, sorted_pairs, seed
+                )
+
             if self.verbose:
                 print(
                     f"[Solver] Solving pair {_format_pair(next_pair)}, "
@@ -350,8 +469,12 @@ class HierarchicalReconvSolver:
             self.inferences += 1
             prediction_result = self.predictor.predict(next_pair, assignment, seed=seed)
             inputs_snapshot = None
+            candidate_confidences: List[float] = []
             if isinstance(prediction_result, tuple):
-                candidates, inputs_snapshot = prediction_result
+                if len(prediction_result) == 3:
+                    candidates, inputs_snapshot, candidate_confidences = prediction_result
+                else:
+                    candidates, inputs_snapshot = prediction_result
             else:
                 candidates = prediction_result
 
@@ -371,7 +494,7 @@ class HierarchicalReconvSolver:
                         f"[Solver] Trying candidate {i + 1}/{len(candidates)} for "
                         f"{_format_pair(next_pair)}: {_format_assignment(assignment_part)}"
                     )
-                
+
                 step_record = None
                 if self.recorder and inputs_snapshot:
                     step_record = self.recorder.log_step(
@@ -432,13 +555,25 @@ class HierarchicalReconvSolver:
                         new_queue.append(k)
 
                 new_solved = set(solved_pairs)
-                new_solved.add(id(next_pair))
+                new_solved.add(pair_id)
+
+                # Record this committed decision on the stack (for retry inspection).
+                min_conf = (
+                    candidate_confidences[i]
+                    if i < len(candidate_confidences)
+                    else 0.5  # neutral default when confidence not provided
+                )
+                self._decision_stack.append((pair_id, min_conf))
 
                 result = self._backward_justify(
                     new_queue, new_assignment, new_solved, sorted_pairs, seed
                 )
                 if result is not None:
                     return result
+
+                # Backtrack: remove the stack entry we just added.
+                if self._decision_stack and self._decision_stack[-1][0] == pair_id:
+                    self._decision_stack.pop()
 
                 if step_record and self.recorder:
                     self.recorder.mark_backtrack(penalty=-0.5)
