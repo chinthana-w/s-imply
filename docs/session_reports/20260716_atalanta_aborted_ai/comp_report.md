@@ -27,6 +27,24 @@ pie showData
 
 ```
 
+## Per fault breakdown
+
+| Benchmark | Faults | AI detected | AI coverage |
+| :--- | ---: | ---: | ---: |
+| b14 | 43 | 42 | 97.67% |
+| b15 | 649 | 632 | 97.38% |
+| b17 | 1718 | 1607 | 93.54% |
+| b18 | 1776 | 1460 | 82.20% |
+| b19 | 14630 | 9065 | 61.96% |
+| b20 | 218 | 214 | 98.17% |
+| b21 | 120 | 120 | 100.00% |
+| b22 | 312 | 303 | 97.12% |
+| c432 | 3 | 0 | 0.00% |
+| c6288 | 284 | 28 | 9.86% |
+| s13207 | 1 | 1 | 100.00% |
+| s38584 | 1 | 1 | 100.00% |
+| **Total** | **19755** | **13573** | **68.71%** |
+
 ## Backtrack interpretation
 
 The Atalanta number is an abort-bound observation: it establishes that Atalanta reached the configured ceiling without detecting the fault in that run. The AI number is the internal PODEM search backtrack counter for the executed AI-guided path. Therefore, the strongest apples-to-apples claim is conditional: **for faults that AI detected, how much search backtracking did AI require relative to the recorded Atalanta abort effort?** It is not a claim that the two implementations have identical per-backtrack computational cost.
