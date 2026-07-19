@@ -215,6 +215,9 @@ checkpoints/
 *.pth
 temp_bench/
 
+# Repo-local third-party tools (recreated by their setup scripts)
+tools/atalanta/
+
 # claude
 .claude/.nfs*
 .claude/**/.nfs*

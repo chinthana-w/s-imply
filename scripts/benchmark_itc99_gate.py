@@ -15,6 +15,7 @@ import math
 import os
 import platform
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -45,6 +46,27 @@ from src.atpg.podem import (
 )
 from src.util.io import parse_bench_file
 from src.util.struct import Fault, GateType, LogicValue
+
+
+class _AiSolveTimeout(TimeoutError):
+    pass
+
+
+def _call_with_timeout(func, timeout_s: float, label: str):
+    if timeout_s <= 0:
+        return func()
+
+    def _handle_timeout(signum, frame):
+        raise _AiSolveTimeout(f"{label} exceeded {timeout_s:.2f}s")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _handle_timeout)
+    signal.setitimer(signal.ITIMER_REAL, timeout_s)
+    try:
+        return func()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _logic_value_label(value: LogicValue | int) -> str:
@@ -598,6 +620,7 @@ def _build_manifest(args: argparse.Namespace, outputs: list[str]) -> dict:
             "no_backtrack_limit": getattr(args, "no_backtrack_limit", False),
             "max_confidence_retries": args.max_confidence_retries,
             "ai_timeout": args.ai_timeout,
+            "ai_solve_timeout": args.ai_solve_timeout,
             "compare_classic": args.compare_classic,
             "classic_timeout": args.classic_timeout,
             "coverage_target": args.coverage_target,
@@ -611,6 +634,8 @@ def _build_manifest(args: argparse.Namespace, outputs: list[str]) -> dict:
             "cooldown_s": args.cooldown_s,
             "progress_every": args.progress_every,
             "log_fault_start": args.log_fault_start,
+            "start_from_fault": args.start_from_fault,
+            "stop_before_fault": args.stop_before_fault,
         },
         "outputs": outputs,
         "baseline": {
@@ -761,6 +786,15 @@ def main() -> None:
         help="Disable the PODEM backtrack cap; wall-clock timeout still applies",
     )
     parser.add_argument("--ai-timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--ai-solve-timeout",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional wall-clock cap for AI assignment generation before PODEM search. "
+            "Set to 0 to preserve historical unbounded solve behavior."
+        ),
+    )
     parser.add_argument("--candidate-count", type=int, default=8)
     parser.add_argument(
         "--ai-attempts",
@@ -932,6 +966,12 @@ def main() -> None:
             "Skip the first N faults (0-indexed). Use to resume an aborted run. "
             "Pass the fault index printed in the last '[RESOURCE-GUARD] Aborting' line."
         ),
+    )
+    parser.add_argument(
+        "--stop-before-fault",
+        type=int,
+        default=0,
+        help="Stop before this 0-indexed fault index. Use 0 to run through the end.",
     )
     args = parser.parse_args()
     classic_cache = {}
@@ -1124,10 +1164,18 @@ def main() -> None:
             f"[RESUME] Skipping first {start_from} faults (--start-from-fault={start_from})",
             flush=True,
         )
+    stop_before = int(getattr(args, "stop_before_fault", 0) or 0)
+    if stop_before and stop_before <= start_from:
+        raise ValueError("--stop-before-fault must be greater than --start-from-fault")
+    if stop_before:
+        print(f"[SHARD] Stopping before fault {stop_before}", flush=True)
     _consecutive_flush_attempts = 0  # tracks back-to-back soft-pressure flushes
     for idx, fault in enumerate(faults):
         if idx < start_from:
             continue
+        if stop_before and idx >= stop_before:
+            print(f"[SHARD] Reached --stop-before-fault {stop_before}", flush=True)
+            break
         resource_snapshot = _resource_snapshot()
         final_resource_snapshot = resource_snapshot
         pressure = _resource_pressure_level(args, resource_snapshot)
@@ -1307,7 +1355,16 @@ def main() -> None:
                 current_seed = args.candidate_seed_base + idx + (attempt * len(faults))
                 reset_gates(circuit, total_gates)
                 solve_start = time.time()
-                ai_assignment = solver.solve(fault.gate_id, activation_val, seed=current_seed)
+                try:
+                    ai_assignment = _call_with_timeout(
+                        lambda: solver.solve(fault.gate_id, activation_val, seed=current_seed),
+                        args.ai_solve_timeout,
+                        "AI solve",
+                    )
+                except _AiSolveTimeout as exc:
+                    ai_error = str(exc)
+                    ai_result_code = UNTESTABLE
+                    break
                 ai_precheck_solve_time += time.time() - solve_start
                 detected, pi_count, sim_time = _direct_ai_assignment_detection(
                     circuit,
@@ -1320,11 +1377,20 @@ def main() -> None:
                 if not detected:
                     reset_gates(circuit, total_gates)
                     solve_start = time.time()
-                    structural_assignment = _single_pass_structural_assignment(
-                        solver,
-                        fault.gate_id,
-                        activation_val,
-                    )
+                    try:
+                        structural_assignment = _call_with_timeout(
+                            lambda: _single_pass_structural_assignment(
+                                solver,
+                                fault.gate_id,
+                                activation_val,
+                            ),
+                            args.ai_solve_timeout,
+                            "structural AI solve",
+                        )
+                    except _AiSolveTimeout as exc:
+                        ai_error = str(exc)
+                        ai_result_code = UNTESTABLE
+                        break
                     ai_precheck_solve_time += time.time() - solve_start
                     detected, pi_count, sim_time = _direct_ai_assignment_detection(
                         circuit,
@@ -1360,11 +1426,20 @@ def main() -> None:
                         current_seed = args.candidate_seed_base + idx + (attempt * len(faults))
                         reset_gates(circuit, total_gates)
                         solve_start = time.time()
-                        ai_assignment = solver.solve(
-                            fault.gate_id,
-                            activation_val,
-                            seed=current_seed,
-                        )
+                        try:
+                            ai_assignment = _call_with_timeout(
+                                lambda: solver.solve(
+                                    fault.gate_id,
+                                    activation_val,
+                                    seed=current_seed,
+                                ),
+                                args.ai_solve_timeout,
+                                "AI solve",
+                            )
+                        except _AiSolveTimeout as exc:
+                            ai_error = str(exc)
+                            ai_result_code = UNTESTABLE
+                            break
                         ai_precheck_solve_time += time.time() - solve_start
                         detected, pi_count, sim_time = _direct_ai_assignment_detection(
                             circuit,
@@ -1377,11 +1452,20 @@ def main() -> None:
                         if not detected:
                             reset_gates(circuit, total_gates)
                             solve_start = time.time()
-                            structural_assignment = _single_pass_structural_assignment(
-                                solver,
-                                fault.gate_id,
-                                activation_val,
-                            )
+                            try:
+                                structural_assignment = _call_with_timeout(
+                                    lambda: _single_pass_structural_assignment(
+                                        solver,
+                                        fault.gate_id,
+                                        activation_val,
+                                    ),
+                                    args.ai_solve_timeout,
+                                    "structural AI solve",
+                                )
+                            except _AiSolveTimeout as exc:
+                                ai_error = str(exc)
+                                ai_result_code = UNTESTABLE
+                                break
                             ai_precheck_solve_time += time.time() - solve_start
                             detected, pi_count, sim_time = _direct_ai_assignment_detection(
                                 circuit,
@@ -1425,7 +1509,11 @@ def main() -> None:
                     )
                     current_seed = args.candidate_seed_base + idx + (attempt * len(faults))
                     solve_start = time.time()
-                    ai_assignment = solver.solve(fault.gate_id, activation_val, seed=current_seed)
+                    ai_assignment = _call_with_timeout(
+                        lambda: solver.solve(fault.gate_id, activation_val, seed=current_seed),
+                        args.ai_solve_timeout,
+                        "AI solve",
+                    )
                     ai_hint_solve_time += time.time() - solve_start
 
                     backtracer = None
@@ -1625,6 +1713,7 @@ def main() -> None:
         "max_backtracks": args.max_backtracks,
         "no_backtrack_limit": getattr(args, "no_backtrack_limit", False),
         "ai_timeout": args.ai_timeout,
+        "ai_solve_timeout": args.ai_solve_timeout,
         "total": len(faults),
         "attempted": attempted,
         "aborted": aborted_reason is not None,

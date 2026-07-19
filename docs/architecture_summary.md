@@ -41,6 +41,121 @@ flowchart LR
     G --> H
 ```
 
+The end-to-end runtime flow has two solver paths. Classic PODEM is the
+reference path. AI-guided PODEM keeps the same objective, simulation, and
+backtracking loop, but replaces selected backtrace choices with reconvergent
+path-pair predictions when a relevant reconvergent region exists.
+
+For presentations, the same system can be reduced to a slide-level block
+diagram:
+
+```mermaid
+flowchart TD
+    A["Benchmark inputs<br/>circuits + fault pool"]
+    B["Circuit engine<br/>parse netlist + simulate logic"]
+    C["PODEM control loop<br/>objective, PI assignment, backtracking"]
+    D["Reconvergence analysis<br/>fanout stems + rejoin regions"]
+    E["Path-pair selector<br/>choose local reconvergent paths"]
+    F["Recursive region solver<br/>justify assignments across paths"]
+    G["Multi-path transformer<br/>predict consistent node values"]
+    H["AI-guided backtrace<br/>turn predictions into PI choices"]
+    I["Validated result<br/>fault detected, timeout, or limit"]
+    J["Benchmark report<br/>coverage, runtime, backtracks"]
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F --> G
+    G --> H
+    H --> C
+    C --> I
+    I --> J
+```
+
+```mermaid
+flowchart TD
+    subgraph Inputs["Inputs and shared circuit state"]
+        I1["Benchmark netlists<br/>ISCAS85 / ISCAS89 / ITC99"]
+        I2["Fault pool<br/>gate id + stuck-at value"]
+        I3["Circuit parser<br/>gate list, fanin/fanout, PIs/POs"]
+        I4["Logic simulator<br/>X / 0 / 1 / D / D-bar"]
+        I1 --> I3
+        I2 --> I4
+        I3 --> I4
+    end
+
+    subgraph DataModel["Offline data and model path"]
+        D1["Reconvergence scanner<br/>fanout stems and rejoin nodes"]
+        D2["Path picking<br/>candidate path pairs / groups"]
+        D3["Training samples<br/>paths, constraints, labels, solvability"]
+        D4["Multi-path transformer<br/>path encoder + interaction + cross-attention"]
+        D5["ModelPairPredictor<br/>ranked assignments for path pairs"]
+        D1 --> D2 --> D3 --> D4 --> D5
+    end
+
+    subgraph AIPodem["AI-guided PODEM runtime"]
+        A1["Fault objective<br/>activate or propagate fault effect"]
+        A2{"Reconvergent structure<br/>available for objective?"}
+        A3["Collect and sort pairs<br/>shortest / local regions first"]
+        A4["Recursive solving<br/>justify target through pair order"]
+        A5["Model proposal<br/>candidate node values"]
+        A6{"Consistent with<br/>constraints and gates?"}
+        A7["Commit assignment<br/>update hints / PI candidates"]
+        A8["AI backtrace<br/>use hints to reach a PI"]
+        A9["Classic simple_backtrace<br/>ordinary PI choice"]
+        A10["Assign PI and simulate"]
+        A11{"Fault reaches<br/>primary output?"}
+        A12["Detected fault"]
+        A13{"More branch choices<br/>or flipped PI value?"}
+        A14["Backtrack<br/>undo choice / try alternate"]
+        A15["Undetected, timeout,<br/>or backtrack limit"]
+
+        A1 --> A2
+        A2 -->|"yes"| A3 --> A4 --> A5 --> A6
+        A6 -->|"yes"| A7 --> A8 --> A10
+        A6 -->|"no"| A14
+        A2 -->|"no"| A9 --> A10
+        A10 --> A11
+        A11 -->|"yes"| A12
+        A11 -->|"no"| A13
+        A13 -->|"yes"| A14 --> A4
+        A13 -->|"no"| A15
+    end
+
+    subgraph Classic["Classic PODEM baseline"]
+        C1["Same fault objective"]
+        C2["simple_backtrace"]
+        C3["Assign PI and simulate"]
+        C4{"Fault reaches<br/>primary output?"}
+        C5["Detected fault"]
+        C6["Backtrack / flip PI<br/>until timeout or limit"]
+        C7["Undetected, timeout,<br/>or backtrack limit"]
+        C1 --> C2 --> C3 --> C4
+        C4 -->|"yes"| C5
+        C4 -->|"no"| C6
+        C6 --> C2
+        C6 --> C7
+    end
+
+    subgraph Reports["Evaluation artifacts"]
+        R1["Per-fault CSV<br/>result, runtime, backtracks"]
+        R2["Merged JSON summary<br/>coverage and comparison metrics"]
+        R3["Markdown report<br/>AI vs classic contribution analysis"]
+        R1 --> R2 --> R3
+    end
+
+    I4 --> D1
+    I4 --> A1
+    I4 --> C1
+    D5 --> A5
+    A12 --> R1
+    A15 --> R1
+    C5 --> R1
+    C7 --> R1
+```
+
 The current success target is 80% AI/system-mode coverage over the faults that
 classic PODEM can cover. For example, if classic PODEM detects 7,000 faults in a
 10,000-fault benchmark, AI/system mode must detect 5,600 faults. Faults without
@@ -378,9 +493,12 @@ updates, and final detection check.
 
 There are two related AI modes. One uses the model to produce activation hints
 before the PODEM search. The other uses an AI backtrace function inside PODEM's
-recursive loop. In strict no-fallback benchmarking, a failed AI-guided
-reconvergent decision is not silently retried by a clean classic PODEM run. This
-keeps the benchmark honest about what the AI/system mode solved.
+recursive loop. S-Imply integrates a confidence-guided retry wrapper (`solve_with_retry`)
+around the recursive solving step: on a justification conflict, instead of backtracking
+exhaustively, S-Imply bypasses the lowest-confidence neural decisions in a prioritized,
+forced-skip manner, recovering via classic gate-logic rules. In strict no-fallback
+benchmarking, a failed AI-guided reconvergent decision is not silently retried by a clean
+classic PODEM run. This keeps the benchmark honest about what the AI/system mode solved.
 
 ```mermaid
 sequenceDiagram

@@ -1,0 +1,86 @@
+{
+  "created_at": "2026-06-30T06:16:01.931552+00:00",
+  "pool": {
+    "path": "data/bench/ITC99/reconv_pool_10000_seed20260629.json",
+    "selected_faults": 10000,
+    "seed": 20260629,
+    "selection_sha256": "b632777c8d71ecd9f222be7378e706a91952f8d94c25466e6f124ffa87c73e32",
+    "bench": "data/bench/ITC99/b17.bench",
+    "total_candidate_reconvergent_faults": 45796,
+    "source_counts": [
+      {
+        "bench": "data/bench/ITC99/b17.bench",
+        "total_faults": 64458,
+        "reconvergent_faults": 45796,
+        "non_reconvergent_faults": 18662
+      }
+    ]
+  },
+  "model": "checkpoints/reconv_solver_fix_20260511/best_model.pth",
+  "benchmark_settings": {
+    "max_backtracks": 5000,
+    "ai_timeout_s": 5,
+    "ai_solve_timeout_s": 10,
+    "candidate_count": 8,
+    "ai_attempts": 1,
+    "candidate_seed_base": 20260629,
+    "max_confidence_retries": 3,
+    "compare_classic": false
+  },
+  "total_faults": 10000,
+  "detected": 5251,
+  "failed": 4749,
+  "coverage": 0.5251,
+  "activation_precheck_successes": 4177,
+  "activation_precheck_rate": 0.4177,
+  "result_code_counts": {
+    "0": 2940,
+    "1": 5251,
+    "2": 1724,
+    "None": 85
+  },
+  "result_code_labels": {
+    "0": "UNTESTABLE",
+    "1": "SUCCESS",
+    "2": "TIMEOUT",
+    "3": "BACKTRACK_LIMIT",
+    "None": "NO_RESULT_RECORDED"
+  },
+  "timeout_count": 1724,
+  "manual_watchdog_timeout_count": 1,
+  "backtracks": {
+    "total": 115633.0,
+    "mean": 11.5633,
+    "median": 0.0,
+    "max": 91.0,
+    "success_total": 6170.0,
+    "failure_total": 109463.0
+  },
+  "runtime": {
+    "summed_per_fault_time_s": 104642.1618,
+    "summed_per_fault_time_h": 29.067267166666667,
+    "artifact_wall_span_s": 23368.105035305023,
+    "artifact_wall_span_h": 6.491140287584729,
+    "mean_time_s": 10.46421618,
+    "median_time_s": 7.9656,
+    "max_time_s": 50.5578,
+    "summed_ai_assignment_time_s": 28153.3761,
+    "summed_podem_search_time_s": 13522.8132,
+    "manual_watchdog_note": "index 3600 external watchdog time is not included in summed_per_fault_time_s"
+  },
+  "top_ai_errors": [
+    [
+      "AI solve exceeded 10.00s",
+      3078
+    ],
+    [
+      "external watchdog timeout: unbounded AI solve at original fault index 3600",
+      1
+    ]
+  ],
+  "artifacts": {
+    "merged_csv": "docs/session_reports/20260629_itc99_reconv_pool_10000/merged_per_fault.csv",
+    "summary_json": "docs/session_reports/20260629_itc99_reconv_pool_10000/merged_summary.json",
+    "report_md": "docs/session_reports/20260629_itc99_reconv_pool_10000/detailed_ai_method_report.md"
+  }
+}

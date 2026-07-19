@@ -1,0 +1,330 @@
+{
+  "created_at": "2026-07-13T23:55:37.641773+00:00",
+  "complete": true,
+  "total_faults": 10000,
+  "budgets": {
+    "baseline_classic_s": 10.0,
+    "tandem_classic_s": 5.0,
+    "tandem_ai_s": 5.0
+  },
+  "baseline": {
+    "solved": 1933,
+    "failed": 8067,
+    "coverage": 0.1933,
+    "backtracks_total": 5912802,
+    "timing_all": {
+      "count": 10000,
+      "total_s": 22510.961256,
+      "mean_s": 2.251096,
+      "median_s": 0.036884,
+      "p95_s": 10.003558,
+      "max_s": 10.494485
+    },
+    "timing_solved": {
+      "count": 1933,
+      "total_s": 20.757335,
+      "mean_s": 0.010738,
+      "median_s": 0.000349,
+      "p95_s": 0.0214,
+      "max_s": 1.269554
+    }
+  },
+  "tandem": {
+    "classic_solved": 9669,
+    "ai_solved": 9527,
+    "union_solved": 9669,
+    "union_failed": 331,
+    "union_coverage": 0.9669,
+    "both_solved": 9527,
+    "ai_only_solved": 0,
+    "classic_only_solved": 142,
+    "ai_wins": 415,
+    "classic_wins": 9250,
+    "ties": 4,
+    "ai_incremental_coverage_points": 0.0,
+    "ai_incremental_relative_to_classic": 0.0,
+    "classic_backtracks_total": 15800,
+    "ai_search_backtracks_total": 519,
+    "classic_timing_all": {
+      "count": 10000,
+      "total_s": 3644.313967,
+      "mean_s": 0.364431,
+      "median_s": 0.005614,
+      "p95_s": 2.475579,
+      "max_s": 5.547197
+    },
+    "ai_timing_all": {
+      "count": 10000,
+      "total_s": 4329.889936,
+      "mean_s": 0.432989,
+      "median_s": 0.025371,
+      "p95_s": 3.095414,
+      "max_s": 5.000448
+    },
+    "portfolio_solve_timing": {
+      "count": 9669,
+      "total_s": 2134.810184,
+      "mean_s": 0.220789,
+      "median_s": 0.004551,
+      "p95_s": 1.144901,
+      "max_s": 4.966529
+    }
+  },
+  "cross_budget": {
+    "tandem_union_also_in_baseline": 1931,
+    "tandem_union_not_in_baseline": 7738,
+    "baseline_not_in_tandem_union": 2,
+    "both_fail": 329
+  },
+  "per_circuit": [
+    {
+      "bench": "data/bench/ITC99_all_numeric/b01.bench",
+      "faults": 94,
+      "classic10_solved": 68,
+      "classic5_solved": 94,
+      "ai5_solved": 94,
+      "tandem_solved": 94,
+      "tandem_coverage": 1.0,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b02.bench",
+      "faults": 54,
+      "classic10_solved": 42,
+      "classic5_solved": 54,
+      "ai5_solved": 54,
+      "tandem_solved": 54,
+      "tandem_coverage": 1.0,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b03.bench",
+      "faults": 312,
+      "classic10_solved": 114,
+      "classic5_solved": 312,
+      "ai5_solved": 312,
+      "tandem_solved": 312,
+      "tandem_coverage": 1.0,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b04.bench",
+      "faults": 596,
+      "classic10_solved": 216,
+      "classic5_solved": 593,
+      "ai5_solved": 588,
+      "tandem_solved": 593,
+      "tandem_coverage": 0.9949664429530202,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b05.bench",
+      "faults": 596,
+      "classic10_solved": 81,
+      "classic5_solved": 569,
+      "ai5_solved": 539,
+      "tandem_solved": 569,
+      "tandem_coverage": 0.9546979865771812,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b06.bench",
+      "faults": 100,
+      "classic10_solved": 82,
+      "classic5_solved": 100,
+      "ai5_solved": 100,
+      "tandem_solved": 100,
+      "tandem_coverage": 1.0,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b07.bench",
+      "faults": 596,
+      "classic10_solved": 138,
+      "classic5_solved": 596,
+      "ai5_solved": 580,
+      "tandem_solved": 596,
+      "tandem_coverage": 1.0,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b08.bench",
+      "faults": 358,
+      "classic10_solved": 114,
+      "classic5_solved": 358,
+      "ai5_solved": 350,
+      "tandem_solved": 358,
+      "tandem_coverage": 1.0,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b09.bench",
+      "faults": 338,
+      "classic10_solved": 180,
+      "classic5_solved": 338,
+      "ai5_solved": 338,
+      "tandem_solved": 338,
+      "tandem_coverage": 1.0,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b10.bench",
+      "faults": 400,
+      "classic10_solved": 124,
+      "classic5_solved": 400,
+      "ai5_solved": 399,
+      "tandem_solved": 400,
+      "tandem_coverage": 1.0,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b11.bench",
+      "faults": 596,
+      "classic10_solved": 147,
+      "classic5_solved": 587,
+      "ai5_solved": 570,
+      "tandem_solved": 587,
+      "tandem_coverage": 0.9848993288590604,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b12.bench",
+      "faults": 596,
+      "classic10_solved": 92,
+      "classic5_solved": 596,
+      "ai5_solved": 594,
+      "tandem_solved": 596,
+      "tandem_coverage": 1.0,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b13.bench",
+      "faults": 596,
+      "classic10_solved": 280,
+      "classic5_solved": 593,
+      "ai5_solved": 593,
+      "tandem_solved": 593,
+      "tandem_coverage": 0.9949664429530202,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b14.bench",
+      "faults": 596,
+      "classic10_solved": 17,
+      "classic5_solved": 594,
+      "ai5_solved": 587,
+      "tandem_solved": 594,
+      "tandem_coverage": 0.9966442953020134,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b15_1.bench",
+      "faults": 596,
+      "classic10_solved": 59,
+      "classic5_solved": 593,
+      "ai5_solved": 581,
+      "tandem_solved": 593,
+      "tandem_coverage": 0.9949664429530202,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b17.bench",
+      "faults": 596,
+      "classic10_solved": 43,
+      "classic5_solved": 573,
+      "ai5_solved": 555,
+      "tandem_solved": 573,
+      "tandem_coverage": 0.9614093959731543,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b18.bench",
+      "faults": 596,
+      "classic10_solved": 31,
+      "classic5_solved": 531,
+      "ai5_solved": 524,
+      "tandem_solved": 531,
+      "tandem_coverage": 0.8909395973154363,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b19.bench",
+      "faults": 596,
+      "classic10_solved": 40,
+      "classic5_solved": 411,
+      "ai5_solved": 406,
+      "tandem_solved": 411,
+      "tandem_coverage": 0.6895973154362416,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b20.bench",
+      "faults": 596,
+      "classic10_solved": 24,
+      "classic5_solved": 591,
+      "ai5_solved": 586,
+      "tandem_solved": 591,
+      "tandem_coverage": 0.9916107382550335,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b21.bench",
+      "faults": 596,
+      "classic10_solved": 26,
+      "classic5_solved": 593,
+      "ai5_solved": 590,
+      "tandem_solved": 593,
+      "tandem_coverage": 0.9949664429530202,
+      "ai_only_solved": 0
+    },
+    {
+      "bench": "data/bench/ITC99_all_numeric/b22.bench",
+      "faults": 596,
+      "classic10_solved": 15,
+      "classic5_solved": 593,
+      "ai5_solved": 587,
+      "tandem_solved": 593,
+      "tandem_coverage": 0.9949664429530202,
+      "ai_only_solved": 0
+    }
+  ],
+  "result_code_labels": {
+    "1": "SUCCESS",
+    "0": "UNTESTABLE",
+    "2": "TIMEOUT",
+    "3": "BACKTRACK_LIMIT"
+  },
+  "run_id": "20260713_itc99_all_classic10_tandem5",
+  "fault_list": "data/bench/ITC99_all_numeric/fault_pool_10000_seed20260713.json",
+  "benches": [
+    "data/bench/ITC99_all_numeric/b01.bench",
+    "data/bench/ITC99_all_numeric/b02.bench",
+    "data/bench/ITC99_all_numeric/b03.bench",
+    "data/bench/ITC99_all_numeric/b04.bench",
+    "data/bench/ITC99_all_numeric/b05.bench",
+    "data/bench/ITC99_all_numeric/b06.bench",
+    "data/bench/ITC99_all_numeric/b07.bench",
+    "data/bench/ITC99_all_numeric/b08.bench",
+    "data/bench/ITC99_all_numeric/b09.bench",
+    "data/bench/ITC99_all_numeric/b10.bench",
+    "data/bench/ITC99_all_numeric/b11.bench",
+    "data/bench/ITC99_all_numeric/b12.bench",
+    "data/bench/ITC99_all_numeric/b13.bench",
+    "data/bench/ITC99_all_numeric/b14.bench",
+    "data/bench/ITC99_all_numeric/b15_1.bench",
+    "data/bench/ITC99_all_numeric/b17.bench",
+    "data/bench/ITC99_all_numeric/b18.bench",
+    "data/bench/ITC99_all_numeric/b19.bench",
+    "data/bench/ITC99_all_numeric/b20.bench",
+    "data/bench/ITC99_all_numeric/b21.bench",
+    "data/bench/ITC99_all_numeric/b22.bench"
+  ],
+  "model": "checkpoints/reconv_solver_fix_20260511/best_model.pth",
+  "device": "cuda",
+  "pool_meta": {
+    "selected_faults": 10000,
+    "seed": 20260713,
+    "selection_sha256": "414370aeb4d2e2914bfb97dd39f1dba6f3232cc20e2c537a5f0096be0880381f",
+    "total_candidate_reconvergent_faults": null
+  }
+}

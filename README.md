@@ -14,6 +14,24 @@ A Topology-Aware Justification Oracle for digital circuits using Multi-Path Tran
 
 ## 🛠️ Usage Guide
 
+### Atalanta baseline ATPG
+
+Install the pinned Atalanta source and binary inside this repository:
+
+```bash
+./scripts/setup_atalanta.sh
+```
+
+Use the repo-local wrapper so Atalanta can also find its manual:
+
+```bash
+./bin/atalanta data/bench/ISCAS85/c17.bench
+./bin/atalanta -h g
+```
+
+Atalanta reads ISCAS89-style `.bench` netlists. The downloaded source and build
+artifacts live under the ignored `tools/atalanta/` directory.
+
 ### 1. Data Preparation (Building Shards)
 Build fault-driven SAT/UNSAT samples from ISCAS85/89 only, then convert the
 chunked output into optimized tensor shards.  Keep `patterns-per-fault` small at

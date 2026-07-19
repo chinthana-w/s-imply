@@ -1,0 +1,134 @@
+{
+  "updated_at": "2026-07-17T06:22:16.837652+00:00",
+  "run_id": "20260716_atalanta_aborted_ai",
+  "fault_pool": "data/atalanta_hdf/aborted_fault_pool_20260716.json",
+  "model": "checkpoints/reconv_solver_fix_20260511/best_model.pth",
+  "device": "cuda",
+  "timeout_s": 5.0,
+  "max_backtracks": 100000,
+  "total_faults": 19755,
+  "completed": 19755,
+  "remaining": 0,
+  "ai_solved": 12787,
+  "ai_failed": 6968,
+  "ai_coverage_completed": 0.6472791698304227,
+  "precheck_solved": 157,
+  "faults_with_reconv_pairs": 9887,
+  "atalanta_backtracks_all_completed": {
+    "count": 19755,
+    "total": 1978319955,
+    "mean": 100142.74639331814,
+    "median": 100001,
+    "p95": 100001,
+    "min": 101,
+    "max": 500001
+  },
+  "ai_backtracks_all_completed": {
+    "count": 19755,
+    "total": 15769,
+    "mean": 0.7982282966337636,
+    "median": 0,
+    "p95": 0,
+    "min": 0,
+    "max": 15486
+  },
+  "atalanta_backtracks_on_ai_success": {
+    "count": 12787,
+    "total": 1287452787,
+    "mean": 100684.50668647846,
+    "median": 100001,
+    "p95": 100001,
+    "min": 10001,
+    "max": 500001
+  },
+  "ai_backtracks_on_ai_success": {
+    "count": 12787,
+    "total": 41,
+    "mean": 0.0032063814811918354,
+    "median": 0,
+    "p95": 0,
+    "min": 0,
+    "max": 26
+  },
+  "backtrack_reduction_on_ai_success": 0.999999968154172,
+  "ai_successes_with_fewer_backtracks": 12787,
+  "result_codes": {
+    "1": 12787,
+    "2": 6966,
+    "3": 2
+  },
+  "per_circuit": {
+    "b14": {
+      "attempted": 43,
+      "solved": 42,
+      "ai_backtracks": 0,
+      "coverage": 0.9767441860465116
+    },
+    "b15": {
+      "attempted": 649,
+      "solved": 632,
+      "ai_backtracks": 4,
+      "coverage": 0.9738058551617874
+    },
+    "b17": {
+      "attempted": 1718,
+      "solved": 1607,
+      "ai_backtracks": 224,
+      "coverage": 0.9353899883585565
+    },
+    "b18": {
+      "attempted": 1776,
+      "solved": 1310,
+      "ai_backtracks": 30,
+      "coverage": 0.7376126126126126
+    },
+    "b19": {
+      "attempted": 14630,
+      "solved": 8529,
+      "ai_backtracks": 24,
+      "coverage": 0.5829801777170198
+    },
+    "b20": {
+      "attempted": 218,
+      "solved": 214,
+      "ai_backtracks": 1,
+      "coverage": 0.981651376146789
+    },
+    "b21": {
+      "attempted": 120,
+      "solved": 120,
+      "ai_backtracks": 0,
+      "coverage": 1.0
+    },
+    "b22": {
+      "attempted": 312,
+      "solved": 303,
+      "ai_backtracks": 0,
+      "coverage": 0.9711538461538461
+    },
+    "c432": {
+      "attempted": 3,
+      "solved": 0,
+      "ai_backtracks": 15486,
+      "coverage": 0.0
+    },
+    "c6288": {
+      "attempted": 284,
+      "solved": 28,
+      "ai_backtracks": 0,
+      "coverage": 0.09859154929577464
+    },
+    "s13207": {
+      "attempted": 1,
+      "solved": 1,
+      "ai_backtracks": 0,
+      "coverage": 1.0
+    },
+    "s38584": {
+      "attempted": 1,
+      "solved": 1,
+      "ai_backtracks": 0,
+      "coverage": 1.0
+    }
+  }
+}

@@ -124,10 +124,15 @@ def _trace(msg: str) -> None:
 
 
 def initialize(circuit: List[Gate], total_gates: int):
-    global gate_distances_back, gate_distances_fwd
+    global gate_distances_back, gate_distances_fwd, scoap_calculated, topological_order
 
     gate_distances_back = calculate_distance_to_primary_inputs(circuit, total_gates)
     gate_distances_fwd = calculate_distance_to_primary_outputs(circuit, total_gates)
+    # These caches are circuit-specific. Multi-circuit benchmarks call initialize
+    # whenever they switch netlists, so retaining either cache can index the new
+    # circuit with the previous circuit's node IDs.
+    scoap_calculated = False
+    topological_order = []
 
     # Reset all gate values to X to prevent state pollution from previous runs
     for i in range(1, total_gates + 1):

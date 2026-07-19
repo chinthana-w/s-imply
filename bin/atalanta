@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+atalanta_dir="${repo_root}/tools/atalanta"
+atalanta_bin="${atalanta_dir}/atalanta"
+
+if [[ ! -x "${atalanta_bin}" ]]; then
+    echo "Atalanta is not built. Run scripts/setup_atalanta.sh first." >&2
+    exit 1
+fi
+
+export ATALANTA_MAN="${atalanta_dir}"
+exec "${atalanta_bin}" "$@"
